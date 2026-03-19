@@ -1,0 +1,17 @@
+node_modules/
+dist/
+out/
+.vite/
+.turbo/
+.python-version
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+coverage/
+.DS_Store
+Thumbs.db
+

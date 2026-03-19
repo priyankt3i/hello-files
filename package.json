@@ -1,0 +1,16 @@
+{
+  "name": "filesystem-rag-chat",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @fschat/desktop",
+    "build": "npm run build -w @fschat/shared && npm run build -w @fschat/desktop",
+    "typecheck": "npm run typecheck -w @fschat/shared && npm run typecheck -w @fschat/desktop",
+    "python:check": "python -m py_compile services/indexer/fschat_indexer/*.py"
+  }
+}
+
