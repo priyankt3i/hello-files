@@ -126,6 +126,17 @@ npm run rebuild:native -w @fschat/desktop
 5. Start indexing
 6. Chat against the indexed content
 
+## Documentation
+
+For deeper project docs, see:
+
+- [Docs Index](docs/README.md)
+- [Getting Started](docs/getting-started.md)
+- [Providers](docs/providers.md)
+- [Indexing](docs/indexing.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Architecture](docs/architecture.md)
+
 ## Contributing
 
 Contributions are welcome.

@@ -1,0 +1,20 @@
+# Documentation
+
+This folder contains the first contributor-facing docs for Filesystem RAG Chat.
+
+## Guides
+
+- [Getting Started](getting-started.md)
+- [Providers](providers.md)
+- [Indexing](indexing.md)
+- [Troubleshooting](troubleshooting.md)
+- [Architecture](architecture.md)
+
+## Intended Audience
+
+- users trying to run the app locally
+- contributors trying to understand the codebase
+- anyone debugging provider, indexing, or desktop-app behavior
+
+## Scope
+
