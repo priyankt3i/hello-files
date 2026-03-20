@@ -15,7 +15,8 @@ export function ProgressCard({ progress }: { progress: IndexProgressEvent }) {
         <div className="h-2 rounded-full bg-gradient-to-r from-ember to-coral" style={{ width: `${percentage}%` }} />
       </div>
       <div className="break-anywhere mt-3 max-h-28 overflow-y-auto text-xs leading-5 text-mist/70">
-        {progress.currentFile || progress.message}
+        {progress.message ? <div>{progress.message}</div> : null}
+        {progress.currentFile ? <div className={progress.message ? "mt-1 text-mist/55" : ""}>{progress.currentFile}</div> : null}
       </div>
       <div className="mt-3 flex gap-2 text-xs text-mist/80">
         <span>{progress.successCount} indexed</span>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +26,7 @@ from index_store import (
     read_manifest,
     write_manifest,
 )
-from vector_store import clear_index_cache, get_vectors_for_labels, load_index_bundle, write_vector_store
+from vector_store import clear_index_cache, get_vectors_for_labels, load_index_bundle, release_index_bundle, write_vector_store
 
 
 @dataclass
@@ -173,6 +174,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
     created_at = previous_manifest.get("createdAt") if previous_manifest else utc_now()
 
     if previous_manifest:
+        index_bundle = None
         try:
             index_bundle = load_index_bundle(root_path, previous_manifest)
             labels = [chunk["label"] for chunk in index_bundle["chunks"]]
@@ -189,9 +191,37 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
             previous_chunks_by_path = {}
             previous_vectors_by_hash = {}
             created_at = utc_now()
+        finally:
+            release_index_bundle(index_bundle)
+            clear_index_cache(root_path)
 
     try:
-        file_paths = discover_files(root_path)
+        emit_progress(
+            {
+                "channelId": channel_id,
+                "phase": "discovering",
+                "totalFiles": 0,
+                "processedFiles": 0,
+                "successCount": 0,
+                "failureCount": 0,
+                "message": "Scanning folder for supported files.",
+            }
+        )
+
+        file_paths = discover_files(
+            root_path,
+            on_progress=lambda discovered_count: emit_progress(
+                {
+                    "channelId": channel_id,
+                    "phase": "discovering",
+                    "totalFiles": discovered_count,
+                    "processedFiles": 0,
+                    "successCount": 0,
+                    "failureCount": 0,
+                    "message": f"Scanning folder... discovered {discovered_count} files so far.",
+                }
+            ),
+        )
         total_files = len(file_paths)
         emit_progress(
             {
@@ -286,6 +316,8 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                     file_chunk_entries.append(entry)
 
                 batch_size = embedding_batch_size(embedding_provider)
+                total_batches = max(1, math.ceil(len(entries_to_embed) / batch_size)) if entries_to_embed else 0
+                embedded_chunk_count = 0
                 for batch_index, batch in enumerate(batched(entries_to_embed, batch_size), start=1):
                     ensure_not_cancelled(channel_id, total_files, processed_files, success_count, failure_count, relative_path)
                     emit_progress(
@@ -297,13 +329,17 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                             "successCount": success_count,
                             "failureCount": failure_count,
                             "currentFile": relative_path,
-                            "message": f"Embedding batch {batch_index} for {relative_path}",
+                            "message": (
+                                f"Embedding batch {batch_index}/{total_batches} "
+                                f"({embedded_chunk_count + 1}-{embedded_chunk_count + len(batch)} of {len(entries_to_embed)} new chunks)."
+                            ),
                         }
                     )
-                    vectors = embed_texts(embedding_provider, [item["text"] for item in batch])
+                    vectors = embed_texts(embedding_provider, [item["text"] for item in batch], timeout_seconds=None)
                     for item, vector in zip(batch, vectors):
                         item["embedding"] = vector
                         previous_vectors_by_hash[item["chunkHash"]] = vector
+                    embedded_chunk_count += len(batch)
 
                 if any("embedding" not in entry for entry in file_chunk_entries):
                     raise ValueError("Failed to create embeddings for one or more chunks.")
@@ -354,7 +390,6 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         }
                     )
 
-        manifest = finalize_index(temp_store, root_path, file_records, embedded_chunks, created_at, embedding_provider)
         emit_progress(
             {
                 "channelId": channel_id,
@@ -366,6 +401,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                 "message": "Writing index files.",
             }
         )
+        manifest = finalize_index(temp_store, root_path, file_records, embedded_chunks, created_at, embedding_provider)
         emit_progress(
             {
                 "channelId": channel_id,
@@ -441,7 +477,7 @@ def search_index(root_path: Path, query: str, top_k: int, options: dict) -> list
     return results
 
 
-def discover_files(root_path: Path) -> list[Path]:
+def discover_files(root_path: Path, on_progress=None) -> list[Path]:
     files: list[Path] = []
     for path in root_path.rglob("*"):
         if not path.is_file():
@@ -450,6 +486,9 @@ def discover_files(root_path: Path) -> list[Path]:
         if relative_parts and relative_parts[0] in {INDEX_DIR_NAME, ".fschat-index.tmp"}:
             continue
         files.append(path)
+        if on_progress and (len(files) == 1 or len(files) % 25 == 0):
+            on_progress(len(files))
+    files.sort(key=lambda item: str(item.relative_to(root_path)).lower())
     return files
 
 
@@ -490,6 +529,7 @@ def finalize_index(
     }
     write_manifest(temp_store, manifest)
     write_vector_store(temp_store, embedded_chunks, embedding_dimension)
+    clear_index_cache(root_path)
     commit_temp_store(root_path)
     clear_index_cache(root_path)
     return manifest
@@ -597,7 +637,7 @@ def build_embedding_model_key(embedding_provider: dict[str, Any]) -> str:
 def embedding_batch_size(embedding_provider: dict[str, Any]) -> int:
     provider = str(embedding_provider.get("provider") or "").lower()
     if provider == "ollama":
-        return 4
+        return 1
     return 24
 
 

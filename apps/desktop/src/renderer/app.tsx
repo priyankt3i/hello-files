@@ -384,8 +384,8 @@ export function App() {
   }
 
   return (
-    <div className="min-h-screen bg-shell-gradient text-paper">
-      <div className="grid min-h-screen grid-cols-[minmax(260px,280px)_minmax(320px,360px)_minmax(0,1fr)] gap-4 p-4">
+    <div className="h-screen overflow-hidden bg-shell-gradient text-paper">
+      <div className="grid h-full grid-cols-[minmax(260px,280px)_minmax(320px,360px)_minmax(0,1fr)] gap-4 overflow-hidden p-4">
         <Sidebar channels={channels} selectedChannelId={selectedChannelId} onSelect={handleSelectChannel} onOpenCreate={() => setCreateOpen(true)} onOpenSettings={() => setSettingsOpen(true)} />
         <FilesPanel
           selectedChannel={selectedChannel}
@@ -1103,7 +1103,7 @@ function ChatPanel({
           ))}
         </div>
       </div>
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_260px] gap-4">
+      <div className="grid min-h-0 flex-1 overflow-hidden grid-cols-[minmax(0,1fr)_260px] gap-4">
         <div className="flex min-h-0 min-w-0 flex-col rounded-[26px] bg-black/10 p-4">
           <div className="flex-1 space-y-4 overflow-y-auto pr-2">
             {messages.length === 0 ? (

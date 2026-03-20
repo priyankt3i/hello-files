@@ -110,6 +110,30 @@ export class PythonWorkerBridge extends EventEmitter {
     const child = spawn("python", ["-u", workerPath], {
       stdio: ["pipe", "pipe", "pipe"]
     });
+    this.process = child;
+
+    let workerFailed = false;
+
+    const rejectAll = (reason: Error) => {
+      this.activeBuildChannels.clear();
+      for (const [id, pending] of this.pending.entries()) {
+        pending.reject(reason);
+        this.pending.delete(id);
+      }
+    };
+
+    const failWorker = (reason: Error, terminate: boolean) => {
+      if (workerFailed) {
+        return;
+      }
+      workerFailed = true;
+      this.process = null;
+      rejectAll(reason);
+      this.emit("error", reason);
+      if (terminate && !child.killed) {
+        child.kill();
+      }
+    };
 
     const stdout = createInterface({ input: child.stdout });
     stdout.on("line", (line) => {
@@ -158,32 +182,21 @@ export class PythonWorkerBridge extends EventEmitter {
           this.emit("file_update", envelope.payload as IndexFileUpdateEvent);
         }
       } catch (error) {
-        this.emit("error", error);
+        const message = error instanceof Error ? error.message : String(error);
+        failWorker(new Error(`Python worker protocol error: ${message}`), true);
       }
     });
-
-    const rejectAll = (reason: Error) => {
-      this.activeBuildChannels.clear();
-      for (const [id, pending] of this.pending.entries()) {
-        pending.reject(reason);
-        this.pending.delete(id);
-      }
-    };
 
     child.stderr.on("data", (chunk) => {
       this.emit("stderr", chunk.toString());
     });
 
     child.on("exit", (code) => {
-      this.process = null;
-      rejectAll(new Error(`Python worker exited with code ${code}.`));
+      failWorker(new Error(`Python worker exited with code ${code}.`), false);
     });
 
     child.on("error", (error) => {
-      this.process = null;
-      rejectAll(error);
+      failWorker(error, false);
     });
-
-    this.process = child;
   }
 }

@@ -95,6 +95,12 @@ TEXT_EXTENSIONS = {
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xlsm"}
 LEGACY_SPREADSHEET_EXTENSIONS = {".xls"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
+MIN_TEXT_CHARS_FOR_VISUAL_OCR = 160
+MIN_TEXT_CHARS_FOR_DOC_IMAGE_OCR = 320
+MAX_EMBEDDED_IMAGES_PER_PDF_PAGE = 3
+MAX_EMBEDDED_IMAGES_PER_DOCX = 12
+OCR_MAX_IMAGE_EDGE = 1800
+OCR_MAX_IMAGE_PIXELS = 3_000_000
 
 _OCR_ENGINE = None
 
@@ -132,11 +138,18 @@ def extract_pdf(path: Path) -> str:
             if page_text:
                 parts.append(f"# PDF page {page_index}\n{page_text}")
 
-            page_ocr = extract_pdf_page_ocr(page)
-            if page_ocr:
-                parts.append(f"# PDF page {page_index} visual text\n{page_ocr}")
+            should_ocr_page = should_attempt_visual_ocr(page_text, MIN_TEXT_CHARS_FOR_VISUAL_OCR)
+            if should_ocr_page:
+                page_ocr = extract_pdf_page_ocr(page)
+                if page_ocr:
+                    parts.append(f"# PDF page {page_index} visual text\n{page_ocr}")
+
+            if not should_ocr_page:
+                continue
 
             for image_index, image_info in enumerate(page.get_images(full=True), start=1):
+                if image_index > MAX_EMBEDDED_IMAGES_PER_PDF_PAGE:
+                    break
                 image_bytes = document.extract_image(image_info[0]).get("image")
                 if not image_bytes:
                     continue
@@ -175,9 +188,11 @@ def extract_docx(path: Path) -> str:
     if table_text:
         parts.append(table_text)
 
-    embedded_images = extract_docx_embedded_images(path)
-    if embedded_images:
-        parts.append(embedded_images)
+    visible_text = "\n\n".join(part for part in parts if part.strip())
+    if should_attempt_visual_ocr(visible_text, MIN_TEXT_CHARS_FOR_DOC_IMAGE_OCR):
+        embedded_images = extract_docx_embedded_images(path)
+        if embedded_images:
+            parts.append(embedded_images)
 
     return "\n\n".join(part for part in parts if part.strip())
 
@@ -199,6 +214,8 @@ def extract_docx_embedded_images(path: Path) -> str:
         for name in archive.namelist():
             if not name.startswith("word/media/"):
                 continue
+            if len(parts) >= MAX_EMBEDDED_IMAGES_PER_DOCX:
+                break
             image_bytes = archive.read(name)
             image_text = extract_image_bytes(image_bytes, name)
             if image_text:
@@ -373,7 +390,8 @@ def ocr_image(image) -> str:
         return ""
 
     try:
-        rgb = image.convert("RGB")
+        prepared = resize_image_for_ocr(image)
+        rgb = prepared.convert("RGB")
         result, _ = engine(np.array(rgb))
     except Exception:
         return ""
@@ -472,3 +490,29 @@ def normalize_text(text: str) -> str:
     except Exception:
         pass
     return stripped
+
+
+def should_attempt_visual_ocr(text: str, minimum_chars: int) -> bool:
+    normalized = re.sub(r"\s+", "", text or "")
+    return len(normalized) < minimum_chars
+
+
+def resize_image_for_ocr(image):
+    if Image is None:
+        return image
+
+    width, height = image.size
+    longest_edge = max(width, height)
+    pixel_count = width * height
+    if longest_edge <= OCR_MAX_IMAGE_EDGE and pixel_count <= OCR_MAX_IMAGE_PIXELS:
+        return image
+
+    edge_scale = OCR_MAX_IMAGE_EDGE / max(longest_edge, 1)
+    pixel_scale = (OCR_MAX_IMAGE_PIXELS / max(pixel_count, 1)) ** 0.5
+    scale = min(edge_scale, pixel_scale, 1.0)
+    if scale >= 1.0:
+        return image
+
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    resampling_module = getattr(Image, "Resampling", Image)
+    return image.resize(new_size, resampling_module.LANCZOS)

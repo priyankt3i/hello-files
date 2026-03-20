@@ -19,9 +19,14 @@ _INDEX_CACHE: dict[str, dict[str, Any]] = {}
 
 def clear_index_cache(root_path: Path | None = None) -> None:
     if root_path is None:
+        for bundle in list(_INDEX_CACHE.values()):
+            release_index_bundle(bundle)
         _INDEX_CACHE.clear()
         return
-    _INDEX_CACHE.pop(str(root_index_path(root_path)), None)
+    cache_key = str(root_index_path(root_path))
+    bundle = _INDEX_CACHE.pop(cache_key, None)
+    if bundle is not None:
+        release_index_bundle(bundle)
 
 
 def write_vector_store(index_path: Path, chunks: list[dict], embedding_dimension: int) -> None:
@@ -93,6 +98,19 @@ def get_vectors_for_labels(index_bundle: dict[str, Any], labels: list[int]) -> l
     if vectors is None:
         return []
     return np.asarray(vectors[labels], dtype=np.float32).tolist()
+
+
+def release_index_bundle(index_bundle: dict[str, Any] | None) -> None:
+    if not index_bundle:
+        return
+    vectors = index_bundle.get("vectors")
+    if vectors is None:
+        return
+
+    mmap_handle = getattr(vectors, "_mmap", None)
+    if mmap_handle is not None:
+        mmap_handle.close()
+    index_bundle["vectors"] = None
 
 
 def normalize_rows(matrix: np.ndarray) -> np.ndarray:

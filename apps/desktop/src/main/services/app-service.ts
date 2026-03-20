@@ -7,11 +7,13 @@ import type {
   BootstrapResponse,
   CancelIndexInput,
   Channel,
+  ChannelStatus,
   ChannelSnapshot,
   ConnectProviderInput,
   ConnectProviderResult,
   IndexFileUpdateEvent,
   IndexProgressEvent,
+  IndexedFileRecord,
   Message,
   ProviderConnection,
   ProviderDefaults,
@@ -58,6 +60,18 @@ export class DesktopAppService {
     });
     this.worker.on("file_update", (event: IndexFileUpdateEvent) => {
       this.webContents?.send("fschat:index-file-update", event);
+    });
+    this.worker.on("error", (error: unknown) => {
+      const message = error instanceof Error ? error.message : "Python worker failed.";
+      this.webContents?.send("fschat:index-progress", {
+        channelId: "global",
+        phase: "error",
+        totalFiles: 0,
+        processedFiles: 0,
+        successCount: 0,
+        failureCount: 0,
+        message
+      } as IndexProgressEvent);
     });
     this.worker.on("stderr", (line: string) => {
       if (IGNORED_STDERR_PATTERNS.some((pattern) => line.includes(pattern))) {
@@ -329,7 +343,7 @@ export class DesktopAppService {
       this.db.replaceIndexedFiles(channel.id, status.manifest.files);
       this.db.updateChannel(channel.id, {
         lastIndexedAt: status.manifest.updatedAt,
-        status: "ready",
+        status: deriveChannelStatusFromFiles(status.manifest.files),
         updatedAt: new Date().toISOString()
       });
     }
@@ -367,7 +381,7 @@ export class DesktopAppService {
         nextLastIndexedAt = null;
       } else {
         this.db.replaceIndexedFiles(channel.id, status.manifest?.files ?? []);
-        nextStatus = "ready";
+        nextStatus = deriveChannelStatusFromFiles(status.manifest?.files ?? []);
         nextLastIndexedAt = status.manifest?.updatedAt ?? channel.lastIndexedAt;
       }
     }
@@ -609,7 +623,7 @@ export class DesktopAppService {
         this.db.replaceIndexedFiles(channel.id, response.files);
         this.db.updateChannel(channel.id, {
           lastIndexedAt: response.manifest.updatedAt,
-          status: response.files.some((file) => file.status === "indexed") ? "stale" : "idle",
+          status: deriveCancelledChannelStatus(response.files),
           updatedAt: new Date().toISOString()
         });
         return;
@@ -620,7 +634,7 @@ export class DesktopAppService {
         this.db.replaceIndexedFiles(channel.id, existing.manifest.files);
         this.db.updateChannel(channel.id, {
           lastIndexedAt: existing.manifest.updatedAt,
-          status: existing.manifest.files.some((file) => file.status === "indexed") ? "ready" : "idle",
+          status: deriveChannelStatusFromFiles(existing.manifest.files),
           updatedAt: new Date().toISOString()
         });
         return;
@@ -642,7 +656,7 @@ export class DesktopAppService {
     this.db.replaceIndexedFiles(channel.id, response.files);
     this.db.updateChannel(channel.id, {
       lastIndexedAt: response.manifest.updatedAt,
-      status: "ready",
+      status: deriveChannelStatusFromFiles(response.files),
       updatedAt: new Date().toISOString()
     });
   }
@@ -706,7 +720,7 @@ export class DesktopAppService {
       if (channel.lastIndexedAt !== status.manifest.updatedAt || channel.status === "idle" || channel.status === "error") {
         this.db.updateChannel(channel.id, {
           lastIndexedAt: status.manifest.updatedAt,
-          status: status.manifest.files.some((file) => file.status === "indexed") ? "ready" : "idle",
+          status: deriveChannelStatusFromFiles(status.manifest.files),
           updatedAt: new Date().toISOString()
         });
       }
@@ -849,4 +863,24 @@ function isMissingProviderConfigurationError(error: unknown) {
 
 function buildEmbeddingModelKey(connection: ProviderConnection, model: ProviderModel) {
   return [connection.provider, connection.baseUrl || "", connection.apiVersion || "", model.deployment || "", model.modelId].join("|");
+}
+
+function deriveChannelStatusFromFiles(files: IndexedFileRecord[]): Exclude<ChannelStatus, "indexing"> {
+  if (files.some((file) => file.status === "indexed")) {
+    return "ready";
+  }
+  if (files.some((file) => file.status === "failed")) {
+    return "error";
+  }
+  return "idle";
+}
+
+function deriveCancelledChannelStatus(files: IndexedFileRecord[]): Exclude<ChannelStatus, "indexing"> {
+  if (files.some((file) => file.status === "indexed")) {
+    return "stale";
+  }
+  if (files.some((file) => file.status === "failed")) {
+    return "error";
+  }
+  return "idle";
 }
