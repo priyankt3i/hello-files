@@ -9,6 +9,7 @@ This folder contains the first contributor-facing docs for Filesystem RAG Chat.
 - [Indexing](indexing.md)
 - [Troubleshooting](troubleshooting.md)
 - [Architecture](architecture.md)
+- [Move To Vectorless RAG](move2vectorless.md)
 
 ## Intended Audience
 
@@ -17,4 +18,3 @@ This folder contains the first contributor-facing docs for Filesystem RAG Chat.
 - anyone debugging provider, indexing, or desktop-app behavior
 
 ## Scope
-

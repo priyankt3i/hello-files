@@ -1,4 +1,12 @@
-import type { ConnectProviderInput, Message, ProviderConnection, ProviderKind, ProviderModel, SearchResult } from "@fschat/shared";
+import type {
+  ConnectProviderInput,
+  IndexedDocumentRecord,
+  Message,
+  ProviderConnection,
+  ProviderKind,
+  ProviderModel,
+  SearchResult
+} from "@fschat/shared";
 
 type ProviderSecret = {
   apiKey: string;
@@ -51,57 +59,65 @@ export async function generateAssistantReply(args: {
   }));
 
   const prompt = ["Indexed context:", contextBlock, "", `User question: ${userMessage}`].join("\n");
-  const baseUrl = connection.baseUrl || DEFAULT_BASE_URLS[connection.provider];
+  return callProviderText({
+    connection,
+    model,
+    secret,
+    systemPrompt,
+    history: recentHistory,
+    prompt
+  });
+}
 
-  switch (connection.provider) {
-    case "openai":
-      return callOpenAI({
-        baseUrl,
-        model: model.modelId,
-        apiKey: secret.apiKey,
-        systemPrompt,
-        history: recentHistory,
-        prompt
-      });
-    case "azure-openai":
-      return callAzureOpenAI({
-        baseUrl,
-        deployment: model.deployment || model.modelId,
-        apiVersion: connection.apiVersion || "2024-10-21",
-        apiKey: secret.apiKey,
-        systemPrompt,
-        history: recentHistory,
-        prompt
-      });
-    case "anthropic":
-      return callAnthropic({
-        baseUrl,
-        model: model.modelId,
-        apiKey: secret.apiKey,
-        systemPrompt,
-        history: recentHistory,
-        prompt
-      });
-    case "google":
-      return callGoogle({
-        baseUrl,
-        model: model.modelId,
-        apiKey: secret.apiKey,
-        systemPrompt,
-        history: recentHistory,
-        prompt
-      });
-    case "ollama":
-      return callOllama({
-        baseUrl,
-        model: model.modelId,
-        systemPrompt,
-        history: recentHistory,
-        prompt
-      });
-    default:
-      throw new Error(`Unsupported provider: ${connection.provider as string}`);
-  }
+export async function selectRelevantDocuments(args: {
+  connection: ProviderConnection;
+  model: ProviderModel;
+  secret: ProviderSecret;
+  documents: IndexedDocumentRecord[];
+  userMessage: string;
+  maxDocuments?: number;
+}): Promise<{ documentIds: string[]; reasoning?: string; rawResponse: string }> {
+  const { connection, model, secret, documents, userMessage, maxDocuments = 3 } = args;
+  const manifestBlock = documents
+    .map((document) =>
+      [
+        `Document ID: ${document.documentId}`,
+        `Path: ${document.relativePath}`,
+        `Parser: ${document.parser}`,
+        `Chunks: ${document.chunks}`,
+        `Estimated tokens: ${document.tokenEstimate}`,
+        `Summary: ${document.summary || "None"}`,
+        document.sectionHints.length > 0 ? `Section hints: ${document.sectionHints.join(" | ")}` : "Section hints: None"
+      ].join("\n")
+    )
+    .join("\n\n");
+
+  const rawResponse = await callProviderText({
+    connection,
+    model,
+    secret,
+    systemPrompt: [
+      "You are doing manifest-first document selection for Filesystem RAG Chat.",
+      "Choose the smallest useful set of documents for answering the user's question.",
+      "Return strict JSON only.",
+      `Return this shape: {"document_ids":["..."],"reasoning":"..."}.`,
+      `Return at most ${maxDocuments} document IDs.`,
+      "Only use document IDs that appear in the manifest."
+    ].join(" "),
+    history: [],
+    prompt: ["Manifest:", manifestBlock, "", `User question: ${userMessage}`].join("\n")
+  });
+
+  const parsed = tryParseJsonObject(rawResponse);
+  const documentIds = Array.isArray(parsed?.document_ids)
+    ? parsed.document_ids.filter((item: unknown): item is string => typeof item === "string" && item.trim().length > 0).slice(0, maxDocuments)
+    : [];
+
+  return {
+    documentIds,
+    reasoning: typeof parsed?.reasoning === "string" ? parsed.reasoning : undefined,
+    rawResponse
+  };
 }
 
 export async function discoverProviderModels(input: ConnectProviderInput): Promise<ProviderDiscovery> {
@@ -181,7 +197,7 @@ async function discoverAnthropicModels(apiKey: string): Promise<ProviderDiscover
       supportsEmbedding: false,
       supportsVision: /vision|claude-3|claude-sonnet|claude-opus/i.test(id)
     })),
-    warnings: ["Anthropic keys support Claude chat models, but indexing still needs a separate embedding-capable provider."]
+    warnings: ["Anthropic keys support Claude chat models. Anthropic works for vectorless channels, but vector channels still need an embedding-capable provider."]
   };
 }
 
@@ -343,6 +359,68 @@ async function callOpenAI(args: {
   return data.choices?.[0]?.message?.content ?? "No response returned.";
 }
 
+async function callProviderText(args: {
+  connection: ProviderConnection;
+  model: ProviderModel;
+  secret: ProviderSecret;
+  systemPrompt: string;
+  history: Array<{ role: "assistant" | "user"; content: string }>;
+  prompt: string;
+}) {
+  const { connection, model, secret, systemPrompt, history, prompt } = args;
+  const baseUrl = connection.baseUrl || DEFAULT_BASE_URLS[connection.provider];
+
+  switch (connection.provider) {
+    case "openai":
+      return callOpenAI({
+        baseUrl,
+        model: model.modelId,
+        apiKey: secret.apiKey,
+        systemPrompt,
+        history,
+        prompt
+      });
+    case "azure-openai":
+      return callAzureOpenAI({
+        baseUrl,
+        deployment: model.deployment || model.modelId,
+        apiVersion: connection.apiVersion || "2024-10-21",
+        apiKey: secret.apiKey,
+        systemPrompt,
+        history,
+        prompt
+      });
+    case "anthropic":
+      return callAnthropic({
+        baseUrl,
+        model: model.modelId,
+        apiKey: secret.apiKey,
+        systemPrompt,
+        history,
+        prompt
+      });
+    case "google":
+      return callGoogle({
+        baseUrl,
+        model: model.modelId,
+        apiKey: secret.apiKey,
+        systemPrompt,
+        history,
+        prompt
+      });
+    case "ollama":
+      return callOllama({
+        baseUrl,
+        model: model.modelId,
+        systemPrompt,
+        history,
+        prompt
+      });
+    default:
+      throw new Error(`Unsupported provider: ${connection.provider as string}`);
+  }
+}
+
 async function callAzureOpenAI(args: {
   baseUrl?: string;
   deployment?: string;
@@ -464,4 +542,33 @@ async function expectJson(response: Response) {
 
 function joinUrl(base: string, path: string) {
   return `${base.replace(/\/$/, "")}${path}`;
+}
+
+function tryParseJsonObject(value: string) {
+  const trimmed = value.trim();
+  for (const candidate of [trimmed, extractCodeFenceJson(trimmed)]) {
+    if (!candidate) {
+      continue;
+    }
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+  }
+  const braceStart = trimmed.indexOf("{");
+  const braceEnd = trimmed.lastIndexOf("}");
+  if (braceStart >= 0 && braceEnd > braceStart) {
+    try {
+      return JSON.parse(trimmed.slice(braceStart, braceEnd + 1));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function extractCodeFenceJson(value: string) {
+  const match = value.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  return match?.[1]?.trim() ?? "";
 }

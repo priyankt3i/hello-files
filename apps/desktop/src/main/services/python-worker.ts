@@ -5,6 +5,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
+  IndexedDocumentRecord,
   IndexFileUpdateEvent,
   IndexManifest,
   IndexProgressEvent,
@@ -57,6 +58,10 @@ export class PythonWorkerBridge extends EventEmitter {
 
   async listFiles(rootPath: string, status: "indexed" | "failed"): Promise<{ files: IndexedFileRecord[] }> {
     return this.request("list_files", { rootPath, status });
+  }
+
+  async listDocuments(rootPath: string): Promise<{ documents: IndexedDocumentRecord[] }> {
+    return this.request("list_documents", { rootPath });
   }
 
   async search(rootPath: string, query: string, topK: number, options: WorkerBuildOptions): Promise<{ results: SearchResult[] }> {

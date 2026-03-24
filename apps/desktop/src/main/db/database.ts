@@ -40,6 +40,7 @@ export class AppDatabase {
         preferred_connection_id TEXT,
         chat_model_id TEXT,
         embedding_model_id TEXT,
+        retrieval_mode TEXT NOT NULL DEFAULT 'vector',
         last_indexed_at TEXT,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -136,6 +137,7 @@ export class AppDatabase {
     this.ensureColumn("channels", "preferred_connection_id", "TEXT");
     this.ensureColumn("channels", "chat_model_id", "TEXT");
     this.ensureColumn("channels", "embedding_model_id", "TEXT");
+    this.ensureColumn("channels", "retrieval_mode", "TEXT NOT NULL DEFAULT 'vector'");
     this.ensureColumn("indexed_files", "content_hash", "TEXT");
 
     this.migrateLegacyProviderProfiles();
@@ -297,8 +299,8 @@ export class AppDatabase {
     this.db
       .prepare(
         `INSERT INTO channels (
-          id, display_name, root_path, index_path, chat_profile_id, embedding_profile_id, preferred_connection_id, chat_model_id, embedding_model_id, last_indexed_at, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          id, display_name, root_path, index_path, chat_profile_id, embedding_profile_id, preferred_connection_id, chat_model_id, embedding_model_id, retrieval_mode, last_indexed_at, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         channel.id,
@@ -310,6 +312,7 @@ export class AppDatabase {
         channel.preferredConnectionId,
         channel.chatModelId,
         channel.embeddingModelId,
+        channel.retrievalMode,
         channel.lastIndexedAt,
         channel.status,
         channel.createdAt,
@@ -341,7 +344,14 @@ export class AppDatabase {
     patch: Partial<
       Pick<
         Channel,
-        "displayName" | "preferredConnectionId" | "chatModelId" | "embeddingModelId" | "lastIndexedAt" | "status" | "updatedAt"
+        | "displayName"
+        | "preferredConnectionId"
+        | "chatModelId"
+        | "embeddingModelId"
+        | "retrievalMode"
+        | "lastIndexedAt"
+        | "status"
+        | "updatedAt"
       >
     >
   ) {
@@ -358,7 +368,7 @@ export class AppDatabase {
     this.db
       .prepare(
         `UPDATE channels
-         SET display_name = ?, preferred_connection_id = ?, chat_model_id = ?, embedding_model_id = ?, last_indexed_at = ?, status = ?, updated_at = ?
+         SET display_name = ?, preferred_connection_id = ?, chat_model_id = ?, embedding_model_id = ?, retrieval_mode = ?, last_indexed_at = ?, status = ?, updated_at = ?
          WHERE id = ?`
       )
       .run(
@@ -366,6 +376,7 @@ export class AppDatabase {
         next.preferredConnectionId,
         next.chatModelId,
         next.embeddingModelId,
+        next.retrievalMode,
         next.lastIndexedAt,
         next.status,
         next.updatedAt,
@@ -656,6 +667,7 @@ function mapChannel(row: any): Channel {
     preferredConnectionId: row.preferred_connection_id ?? null,
     chatModelId: row.chat_model_id ?? null,
     embeddingModelId: row.embedding_model_id ?? null,
+    retrievalMode: row.retrieval_mode ?? "vector",
     lastIndexedAt: row.last_indexed_at,
     status: row.status,
     createdAt: row.created_at,

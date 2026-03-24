@@ -33,7 +33,6 @@ def write_vector_store(index_path: Path, chunks: list[dict], embedding_dimension
     metadata_rows = []
     vectors = []
     for label, chunk in enumerate(chunks):
-        vectors.append(chunk["embedding"])
         metadata_rows.append(
             {
                 "label": label,
@@ -45,6 +44,8 @@ def write_vector_store(index_path: Path, chunks: list[dict], embedding_dimension
                 "fileHash": chunk["fileHash"],
             }
         )
+        if "embedding" in chunk:
+            vectors.append(chunk["embedding"])
 
     write_chunk_metadata(index_path, metadata_rows)
 

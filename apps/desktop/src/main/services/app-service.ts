@@ -11,6 +11,7 @@ import type {
   ChannelSnapshot,
   ConnectProviderInput,
   ConnectProviderResult,
+  IndexedDocumentRecord,
   IndexFileUpdateEvent,
   IndexProgressEvent,
   IndexedFileRecord,
@@ -18,6 +19,7 @@ import type {
   ProviderConnection,
   ProviderDefaults,
   ProviderModel,
+  RetrievalMode,
   RefreshProviderModelsResult,
   RegisterChannelInput,
   SendMessageInput,
@@ -33,7 +35,8 @@ import {
   discoverProviderModels,
   generateAssistantReply,
   pickDefaultChatModel,
-  pickDefaultEmbeddingModel
+  pickDefaultEmbeddingModel,
+  selectRelevantDocuments
 } from "../providers/client";
 import { PythonWorkerBridge } from "./python-worker";
 
@@ -300,13 +303,14 @@ export class DesktopAppService {
   }
 
   async registerChannel(input: RegisterChannelInput): Promise<ChannelSnapshot> {
+    const existing = this.db.getChannelByRoot(input.rootPath);
+    const retrievalMode = this.resolveRetrievalMode(input.retrievalMode ?? existing?.retrievalMode ?? "vector");
     const resolvedModels = this.resolveChannelModelSelection(
       input.preferredConnectionId,
       input.chatModelId,
       input.embeddingModelId
     );
 
-    const existing = this.db.getChannelByRoot(input.rootPath);
     if (existing) {
       this.assertValidChannelModelSelection(resolvedModels.chatModelId, resolvedModels.embeddingModelId);
       this.db.updateChannel(existing.id, {
@@ -314,6 +318,7 @@ export class DesktopAppService {
         preferredConnectionId: resolvedModels.preferredConnectionId ?? existing.preferredConnectionId,
         chatModelId: resolvedModels.chatModelId ?? existing.chatModelId,
         embeddingModelId: resolvedModels.embeddingModelId ?? existing.embeddingModelId,
+        retrievalMode,
         updatedAt: new Date().toISOString()
       });
       return this.loadChannel(existing.id);
@@ -329,6 +334,7 @@ export class DesktopAppService {
       preferredConnectionId: resolvedModels.preferredConnectionId,
       chatModelId: resolvedModels.chatModelId,
       embeddingModelId: resolvedModels.embeddingModelId,
+      retrievalMode,
       lastIndexedAt: null,
       status: "idle",
       createdAt: now,
@@ -362,6 +368,7 @@ export class DesktopAppService {
 
     let nextStatus = channel.status;
     let nextLastIndexedAt = channel.lastIndexedAt;
+    const retrievalMode = this.resolveRetrievalMode(input.retrievalMode ?? channel.retrievalMode);
     const resolvedModels = this.resolveChannelModelSelection(
       input.preferredConnectionId,
       input.chatModelId,
@@ -369,7 +376,11 @@ export class DesktopAppService {
     );
     this.assertValidChannelModelSelection(resolvedModels.chatModelId, resolvedModels.embeddingModelId);
 
-    if (resolvedModels.embeddingModelId && resolvedModels.embeddingModelId !== channel.embeddingModelId) {
+    if (retrievalMode !== channel.retrievalMode) {
+      this.db.replaceIndexedFiles(channel.id, []);
+      nextStatus = "idle";
+      nextLastIndexedAt = null;
+    } else if (retrievalMode === "vector" && resolvedModels.embeddingModelId && resolvedModels.embeddingModelId !== channel.embeddingModelId) {
       const embeddingSelection = await this.resolveModelSelection(resolvedModels.embeddingModelId);
       const status = await this.worker.getIndexStatus(channel.rootPath);
       const expectedKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
@@ -390,6 +401,7 @@ export class DesktopAppService {
       preferredConnectionId: resolvedModels.preferredConnectionId,
       chatModelId: resolvedModels.chatModelId,
       embeddingModelId: resolvedModels.embeddingModelId,
+      retrievalMode,
       status: nextStatus,
       lastIndexedAt: nextLastIndexedAt,
       updatedAt: new Date().toISOString()
@@ -486,28 +498,82 @@ export class DesktopAppService {
       throw new Error("Channel is not indexed yet.");
     }
 
-    if (!channel.chatModelId || !channel.embeddingModelId) {
-      throw new Error("Both chat and embedding models are required.");
+    if (!channel.chatModelId) {
+      throw new Error("A chat model is required.");
     }
 
     const chatSelection = await this.resolveModelSelection(channel.chatModelId);
-    const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
     if (!chatSelection.model.supportsChat) {
       throw new Error("Selected chat model does not support chat.");
     }
-    if (!embeddingSelection.model.supportsEmbedding) {
-      throw new Error("Selected embedding model does not support embeddings.");
-    }
-
-    const queryOptions = this.toWorkerBuildOptions(embeddingSelection.connection, embeddingSelection.model, embeddingSelection.secret);
     let searchResponse;
-    try {
-      searchResponse = await this.worker.search(channel.rootPath, input.message, 6, queryOptions);
-    } catch (error) {
-      if (isInvalidIndexError(error)) {
-        await this.invalidateChannelIndex(channel, "This channel's index is outdated or missing. Regenerate the index before chatting.");
+
+    if (channel.retrievalMode === "vector") {
+      if (!channel.embeddingModelId) {
+        throw new Error("An embedding model is required for vector channels.");
       }
-      throw error;
+      const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
+      if (!embeddingSelection.model.supportsEmbedding) {
+        throw new Error("Selected embedding model does not support embeddings.");
+      }
+      const queryOptions = this.toWorkerBuildOptions({
+        retrievalMode: "vector",
+        connection: embeddingSelection.connection,
+        model: embeddingSelection.model,
+        secret: embeddingSelection.secret
+      });
+      try {
+        searchResponse = await this.worker.search(channel.rootPath, input.message, 6, queryOptions);
+      } catch (error) {
+        if (isInvalidIndexError(error)) {
+          await this.invalidateChannelIndex(channel, "This channel's index is outdated or missing. Regenerate the index before chatting.");
+        }
+        throw error;
+      }
+    } else {
+      const documentManifest = await this.worker.listDocuments(channel.rootPath);
+      const candidateDocuments = preselectManifestDocuments(documentManifest.documents, input.message, 24);
+      let selectedDocumentIds = candidateDocuments.slice(0, 3).map((document) => document.documentId);
+
+      if (candidateDocuments.length > 0) {
+        try {
+          const selection = await selectRelevantDocuments({
+            connection: chatSelection.connection,
+            model: chatSelection.model,
+            secret: chatSelection.secret,
+            documents: candidateDocuments,
+            userMessage: input.message,
+            maxDocuments: 3
+          });
+          selectedDocumentIds = resolveSelectedDocumentIds(selection.documentIds, candidateDocuments);
+          if (selectedDocumentIds.length === 0) {
+            selectedDocumentIds = candidateDocuments.slice(0, 3).map((document) => document.documentId);
+          }
+        } catch {
+          selectedDocumentIds = candidateDocuments.slice(0, 3).map((document) => document.documentId);
+        }
+      }
+
+      const queryOptions = this.toWorkerBuildOptions({
+        retrievalMode: "vectorless",
+        documentIds: selectedDocumentIds
+      });
+      try {
+        searchResponse = await this.worker.search(channel.rootPath, input.message, 8, queryOptions);
+        if (searchResponse.results.length === 0 && selectedDocumentIds.length > 0) {
+          searchResponse = await this.worker.search(
+            channel.rootPath,
+            input.message,
+            8,
+            this.toWorkerBuildOptions({ retrievalMode: "vectorless" })
+          );
+        }
+      } catch (error) {
+        if (isInvalidIndexError(error)) {
+          await this.invalidateChannelIndex(channel, "This channel's index is outdated or missing. Regenerate the index before chatting.");
+        }
+        throw error;
+      }
     }
 
     const now = new Date().toISOString();
@@ -575,20 +641,10 @@ export class DesktopAppService {
       throw new Error("Channel not found.");
     }
 
-    if (!channel.embeddingModelId) {
-      throw new Error("An embedding model is required before indexing.");
-    }
-
-    const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
-    if (!embeddingSelection.model.supportsEmbedding) {
-      throw new Error("Selected model does not support embeddings.");
-    }
-
-    const options = this.toWorkerBuildOptions(
-      embeddingSelection.connection,
-      embeddingSelection.model,
-      embeddingSelection.secret
-    );
+    const options =
+      channel.retrievalMode === "vector"
+        ? await this.buildVectorIndexOptions(channel)
+        : this.toWorkerBuildOptions({ retrievalMode: "vectorless" });
     this.db.updateChannel(channel.id, {
       status: "indexing",
       updatedAt: new Date().toISOString()
@@ -686,19 +742,33 @@ export class DesktopAppService {
     return { apiKey };
   }
 
-  private toWorkerBuildOptions(
-    connection: ProviderConnection,
-    model: ProviderModel,
-    secret: { apiKey: string }
-  ): WorkerBuildOptions {
+  private toWorkerBuildOptions(args: {
+    retrievalMode: RetrievalMode;
+    connection?: ProviderConnection;
+    model?: ProviderModel;
+    secret?: { apiKey: string };
+    documentIds?: string[];
+  }): WorkerBuildOptions {
+    const retrieval = {
+      mode: args.retrievalMode,
+      engine: args.retrievalMode === "vector" ? "numpy-cosine" : "manifest-first-lexical",
+      documentIds: args.documentIds
+    };
+    if (args.retrievalMode !== "vector") {
+      return { retrieval };
+    }
+    if (!args.connection || !args.model || !args.secret) {
+      throw new Error("Vector retrieval requires provider connection, model, and secret.");
+    }
     return {
+      retrieval,
       embeddingProvider: {
-        provider: connection.provider,
-        baseUrl: connection.baseUrl,
-        apiVersion: connection.apiVersion,
-        apiKey: secret.apiKey,
-        model: model.modelId,
-        deployment: model.deployment
+        provider: args.connection.provider,
+        baseUrl: args.connection.baseUrl,
+        apiVersion: args.connection.apiVersion,
+        apiKey: args.secret.apiKey,
+        model: args.model.modelId,
+        deployment: args.model.deployment
       }
     };
   }
@@ -708,14 +778,44 @@ export class DesktopAppService {
       return channel;
     }
 
-    if (!channel.embeddingModelId) {
-      return channel;
+    const status = await this.worker.getIndexStatus(channel.rootPath);
+    if (!status.exists || !status.manifest || status.manifest.retrievalMode !== channel.retrievalMode) {
+      if (channel.lastIndexedAt || channel.status === "ready" || channel.status === "stale") {
+        this.db.replaceIndexedFiles(channel.id, []);
+        this.db.updateChannel(channel.id, {
+          lastIndexedAt: null,
+          status: "idle",
+          updatedAt: new Date().toISOString()
+        });
+      }
+      return this.db.getChannel(channel.id);
     }
 
-    const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
-    const expectedEmbeddingKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
-    const status = await this.worker.getIndexStatus(channel.rootPath);
-    if (status.exists && status.manifest && status.manifest.embeddingModelKey === expectedEmbeddingKey) {
+    if (channel.retrievalMode === "vector") {
+      if (!channel.embeddingModelId) {
+        return channel;
+      }
+
+      const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
+      const expectedEmbeddingKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
+      if (status.manifest.embeddingModelKey !== expectedEmbeddingKey) {
+        if (channel.lastIndexedAt || channel.status === "ready" || channel.status === "stale") {
+          this.db.replaceIndexedFiles(channel.id, []);
+          this.db.updateChannel(channel.id, {
+            lastIndexedAt: null,
+            status: "idle",
+            updatedAt: new Date().toISOString()
+          });
+        }
+        return this.db.getChannel(channel.id);
+      }
+    }
+
+    if (
+      status.exists &&
+      status.manifest &&
+      status.manifest.retrievalMode === channel.retrievalMode
+    ) {
       this.db.replaceIndexedFiles(channel.id, status.manifest.files);
       if (channel.lastIndexedAt !== status.manifest.updatedAt || channel.status === "idle" || channel.status === "error") {
         this.db.updateChannel(channel.id, {
@@ -727,14 +827,6 @@ export class DesktopAppService {
       return this.db.getChannel(channel.id);
     }
 
-    if (channel.lastIndexedAt || channel.status === "ready" || channel.status === "stale") {
-      this.db.replaceIndexedFiles(channel.id, []);
-      this.db.updateChannel(channel.id, {
-        lastIndexedAt: null,
-        status: "idle",
-        updatedAt: new Date().toISOString()
-      });
-    }
     return this.db.getChannel(channel.id);
   }
 
@@ -778,6 +870,29 @@ export class DesktopAppService {
       chatModelId: chatModelId ?? defaults?.defaultChatModelId ?? null,
       embeddingModelId: embeddingModelId ?? defaults?.defaultEmbeddingModelId ?? null
     };
+  }
+
+  private resolveRetrievalMode(mode: RetrievalMode): RetrievalMode {
+    if (!["vector", "vectorless"].includes(mode)) {
+      throw new Error(`Retrieval mode "${mode}" is not supported.`);
+    }
+    return mode;
+  }
+
+  private async buildVectorIndexOptions(channel: Channel) {
+    if (!channel.embeddingModelId) {
+      throw new Error("An embedding model is required before indexing vector channels.");
+    }
+    const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
+    if (!embeddingSelection.model.supportsEmbedding) {
+      throw new Error("Selected model does not support embeddings.");
+    }
+    return this.toWorkerBuildOptions({
+      retrievalMode: "vector",
+      connection: embeddingSelection.connection,
+      model: embeddingSelection.model,
+      secret: embeddingSelection.secret
+    });
   }
 
   private assertProviderDefaultModel(connectionId: string, modelId: string | null, expectedCapability: "chat" | "embedding") {
@@ -883,4 +998,43 @@ function deriveCancelledChannelStatus(files: IndexedFileRecord[]): Exclude<Chann
     return "error";
   }
   return "idle";
+}
+
+function preselectManifestDocuments(documents: IndexedDocumentRecord[], query: string, limit: number) {
+  const queryTokens = tokenizeManifestQuery(query);
+  return [...documents]
+    .sort((left, right) => {
+      const leftScore = scoreManifestDocument(left, query, queryTokens);
+      const rightScore = scoreManifestDocument(right, query, queryTokens);
+      return rightScore - leftScore;
+    })
+    .slice(0, limit);
+}
+
+function resolveSelectedDocumentIds(documentIds: string[], documents: IndexedDocumentRecord[]) {
+  const validIds = new Set(documents.map((document) => document.documentId));
+  return documentIds.filter((documentId) => validIds.has(documentId));
+}
+
+function scoreManifestDocument(document: IndexedDocumentRecord, query: string, queryTokens: string[]) {
+  const haystack = [document.relativePath, document.summary, ...document.sectionHints].join(" ").toLowerCase();
+  const lowerQuery = query.toLowerCase().trim();
+  let score = 0;
+  if (lowerQuery && haystack.includes(lowerQuery)) {
+    score += 5;
+  }
+  for (const token of new Set(queryTokens)) {
+    const count = haystack.split(token).length - 1;
+    if (count > 0) {
+      score += Math.min(count, 6);
+    }
+    if (document.relativePath.toLowerCase().includes(token)) {
+      score += 1.5;
+    }
+  }
+  return score;
+}
+
+function tokenizeManifestQuery(query: string) {
+  return query.toLowerCase().match(/[a-z0-9]+/g)?.filter((token) => token.length > 1) ?? [];
 }

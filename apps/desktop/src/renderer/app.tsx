@@ -9,6 +9,7 @@ import type {
   ProviderConnection,
   ProviderDefaults,
   ProviderModel,
+  RetrievalMode,
   Thread
 } from "@fschat/shared";
 import { CitationsPanel, Field, FileRow, Modal, ProgressCard, StatusPill } from "./ui/common";
@@ -40,6 +41,7 @@ export function App() {
   const [inspection, setInspection] = useState<RootInspection | null>(null);
   const [channelName, setChannelName] = useState("");
   const [pendingPreferredConnectionId, setPendingPreferredConnectionId] = useState<string | null>(null);
+  const [pendingRetrievalMode, setPendingRetrievalMode] = useState<RetrievalMode>("vector");
   const [pendingChatModelId, setPendingChatModelId] = useState<string | null>(null);
   const [pendingEmbeddingModelId, setPendingEmbeddingModelId] = useState<string | null>(null);
   const [fileQuery, setFileQuery] = useState("");
@@ -110,7 +112,8 @@ export function App() {
   );
   const chatModels = models.filter((model) => model.supportsChat);
   const embeddingModels = models.filter((model) => model.supportsEmbedding);
-  const hasProviderProfiles = chatModels.length > 0 && embeddingModels.length > 0;
+  const hasChatProviders = chatModels.length > 0;
+  const hasVectorProviders = chatModels.length > 0 && embeddingModels.length > 0;
   const selectedThread = snapshot?.threads.find((thread) => thread.id === selectedThreadId) ?? null;
   const selectedProgress = selectedChannelId ? progressByChannel[selectedChannelId] : undefined;
   const filteredIndexedFiles = useMemo(() => filterFiles(snapshot?.indexedFiles ?? [], fileQuery), [snapshot?.indexedFiles, fileQuery]);
@@ -191,6 +194,7 @@ export function App() {
       const result = await window.fsChat.inspectRootFolder(rootPath);
       setInspection(result);
       setChannelName(result.defaultDisplayName);
+      setPendingRetrievalMode(result.existingChannel?.retrievalMode ?? "vector");
       const preferredConnectionId =
         result.existingChannel?.preferredConnectionId ??
         pickInitialConnectionId(connections, providerDefaultsByConnectionId) ??
@@ -213,12 +217,14 @@ export function App() {
         displayName: channelName,
         preferredConnectionId: pendingPreferredConnectionId,
         chatModelId: pendingChatModelId,
-        embeddingModelId: pendingEmbeddingModelId
+        embeddingModelId: pendingRetrievalMode === "vector" ? pendingEmbeddingModelId : null,
+        retrievalMode: pendingRetrievalMode
       });
       setCreateOpen(false);
       setInspection(null);
       setChannelName("");
       setPendingPreferredConnectionId(null);
+      setPendingRetrievalMode("vector");
       setPendingChatModelId(null);
       setPendingEmbeddingModelId(null);
       await refreshBootstrap();
@@ -306,7 +312,8 @@ export function App() {
   async function handleSaveChannelModels(
     preferredConnectionId: string | null,
     chatModelId: string | null,
-    embeddingModelId: string | null
+    embeddingModelId: string | null,
+    retrievalMode: RetrievalMode
   ) {
     if (!selectedChannel) return;
     setBusy(true);
@@ -315,7 +322,8 @@ export function App() {
         channelId: selectedChannel.id,
         preferredConnectionId,
         chatModelId,
-        embeddingModelId
+        embeddingModelId,
+        retrievalMode
       });
       setChannels((current) => mergeChannels(current, nextSnapshot.channel));
       setSnapshot(nextSnapshot);
@@ -366,6 +374,7 @@ export function App() {
       setInspection(null);
       setChannelName("");
       setPendingPreferredConnectionId(null);
+      setPendingRetrievalMode("vector");
       setPendingChatModelId(null);
       setPendingEmbeddingModelId(null);
       setProgressByChannel({});
@@ -454,11 +463,12 @@ export function App() {
       {createOpen ? (
         <Modal title="Create Channel" onClose={() => setCreateOpen(false)}>
           <div className="space-y-4">
-            {!hasProviderProfiles ? (
+            {!hasChatProviders ? (
               <div className="rounded-3xl border border-amber-300/20 bg-amber-400/10 p-4 text-sm text-amber-100">
                 <div className="font-medium">Connected models are required before you can create a channel.</div>
                 <div className="mt-1 text-xs text-amber-100/80">
-                  Connect at least one provider with a chat-capable model and an embedding-capable model in Settings, then come back here.
+                  Connect at least one provider with a chat-capable model in Settings. Vector channels also need an
+                  embedding-capable model.
                 </div>
                 <div className="mt-3">
                   <button
@@ -508,6 +518,16 @@ export function App() {
                     ))}
                   </select>
                 </Field>
+                <Field label="Retrieval mode">
+                  <select
+                    value={pendingRetrievalMode}
+                    onChange={(event) => setPendingRetrievalMode(event.target.value as RetrievalMode)}
+                    className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
+                  >
+                    <option value="vector">Vector</option>
+                    <option value="vectorless">Vectorless</option>
+                  </select>
+                </Field>
                 <Field label="Chat model">
                   <select value={pendingChatModelId ?? ""} onChange={(event) => setPendingChatModelId(event.target.value || null)} className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none" disabled={pendingConnectionChatModels.length === 0}>
                     <option value="">Select chat model</option>
@@ -516,15 +536,22 @@ export function App() {
                     ))}
                   </select>
                 </Field>
-                <Field label="Embedding model">
-                  <select value={pendingEmbeddingModelId ?? ""} onChange={(event) => setPendingEmbeddingModelId(event.target.value || null)} className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none" disabled={pendingConnectionEmbeddingModels.length === 0}>
-                    <option value="">Select embedding model</option>
-                    {pendingConnectionEmbeddingModels.map((model) => (
-                      <option key={model.id} value={model.id}>{formatProviderModelLabel(model, connectionById[model.connectionId])}</option>
-                    ))}
-                  </select>
-                </Field>
-                {pendingPreferredConnectionId && pendingConnectionEmbeddingModels.length === 0 ? (
+                {pendingRetrievalMode === "vector" ? (
+                  <Field label="Embedding model">
+                    <select value={pendingEmbeddingModelId ?? ""} onChange={(event) => setPendingEmbeddingModelId(event.target.value || null)} className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none" disabled={pendingConnectionEmbeddingModels.length === 0}>
+                      <option value="">Select embedding model</option>
+                      {pendingConnectionEmbeddingModels.map((model) => (
+                        <option key={model.id} value={model.id}>{formatProviderModelLabel(model, connectionById[model.connectionId])}</option>
+                      ))}
+                    </select>
+                  </Field>
+                ) : (
+                  <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
+                    Vectorless channels do not need an embedding model. The app will use a manifest-first document pass
+                    before grounding answers in matching file excerpts.
+                  </div>
+                )}
+                {pendingRetrievalMode === "vector" && pendingPreferredConnectionId && pendingConnectionEmbeddingModels.length === 0 ? (
                   <div className="rounded-3xl border border-coral/25 bg-coral/10 p-4 text-sm text-[#ffd1ca]">
                     The selected provider connection does not currently expose any embedding-capable models. Refresh the
                     provider or choose a different provider connection.
@@ -537,6 +564,7 @@ export function App() {
                   </div>
                 ) : null}
                 <ModelSelectionHint
+                  retrievalMode={pendingRetrievalMode}
                   preferredConnection={pendingPreferredConnectionId ? connectionById[pendingPreferredConnectionId] ?? null : null}
                   selectedChatModel={pendingChatModelId ? models.find((model) => model.id === pendingChatModelId) ?? null : null}
                   selectedEmbeddingModel={
@@ -555,13 +583,13 @@ export function App() {
                     Settings
                   </button>
                   <button className="rounded-full border border-white/10 px-4 py-2 text-sm text-mist" onClick={() => setCreateOpen(false)}>Close</button>
-                  <button className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink disabled:opacity-40" onClick={() => void handleCreateChannel()} disabled={!inspection || !channelName.trim() || !pendingPreferredConnectionId || !pendingEmbeddingModelId || !pendingChatModelId || pendingConnectionEmbeddingModels.length === 0 || pendingConnectionChatModels.length === 0 || !hasProviderProfiles}>Create Channel</button>
+                  <button className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink disabled:opacity-40" onClick={() => void handleCreateChannel()} disabled={!inspection || !channelName.trim() || !pendingPreferredConnectionId || !pendingChatModelId || pendingConnectionChatModels.length === 0 || !hasChatProviders || (pendingRetrievalMode === "vector" && (!pendingEmbeddingModelId || pendingConnectionEmbeddingModels.length === 0 || !hasVectorProviders))}>Create Channel</button>
                 </div>
               </>
             ) : (
               <div className="rounded-3xl border border-dashed border-white/10 p-5 text-sm text-mist/75">
-                {hasProviderProfiles
-                  ? "Pick a root folder to inspect existing index data and assign chat and embedding models."
+                {hasChatProviders
+                  ? "Pick a root folder to inspect existing index data and assign chat and retrieval settings."
                   : "Connect your providers in Settings first, then pick a root folder."}
               </div>
             )}
@@ -704,11 +732,12 @@ function FilesPanel({
         </div>
         <div className="mt-3 space-y-1 text-xs text-mist/65">
           <div className="break-anywhere">Provider: {preferredConnection ? preferredConnection.name : "Not set"}</div>
+          <div className="break-anywhere">Retrieval: {formatRetrievalModeLabel(selectedChannel.retrievalMode)}</div>
           <div className="break-anywhere">
             Chat: {selectedChatModel ? formatProviderModelLabel(selectedChatModel, connectionById[selectedChatModel.connectionId]) : "Not set"}
           </div>
           <div className="break-anywhere">
-            Embedding: {selectedEmbeddingModel ? formatProviderModelLabel(selectedEmbeddingModel, connectionById[selectedEmbeddingModel.connectionId]) : "Not set"}
+            Embedding: {selectedChannel.retrievalMode === "vectorless" ? "Not used" : selectedEmbeddingModel ? formatProviderModelLabel(selectedEmbeddingModel, connectionById[selectedEmbeddingModel.connectionId]) : "Not set"}
           </div>
         </div>
       </div>
@@ -794,7 +823,7 @@ function CancelToast({
           </button>
         </div>
         <div className="break-anywhere text-sm leading-6 text-[#ffd1ca]/85">
-          Choose whether to keep the files that already finished embedding, or discard this in-progress run and leave the last committed index untouched.
+          Choose whether to keep the files that already finished indexing, or discard this in-progress run and leave the last committed index untouched.
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
           <button
@@ -833,10 +862,12 @@ function ChannelModelsModal({
   onSave: (
     preferredConnectionId: string | null,
     chatModelId: string | null,
-    embeddingModelId: string | null
+    embeddingModelId: string | null,
+    retrievalMode: RetrievalMode
   ) => void | Promise<void>;
 }) {
   const [preferredConnectionId, setPreferredConnectionId] = useState(channel.preferredConnectionId ?? "");
+  const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>(channel.retrievalMode ?? "vector");
   const [chatModelId, setChatModelId] = useState(channel.chatModelId ?? "");
   const [embeddingModelId, setEmbeddingModelId] = useState(channel.embeddingModelId ?? "");
   const connectionById = useMemo(
@@ -861,7 +892,7 @@ function ChannelModelsModal({
         : [],
     [models, preferredConnectionId]
   );
-  const embeddingChanged = (channel.embeddingModelId ?? "") !== embeddingModelId;
+  const embeddingChanged = retrievalMode === "vector" && (channel.embeddingModelId ?? "") !== embeddingModelId;
   const preferredConnection = preferredConnectionId ? connectionById[preferredConnectionId] ?? null : null;
   const selectedChatModel = chatModelId ? models.find((model) => model.id === chatModelId) ?? null : null;
   const selectedEmbeddingModel = embeddingModelId ? models.find((model) => model.id === embeddingModelId) ?? null : null;
@@ -893,6 +924,16 @@ function ChannelModelsModal({
             ))}
           </select>
         </Field>
+        <Field label="Retrieval mode">
+          <select
+            value={retrievalMode}
+            onChange={(event) => setRetrievalMode(event.target.value as RetrievalMode)}
+            className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
+          >
+            <option value="vector">Vector</option>
+            <option value="vectorless">Vectorless</option>
+          </select>
+        </Field>
         <Field label="Chat model">
           <select
             value={chatModelId}
@@ -907,27 +948,34 @@ function ChannelModelsModal({
             ))}
           </select>
         </Field>
-        <Field label="Embedding model">
-          <select
-            value={embeddingModelId}
-            onChange={(event) => setEmbeddingModelId(event.target.value)}
-            className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
-          >
-            <option value="">No embedding model</option>
-            {embeddingModels.map((model) => (
-              <option key={model.id} value={model.id}>
-                {formatProviderModelLabel(model, connectionById[model.connectionId])}
-              </option>
-            ))}
-          </select>
-        </Field>
+        {retrievalMode === "vector" ? (
+          <Field label="Embedding model">
+            <select
+              value={embeddingModelId}
+              onChange={(event) => setEmbeddingModelId(event.target.value)}
+              className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
+            >
+              <option value="">No embedding model</option>
+              {embeddingModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {formatProviderModelLabel(model, connectionById[model.connectionId])}
+                </option>
+              ))}
+            </select>
+          </Field>
+        ) : (
+          <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
+            Vectorless channels use manifest-first document selection and do not require an embedding model.
+          </div>
+        )}
         <ModelSelectionHint
+          retrievalMode={retrievalMode}
           preferredConnection={preferredConnection}
           selectedChatModel={selectedChatModel}
           selectedEmbeddingModel={selectedEmbeddingModel}
           connectionById={connectionById}
         />
-        {preferredConnectionId && embeddingModels.length === 0 ? (
+        {retrievalMode === "vector" && preferredConnectionId && embeddingModels.length === 0 ? (
           <div className="rounded-3xl border border-coral/25 bg-coral/10 p-4 text-sm text-[#ffd1ca]">
             This provider connection does not currently expose any embedding-capable models.
           </div>
@@ -948,8 +996,8 @@ function ChannelModelsModal({
           </button>
           <button
             className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink disabled:opacity-40"
-            disabled={!preferredConnectionId || !chatModelId || !embeddingModelId || chatModels.length === 0 || embeddingModels.length === 0}
-            onClick={() => void onSave(preferredConnectionId || null, chatModelId || null, embeddingModelId || null)}
+            disabled={!preferredConnectionId || !chatModelId || chatModels.length === 0 || (retrievalMode === "vector" && (!embeddingModelId || embeddingModels.length === 0))}
+            onClick={() => void onSave(preferredConnectionId || null, chatModelId || null, retrievalMode === "vector" ? embeddingModelId || null : null, retrievalMode)}
           >
             Save Models
           </button>
@@ -1006,11 +1054,13 @@ function DeleteChannelToast({
 }
 
 function ModelSelectionHint({
+  retrievalMode,
   preferredConnection,
   selectedChatModel,
   selectedEmbeddingModel,
   connectionById
 }: {
+  retrievalMode: RetrievalMode;
   preferredConnection: ProviderConnection | null;
   selectedChatModel: ProviderModel | null;
   selectedEmbeddingModel: ProviderModel | null;
@@ -1033,8 +1083,9 @@ function ModelSelectionHint({
     <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
       <div className="font-medium text-paper">Selection rules</div>
       <div className="mt-2 leading-6">
-        Chat and embedding models are validated independently, and both must come from the same provider connection.
-        The chat model must support chat, and the embedding model must support embeddings.
+        {retrievalMode === "vector"
+          ? "Chat and embedding models are validated independently, and both must come from the same provider connection. The chat model must support chat, and the embedding model must support embeddings."
+          : "Vectorless channels require a chat-capable model. Embedding models are optional because retrieval happens through manifest-first document selection and lexical grounding."}
       </div>
       {crossProviderOverride ? (
         <div className="mt-2 leading-6 text-amber-100/85">
@@ -1047,7 +1098,7 @@ function ModelSelectionHint({
       </div>
       <div className="text-xs leading-6 text-mist/65">
         Embedding source:{" "}
-        {selectedEmbeddingModel ? connectionById[selectedEmbeddingModel.connectionId]?.name ?? "Unknown" : "Not set"}
+        {retrievalMode === "vectorless" ? "Not used" : selectedEmbeddingModel ? connectionById[selectedEmbeddingModel.connectionId]?.name ?? "Unknown" : "Not set"}
       </div>
     </div>
   );
@@ -1089,7 +1140,9 @@ function ChatPanel({
           <div className="break-anywhere font-display text-[clamp(2rem,2vw+1rem,3rem)] leading-tight text-paper">Chat With {selectedChannel.displayName}</div>
           <div className="break-anywhere mt-2 text-sm text-mist/70">
             {selectedChannel.status === "ready"
-              ? "Ask questions across the selected folder and its indexed subdirectories."
+              ? selectedChannel.retrievalMode === "vectorless"
+                ? "Ask questions across the selected folder. Vectorless chat first selects relevant documents from the local manifest, then grounds the answer in matching file excerpts."
+                : "Ask questions across the selected folder and its indexed subdirectories."
               : selectedChannel.status === "stale"
                 ? "This channel remains searchable, but the latest rebuild was cancelled and the retained index is partial."
                 : "Finish indexing before starting retrieval-backed chat."}
@@ -1185,6 +1238,10 @@ function filterFiles(files: IndexedFileRecord[], query: string) {
 
 function formatModelLabel(model: ProviderModel, connection: ProviderConnection | undefined) {
   return connection ? `${connection.name} · ${model.displayName}` : model.displayName;
+}
+
+function formatRetrievalModeLabel(retrievalMode: RetrievalMode) {
+  return retrievalMode === "vectorless" ? "Vectorless manifest-first" : "Vector";
 }
 
 function toErrorMessage(error: unknown) {

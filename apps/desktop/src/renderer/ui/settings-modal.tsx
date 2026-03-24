@@ -13,7 +13,7 @@ const PROVIDERS: Array<{ value: ProviderKind; label: string; note: string }> = [
   {
     value: "anthropic",
     label: "Anthropic",
-    note: "Claude chat models are discovered automatically. Anthropic connections do not provide embeddings here."
+    note: "Claude chat models are discovered automatically. Anthropic works for vectorless channels, but vector channels still need embeddings from another provider."
   },
   { value: "google", label: "Google Gemini", note: "Chat and embedding models are discovered automatically." },
   {

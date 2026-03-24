@@ -10,7 +10,8 @@ from typing import Iterable
 
 INDEX_DIR_NAME = ".fschat-index"
 INDEX_TEMP_DIR_NAME = ".fschat-index.tmp"
-INDEX_VERSION = 2
+INDEX_VERSION = 3
+SUPPORTED_INDEX_VERSIONS = {2, 3}
 
 
 def root_index_path(root_path: Path) -> Path:
@@ -27,6 +28,10 @@ def manifest_path(index_path: Path) -> Path:
 
 def chunk_metadata_path(index_path: Path) -> Path:
     return index_path / "chunk_metadata.jsonl"
+
+
+def documents_path(index_path: Path) -> Path:
+    return index_path / "documents.json"
 
 
 def vector_index_path(index_path: Path) -> Path:
@@ -66,8 +71,15 @@ def read_manifest(root_path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError("Index manifest not found.")
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("version") != INDEX_VERSION:
+    version = manifest.get("version")
+    if version not in SUPPORTED_INDEX_VERSIONS:
         raise ValueError("Unsupported index version.")
+    if version == 2:
+        manifest["retrievalMode"] = "vector"
+        manifest["indexEngine"] = "numpy-cosine"
+        return manifest
+    manifest.setdefault("retrievalMode", "vector")
+    manifest.setdefault("indexEngine", "numpy-cosine")
     return manifest
 
 
@@ -81,12 +93,23 @@ def write_chunk_metadata(index_path: Path, chunks: Iterable[dict]) -> None:
             handle.write(json.dumps(chunk, ensure_ascii=True) + "\n")
 
 
+def write_documents(index_path: Path, documents: list[dict]) -> None:
+    documents_path(index_path).write_text(json.dumps(documents, indent=2), encoding="utf-8")
+
+
 def read_chunk_metadata(root_path: Path) -> list[dict]:
     path = chunk_metadata_path(root_index_path(root_path))
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def read_documents(root_path: Path) -> list[dict]:
+    path = documents_path(root_index_path(root_path))
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def hide_path(path: Path) -> None:

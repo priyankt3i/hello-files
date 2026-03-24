@@ -1,10 +1,11 @@
 export const INDEX_DIR_NAME = ".fschat-index";
-export const INDEX_VERSION = 2;
+export const INDEX_VERSION = 3;
 
 export type ChannelStatus = "ready" | "indexing" | "stale" | "error" | "idle";
 export type FileIndexStatus = "indexed" | "failed";
 export type ProviderKind = "openai" | "azure-openai" | "anthropic" | "google" | "ollama";
 export type ModelCapability = "chat" | "embedding" | "vision";
+export type RetrievalMode = "vector" | "vectorless";
 
 export interface ProviderConnection {
   id: string;
@@ -48,6 +49,7 @@ export interface Channel {
   preferredConnectionId: string | null;
   chatModelId: string | null;
   embeddingModelId: string | null;
+  retrievalMode: RetrievalMode;
   lastIndexedAt: string | null;
   status: ChannelStatus;
   createdAt: string;
@@ -63,6 +65,19 @@ export interface IndexedFileRecord {
   chunks: number;
   contentHash?: string;
   errorReason?: string;
+}
+
+export interface IndexedDocumentRecord {
+  documentId: string;
+  relativePath: string;
+  parser: string;
+  size: number;
+  mtime: number;
+  chunks: number;
+  tokenEstimate: number;
+  summary: string;
+  sectionHints: string[];
+  contentHash?: string;
 }
 
 export interface Citation {
@@ -103,7 +118,10 @@ export interface IndexManifest {
   updatedAt: string;
   files: IndexedFileRecord[];
   chunkCount: number;
-  embeddingDimension: number;
+  documentCount?: number;
+  retrievalMode: RetrievalMode;
+  indexEngine?: string;
+  embeddingDimension?: number;
   embeddingModelKey?: string;
 }
 
@@ -133,6 +151,10 @@ export interface SearchResult {
 
 export interface WorkerSearchResponse {
   results: SearchResult[];
+}
+
+export interface WorkerDocumentsResponse {
+  documents: IndexedDocumentRecord[];
 }
 
 export interface ConnectProviderInput {
@@ -166,6 +188,7 @@ export interface RegisterChannelInput {
   preferredConnectionId: string | null;
   chatModelId: string | null;
   embeddingModelId: string | null;
+  retrievalMode?: RetrievalMode;
 }
 
 export interface UpdateChannelModelsInput {
@@ -173,6 +196,7 @@ export interface UpdateChannelModelsInput {
   preferredConnectionId: string | null;
   chatModelId: string | null;
   embeddingModelId: string | null;
+  retrievalMode?: RetrievalMode;
 }
 
 export interface CancelIndexInput {
@@ -193,6 +217,11 @@ export interface SendMessageResult {
 }
 
 export interface WorkerBuildOptions {
+  retrieval?: {
+    mode: RetrievalMode;
+    engine?: string;
+    documentIds?: string[];
+  };
   embeddingProvider?: {
     provider: ProviderKind;
     baseUrl?: string;
