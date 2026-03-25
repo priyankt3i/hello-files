@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { WebContents } from "electron";
 import { INDEX_DIR_NAME } from "@fschat/shared";
 import type {
@@ -9,6 +10,7 @@ import type {
   Channel,
   ChannelStatus,
   ChannelSnapshot,
+  CreateThreadInput,
   ConnectProviderInput,
   ConnectProviderResult,
   IndexedDocumentRecord,
@@ -16,6 +18,7 @@ import type {
   IndexProgressEvent,
   IndexedFileRecord,
   Message,
+  OpenChannelFileInput,
   ProviderConnection,
   ProviderDefaults,
   ProviderModel,
@@ -25,6 +28,8 @@ import type {
   SendMessageInput,
   SendMessageResult,
   Thread,
+  UpdateChannelSystemPromptInput,
+  UpdateThreadTitleInput,
   UpdateChannelModelsInput,
   WorkerBuildResponse,
   WorkerBuildOptions
@@ -42,12 +47,18 @@ import { PythonWorkerBridge } from "./python-worker";
 
 const SECRET_SERVICE = "filesystem-rag-chat";
 const require = createRequire(import.meta.url);
-const { app, dialog } = require("electron") as typeof import("electron");
+const { app, dialog, shell } = require("electron") as typeof import("electron");
 const keytar = require("keytar") as typeof import("keytar");
 const IGNORED_STDERR_PATTERNS = [
   "Conditional Formatting extension is not supported and will be removed",
   "openpyxl\\worksheet\\_reader.py:329: UserWarning"
 ];
+const DEFAULT_CHANNEL_SYSTEM_PROMPT = [
+  "You are Filesystem RAG Chat.",
+  "Answer using the indexed filesystem context when possible.",
+  "If the indexed context is insufficient, say what is missing.",
+  "Mention the source file paths inline when making claims."
+].join(" ");
 
 export class DesktopAppService {
   private db: AppDatabase;
@@ -98,6 +109,7 @@ export class DesktopAppService {
 
   async bootstrap(): Promise<BootstrapResponse> {
     for (const channel of this.db.listChannels()) {
+      await this.ensureChannelSystemPrompt(channel);
       if (channel.status === "indexing" && !this.worker.hasActiveBuild(channel.id)) {
         this.db.updateChannel(channel.id, {
           status: "idle",
@@ -319,6 +331,7 @@ export class DesktopAppService {
         chatModelId: resolvedModels.chatModelId ?? existing.chatModelId,
         embeddingModelId: resolvedModels.embeddingModelId ?? existing.embeddingModelId,
         retrievalMode,
+        systemPrompt: normalizeChannelSystemPrompt(input.systemPrompt, existing.systemPrompt),
         updatedAt: new Date().toISOString()
       });
       return this.loadChannel(existing.id);
@@ -335,6 +348,7 @@ export class DesktopAppService {
       chatModelId: resolvedModels.chatModelId,
       embeddingModelId: resolvedModels.embeddingModelId,
       retrievalMode,
+      systemPrompt: normalizeChannelSystemPrompt(input.systemPrompt),
       lastIndexedAt: null,
       status: "idle",
       createdAt: now,
@@ -410,6 +424,20 @@ export class DesktopAppService {
     return this.loadChannel(channel.id);
   }
 
+  async updateChannelSystemPrompt(input: UpdateChannelSystemPromptInput): Promise<ChannelSnapshot> {
+    const channel = this.db.getChannel(input.channelId);
+    if (!channel) {
+      throw new Error("Channel not found.");
+    }
+
+    this.db.updateChannel(channel.id, {
+      systemPrompt: normalizeChannelSystemPrompt(input.systemPrompt, channel.systemPrompt),
+      updatedAt: new Date().toISOString()
+    });
+
+    return this.loadChannel(channel.id);
+  }
+
   async deleteChannel(channelId: string) {
     const channel = this.db.getChannel(channelId);
     if (!channel) {
@@ -426,6 +454,7 @@ export class DesktopAppService {
     if (!channel) {
       throw new Error("Channel not found.");
     }
+    await this.ensureChannelSystemPrompt(channel);
     if (channel.status === "indexing" && !this.worker.hasActiveBuild(channel.id)) {
       this.db.updateChannel(channel.id, {
         status: "idle",
@@ -474,6 +503,60 @@ export class DesktopAppService {
 
   async getThreadMessages(threadId: string) {
     return this.db.listMessages(threadId);
+  }
+
+  async createThread(input: CreateThreadInput): Promise<Thread> {
+    const channel = this.db.getChannel(input.channelId);
+    if (!channel) {
+      throw new Error("Channel not found.");
+    }
+
+    const now = new Date().toISOString();
+    return this.db.createThread({
+      id: randomUUID(),
+      channelId: channel.id,
+      title: resolveThreadTitle(input.title, this.db.listThreads(channel.id).length + 1),
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+
+  async openChannelFile(input: OpenChannelFileInput): Promise<void> {
+    const filePath = this.resolveChannelFilePath(input);
+    const error = await shell.openPath(filePath);
+    if (error) {
+      throw new Error(error);
+    }
+  }
+
+  async revealChannelFile(input: OpenChannelFileInput): Promise<void> {
+    const filePath = this.resolveChannelFilePath(input);
+    shell.showItemInFolder(filePath);
+  }
+
+  async updateThreadTitle(input: UpdateThreadTitleInput): Promise<Thread> {
+    const thread = this.db.getThread(input.threadId);
+    if (!thread) {
+      throw new Error("Thread not found.");
+    }
+
+    const title = input.title.trim();
+    if (!title) {
+      throw new Error("Thread title is required.");
+    }
+
+    this.db.updateThreadTitle(thread.id, title);
+    return this.db.getThread(thread.id) ?? { ...thread, title };
+  }
+
+  async deleteThread(threadId: string): Promise<ChannelSnapshot> {
+    const thread = this.db.getThread(threadId);
+    if (!thread) {
+      throw new Error("Thread not found.");
+    }
+
+    this.db.deleteThread(threadId);
+    return this.loadChannel(thread.channelId);
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
@@ -583,10 +666,11 @@ export class DesktopAppService {
       this.db.createThread({
         id: randomUUID(),
         channelId: channel.id,
-        title: input.message.slice(0, 50) || "New chat",
+        title: resolveThreadTitle(input.message.slice(0, 50), this.db.listThreads(channel.id).length + 1),
         createdAt: now,
         updatedAt: now
       });
+    const history = this.db.listMessages(thread.id);
 
     const userMessage: Message = {
       id: randomUUID(),
@@ -597,15 +681,18 @@ export class DesktopAppService {
       createdAt: now
     };
     this.db.createMessage(userMessage);
+    if (history.length === 0) {
+      this.db.updateThreadTitle(thread.id, input.message.slice(0, 50) || thread.title);
+    }
 
-    const history = this.db.listMessages(thread.id);
     const assistantText = await generateAssistantReply({
       connection: chatSelection.connection,
       model: chatSelection.model,
       secret: chatSelection.secret,
       searchResults: searchResponse.results,
       history,
-      userMessage: input.message
+      userMessage: input.message,
+      systemPrompt: channel.systemPrompt
     });
 
     const assistantMessage: Message = {
@@ -628,6 +715,7 @@ export class DesktopAppService {
     return {
       thread: {
         ...thread,
+        title: history.length === 0 ? input.message.slice(0, 50) || thread.title : thread.title,
         updatedAt: assistantMessage.createdAt
       },
       userMessage,
@@ -895,6 +983,45 @@ export class DesktopAppService {
     });
   }
 
+  private async ensureChannelSystemPrompt(channel: Channel) {
+    if (channel.systemPrompt.trim()) {
+      return;
+    }
+
+    this.db.updateChannel(channel.id, {
+      systemPrompt: DEFAULT_CHANNEL_SYSTEM_PROMPT,
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  private resolveChannelFilePath(input: OpenChannelFileInput) {
+    const channel = this.db.getChannel(input.channelId);
+    if (!channel) {
+      throw new Error("Channel not found.");
+    }
+    if (typeof input.relativePath !== "string" || !input.relativePath.trim()) {
+      throw new Error("A valid relative file path is required.");
+    }
+
+    const rootPath = resolve(channel.rootPath);
+    const candidatePath = resolve(channel.rootPath, input.relativePath);
+    const normalizedRoot = rootPath.toLowerCase();
+    const normalizedCandidate = candidatePath.toLowerCase();
+    const withinRoot =
+      normalizedCandidate === normalizedRoot ||
+      normalizedCandidate.startsWith(`${normalizedRoot}\\`) ||
+      normalizedCandidate.startsWith(`${normalizedRoot}/`);
+
+    if (!withinRoot) {
+      throw new Error("File path must stay within the selected channel root.");
+    }
+    if (!existsSync(candidatePath)) {
+      throw new Error("The cited file no longer exists on disk.");
+    }
+
+    return candidatePath;
+  }
+
   private assertProviderDefaultModel(connectionId: string, modelId: string | null, expectedCapability: "chat" | "embedding") {
     if (!modelId) {
       return;
@@ -978,6 +1105,16 @@ function isMissingProviderConfigurationError(error: unknown) {
 
 function buildEmbeddingModelKey(connection: ProviderConnection, model: ProviderModel) {
   return [connection.provider, connection.baseUrl || "", connection.apiVersion || "", model.deployment || "", model.modelId].join("|");
+}
+
+function normalizeChannelSystemPrompt(value?: string | null, fallback = DEFAULT_CHANNEL_SYSTEM_PROMPT) {
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : fallback;
+}
+
+function resolveThreadTitle(value: string | null | undefined, sessionNumber: number) {
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : `Session ${sessionNumber}`;
 }
 
 function deriveChannelStatusFromFiles(files: IndexedFileRecord[]): Exclude<ChannelStatus, "indexing"> {

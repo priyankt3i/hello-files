@@ -3,6 +3,7 @@ import type {
   CancelIndexInput,
   Channel,
   ChannelSnapshot,
+  CreateThreadInput,
   ConnectProviderInput,
   ConnectProviderResult,
   FileIndexStatus,
@@ -10,11 +11,15 @@ import type {
   IndexProgressEvent,
   IndexedFileRecord,
   Message,
+  OpenChannelFileInput,
   ProviderDefaults,
   RefreshProviderModelsResult,
   RegisterChannelInput,
   SendMessageInput,
   SendMessageResult,
+  Thread,
+  UpdateChannelSystemPromptInput,
+  UpdateThreadTitleInput,
   UpdateChannelModelsInput
 } from "@fschat/shared";
 
@@ -40,14 +45,21 @@ declare global {
       ) => Promise<ProviderDefaults>;
       registerChannel: (input: RegisterChannelInput) => Promise<ChannelSnapshot>;
       updateChannelModels: (input: UpdateChannelModelsInput) => Promise<ChannelSnapshot>;
+      updateChannelSystemPrompt: (input: UpdateChannelSystemPromptInput) => Promise<ChannelSnapshot>;
       deleteChannel: (channelId: string) => Promise<void>;
       loadChannel: (channelId: string) => Promise<ChannelSnapshot>;
       startIndex: (channelId: string) => Promise<ChannelSnapshot>;
       regenerateIndex: (channelId: string) => Promise<ChannelSnapshot>;
       cancelIndex: (input: CancelIndexInput) => Promise<void>;
       listChannelFiles: (channelId: string, status: FileIndexStatus) => Promise<IndexedFileRecord[]>;
+      createThread: (input: CreateThreadInput) => Promise<Thread>;
+      updateThreadTitle: (input: UpdateThreadTitleInput) => Promise<Thread>;
+      deleteThread: (threadId: string) => Promise<ChannelSnapshot>;
+      openChannelFile: (input: OpenChannelFileInput) => Promise<void>;
+      revealChannelFile: (input: OpenChannelFileInput) => Promise<void>;
       getThreadMessages: (threadId: string) => Promise<Message[]>;
       sendMessage: (input: SendMessageInput) => Promise<SendMessageResult>;
+      openExternalUrl: (url: string) => Promise<void>;
       onIndexProgress: (listener: (payload: IndexProgressEvent) => void) => () => void;
       onIndexFileUpdate: (listener: (payload: IndexFileUpdateEvent) => void) => () => void;
       onChannelRefreshed: (listener: (payload: ChannelSnapshot) => void) => () => void;

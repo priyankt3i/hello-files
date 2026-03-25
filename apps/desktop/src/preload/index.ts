@@ -3,15 +3,20 @@ import type {
   CancelIndexInput,
   BootstrapResponse,
   ChannelSnapshot,
+  CreateThreadInput,
   ConnectProviderInput,
   ConnectProviderResult,
   FileIndexStatus,
   IndexFileUpdateEvent,
   IndexProgressEvent,
+  OpenChannelFileInput,
+  Thread,
   RegisterChannelInput,
   ProviderDefaults,
   RefreshProviderModelsResult,
   SendMessageInput,
+  UpdateChannelSystemPromptInput,
+  UpdateThreadTitleInput,
   UpdateChannelModelsInput
 } from "@fschat/shared";
 
@@ -32,6 +37,8 @@ const api = {
     ipcRenderer.invoke("fschat:save-provider-defaults", connectionId, chatModelId, embeddingModelId),
   registerChannel: (input: RegisterChannelInput): Promise<ChannelSnapshot> => ipcRenderer.invoke("fschat:register-channel", input),
   updateChannelModels: (input: UpdateChannelModelsInput): Promise<ChannelSnapshot> => ipcRenderer.invoke("fschat:update-channel-models", input),
+  updateChannelSystemPrompt: (input: UpdateChannelSystemPromptInput): Promise<ChannelSnapshot> =>
+    ipcRenderer.invoke("fschat:update-channel-system-prompt", input),
   deleteChannel: (channelId: string) => ipcRenderer.invoke("fschat:delete-channel", channelId),
   loadChannel: (channelId: string): Promise<ChannelSnapshot> => ipcRenderer.invoke("fschat:load-channel", channelId),
   startIndex: (channelId: string) => ipcRenderer.invoke("fschat:start-index", channelId),
@@ -39,8 +46,14 @@ const api = {
   cancelIndex: (input: CancelIndexInput) => ipcRenderer.invoke("fschat:cancel-index", input),
   listChannelFiles: (channelId: string, status: FileIndexStatus) =>
     ipcRenderer.invoke("fschat:list-channel-files", channelId, status),
+  createThread: (input: CreateThreadInput): Promise<Thread> => ipcRenderer.invoke("fschat:create-thread", input),
+  updateThreadTitle: (input: UpdateThreadTitleInput): Promise<Thread> => ipcRenderer.invoke("fschat:update-thread-title", input),
+  deleteThread: (threadId: string): Promise<ChannelSnapshot> => ipcRenderer.invoke("fschat:delete-thread", threadId),
+  openChannelFile: (input: OpenChannelFileInput): Promise<void> => ipcRenderer.invoke("fschat:open-channel-file", input),
+  revealChannelFile: (input: OpenChannelFileInput): Promise<void> => ipcRenderer.invoke("fschat:reveal-channel-file", input),
   getThreadMessages: (threadId: string) => ipcRenderer.invoke("fschat:get-thread-messages", threadId),
   sendMessage: (input: SendMessageInput) => ipcRenderer.invoke("fschat:send-message", input),
+  openExternalUrl: (url: string): Promise<void> => ipcRenderer.invoke("fschat:open-external-url", url),
   onIndexProgress: (listener: (event: IndexProgressEvent) => void) => {
     const wrapped = (_event: unknown, payload: IndexProgressEvent) => listener(payload);
     ipcRenderer.on("fschat:index-progress", wrapped);

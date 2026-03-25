@@ -50,6 +50,7 @@ export interface Channel {
   chatModelId: string | null;
   embeddingModelId: string | null;
   retrievalMode: RetrievalMode;
+  systemPrompt: string;
   lastIndexedAt: string | null;
   status: ChannelStatus;
   createdAt: string;
@@ -189,6 +190,7 @@ export interface RegisterChannelInput {
   chatModelId: string | null;
   embeddingModelId: string | null;
   retrievalMode?: RetrievalMode;
+  systemPrompt?: string;
 }
 
 export interface UpdateChannelModelsInput {
@@ -197,6 +199,26 @@ export interface UpdateChannelModelsInput {
   chatModelId: string | null;
   embeddingModelId: string | null;
   retrievalMode?: RetrievalMode;
+}
+
+export interface UpdateChannelSystemPromptInput {
+  channelId: string;
+  systemPrompt: string;
+}
+
+export interface CreateThreadInput {
+  channelId: string;
+  title?: string | null;
+}
+
+export interface UpdateThreadTitleInput {
+  threadId: string;
+  title: string;
+}
+
+export interface OpenChannelFileInput {
+  channelId: string;
+  relativePath: string;
 }
 
 export interface CancelIndexInput {

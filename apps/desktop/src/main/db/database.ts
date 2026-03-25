@@ -41,6 +41,7 @@ export class AppDatabase {
         chat_model_id TEXT,
         embedding_model_id TEXT,
         retrieval_mode TEXT NOT NULL DEFAULT 'vector',
+        system_prompt TEXT NOT NULL DEFAULT '',
         last_indexed_at TEXT,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -138,6 +139,7 @@ export class AppDatabase {
     this.ensureColumn("channels", "chat_model_id", "TEXT");
     this.ensureColumn("channels", "embedding_model_id", "TEXT");
     this.ensureColumn("channels", "retrieval_mode", "TEXT NOT NULL DEFAULT 'vector'");
+    this.ensureColumn("channels", "system_prompt", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("indexed_files", "content_hash", "TEXT");
 
     this.migrateLegacyProviderProfiles();
@@ -299,8 +301,8 @@ export class AppDatabase {
     this.db
       .prepare(
         `INSERT INTO channels (
-          id, display_name, root_path, index_path, chat_profile_id, embedding_profile_id, preferred_connection_id, chat_model_id, embedding_model_id, retrieval_mode, last_indexed_at, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          id, display_name, root_path, index_path, chat_profile_id, embedding_profile_id, preferred_connection_id, chat_model_id, embedding_model_id, retrieval_mode, system_prompt, last_indexed_at, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         channel.id,
@@ -313,6 +315,7 @@ export class AppDatabase {
         channel.chatModelId,
         channel.embeddingModelId,
         channel.retrievalMode,
+        channel.systemPrompt,
         channel.lastIndexedAt,
         channel.status,
         channel.createdAt,
@@ -349,6 +352,7 @@ export class AppDatabase {
         | "chatModelId"
         | "embeddingModelId"
         | "retrievalMode"
+        | "systemPrompt"
         | "lastIndexedAt"
         | "status"
         | "updatedAt"
@@ -368,7 +372,7 @@ export class AppDatabase {
     this.db
       .prepare(
         `UPDATE channels
-         SET display_name = ?, preferred_connection_id = ?, chat_model_id = ?, embedding_model_id = ?, retrieval_mode = ?, last_indexed_at = ?, status = ?, updated_at = ?
+         SET display_name = ?, preferred_connection_id = ?, chat_model_id = ?, embedding_model_id = ?, retrieval_mode = ?, system_prompt = ?, last_indexed_at = ?, status = ?, updated_at = ?
          WHERE id = ?`
       )
       .run(
@@ -377,6 +381,7 @@ export class AppDatabase {
         next.chatModelId,
         next.embeddingModelId,
         next.retrievalMode,
+        next.systemPrompt,
         next.lastIndexedAt,
         next.status,
         next.updatedAt,
@@ -586,11 +591,32 @@ export class AppDatabase {
       .all(channelId) as any[]).map(mapThread);
   }
 
+  getThread(id: string): Thread | null {
+    const row = this.db.prepare("SELECT * FROM threads WHERE id = ?").get(id) as any;
+    return row ? mapThread(row) : null;
+  }
+
   createThread(thread: Thread): Thread {
     this.db
       .prepare("INSERT INTO threads (id, channel_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
       .run(thread.id, thread.channelId, thread.title, thread.createdAt, thread.updatedAt);
     return thread;
+  }
+
+  updateThreadTitle(id: string, title: string) {
+    this.db.prepare("UPDATE threads SET title = ? WHERE id = ?").run(title, id);
+  }
+
+  deleteThread(id: string) {
+    const deleteMessages = this.db.prepare("DELETE FROM messages WHERE thread_id = ?");
+    const deleteThread = this.db.prepare("DELETE FROM threads WHERE id = ?");
+
+    const transaction = this.db.transaction(() => {
+      deleteMessages.run(id);
+      deleteThread.run(id);
+    });
+
+    transaction();
   }
 
   touchThread(id: string, updatedAt: string) {
@@ -668,6 +694,7 @@ function mapChannel(row: any): Channel {
     chatModelId: row.chat_model_id ?? null,
     embeddingModelId: row.embedding_model_id ?? null,
     retrievalMode: row.retrieval_mode ?? "vector",
+    systemPrompt: row.system_prompt ?? "",
     lastIndexedAt: row.last_indexed_at,
     status: row.status,
     createdAt: row.created_at,

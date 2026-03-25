@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { Channel, IndexProgressEvent, IndexedFileRecord, Message } from "@fschat/shared";
+import type { Channel, Citation, IndexProgressEvent, IndexedFileRecord, Message } from "@fschat/shared";
 
 export function ProgressCard({ progress }: { progress: IndexProgressEvent }) {
   const percentage = Math.min(100, (progress.processedFiles / Math.max(progress.totalFiles || 1, 1)) * 100);
@@ -26,7 +26,13 @@ export function ProgressCard({ progress }: { progress: IndexProgressEvent }) {
   );
 }
 
-export function CitationsPanel({ messages }: { messages: Message[] }) {
+export function CitationsPanel({
+  messages,
+  onSelectCitation
+}: {
+  messages: Message[];
+  onSelectCitation?: (citation: Citation) => void | Promise<void>;
+}) {
   const citedMessage = [...messages].reverse().find((message) => message.role === "assistant" && message.citations.length > 0);
   if (!citedMessage) {
     return <div className="text-sm text-mist/70">Assistant citations will appear here after a grounded response.</div>;
@@ -34,11 +40,16 @@ export function CitationsPanel({ messages }: { messages: Message[] }) {
   return (
     <>
       {citedMessage.citations.map((citation) => (
-        <div key={`${citation.chunkId}-${citation.relativePath}`} className="mb-3 rounded-3xl bg-black/15 p-4">
+        <button
+          key={`${citation.chunkId}-${citation.relativePath}`}
+          className="mb-3 block w-full rounded-3xl bg-black/15 p-4 text-left transition hover:bg-black/20"
+          onClick={() => void onSelectCitation?.(citation)}
+        >
           <div className="break-anywhere text-sm font-medium text-paper">{citation.relativePath}</div>
           <div className="mt-1 text-xs text-mist/55">Score {citation.score.toFixed(3)}</div>
           <div className="break-anywhere mt-3 text-xs leading-6 text-mist/80">{citation.snippet}</div>
-        </div>
+          <div className="mt-3 text-[11px] uppercase tracking-[0.18em] text-mist/45">Open Source Preview</div>
+        </button>
       ))}
     </>
   );

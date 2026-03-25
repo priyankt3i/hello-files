@@ -34,8 +34,9 @@ export async function generateAssistantReply(args: {
   searchResults: SearchResult[];
   history: Message[];
   userMessage: string;
+  systemPrompt?: string;
 }): Promise<string> {
-  const { connection, model, secret, searchResults, history, userMessage } = args;
+  const { connection, model, secret, searchResults, history, userMessage, systemPrompt } = args;
   const contextBlock =
     searchResults.length === 0
       ? "No indexed documents were retrieved for this question."
@@ -46,12 +47,14 @@ export async function generateAssistantReply(args: {
           )
           .join("\n\n");
 
-  const systemPrompt = [
-    "You are Filesystem RAG Chat.",
-    "Answer using only the indexed filesystem context when possible.",
-    "If the indexed context is insufficient, say what is missing.",
-    "Mention the source file paths inline when making claims."
-  ].join(" ");
+  const effectiveSystemPrompt =
+    systemPrompt?.trim() ||
+    [
+      "You are Filesystem RAG Chat.",
+      "Answer using only the indexed filesystem context when possible.",
+      "If the indexed context is insufficient, say what is missing.",
+      "Mention the source file paths inline when making claims."
+    ].join(" ");
 
   const recentHistory: Array<{ role: "assistant" | "user"; content: string }> = history.slice(-6).map((message) => ({
     role: message.role === "assistant" ? "assistant" : "user",
@@ -63,7 +66,7 @@ export async function generateAssistantReply(args: {
     connection,
     model,
     secret,
-    systemPrompt,
+    systemPrompt: effectiveSystemPrompt,
     history: recentHistory,
     prompt
   });

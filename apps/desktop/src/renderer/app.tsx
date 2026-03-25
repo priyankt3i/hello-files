@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import type {
+  Citation,
   Channel,
   ChannelSnapshot,
   IndexFileUpdateEvent,
@@ -23,6 +24,12 @@ type RootInspection = {
   existingChannel: Channel | null;
 };
 
+type PendingTurn = {
+  channelId: string;
+  threadId: string | null;
+  userMessage: Message;
+};
+
 export function App() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [connections, setConnections] = useState<ProviderConnection[]>([]);
@@ -32,6 +39,7 @@ export function App() {
   const [snapshot, setSnapshot] = useState<ChannelSnapshot | null>(null);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [pendingTurn, setPendingTurn] = useState<PendingTurn | null>(null);
   const [composer, setComposer] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +55,10 @@ export function App() {
   const [fileQuery, setFileQuery] = useState("");
   const [cancelPrompt, setCancelPrompt] = useState<{ channelId: string; channelName: string } | null>(null);
   const [channelModelsOpen, setChannelModelsOpen] = useState(false);
+  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
   const [deletePrompt, setDeletePrompt] = useState<{ channelId: string; channelName: string } | null>(null);
+  const [deleteThreadPrompt, setDeleteThreadPrompt] = useState<{ threadId: string; title: string } | null>(null);
+  const [citationPreview, setCitationPreview] = useState<{ channelId: string; citation: Citation } | null>(null);
   const [cancellingByChannel, setCancellingByChannel] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
@@ -161,16 +172,20 @@ export function App() {
     }
   }
 
-  async function refreshChannel(channelId: string) {
+  async function refreshChannel(channelId: string, options?: { preferredThreadId?: string | null }) {
     try {
       const nextSnapshot = await window.fsChat.loadChannel(channelId);
+      const orderedThreads = orderThreads(nextSnapshot.threads);
       setChannels((current) => mergeChannels(current, nextSnapshot.channel));
       setSnapshot(nextSnapshot);
       setSelectedChannelId(channelId);
+      const preferredThreadId = options?.preferredThreadId;
       const threadId =
-        selectedThreadId && nextSnapshot.threads.some((thread) => thread.id === selectedThreadId)
-          ? selectedThreadId
-          : nextSnapshot.threads[0]?.id ?? null;
+        preferredThreadId && orderedThreads.some((thread) => thread.id === preferredThreadId)
+          ? preferredThreadId
+          : selectedThreadId && orderedThreads.some((thread) => thread.id === selectedThreadId)
+            ? selectedThreadId
+            : orderedThreads[0]?.id ?? null;
       setSelectedThreadId(threadId);
       setMessages(threadId ? await window.fsChat.getThreadMessages(threadId) : []);
     } catch (caught) {
@@ -241,6 +256,7 @@ export function App() {
 
   async function handleSelectChannel(channelId: string) {
     try {
+      setCitationPreview(null);
       await refreshChannel(channelId);
     } catch (caught) {
       setError(toErrorMessage(caught));
@@ -258,19 +274,37 @@ export function App() {
 
   async function handleSendMessage() {
     if (!selectedChannel || !composer.trim()) return;
+    const messageText = composer.trim();
+    const optimisticUserMessage: Message = {
+      id: `pending-user-${Date.now()}`,
+      threadId: selectedThreadId ?? "pending-thread",
+      role: "user",
+      content: messageText,
+      citations: [],
+      createdAt: new Date().toISOString()
+    };
+
     setBusy(true);
     setError(null);
+    setComposer("");
+    setPendingTurn({
+      channelId: selectedChannel.id,
+      threadId: selectedThreadId,
+      userMessage: optimisticUserMessage
+    });
     try {
       const result = await window.fsChat.sendMessage({
         channelId: selectedChannel.id,
         threadId: selectedThreadId,
-        message: composer.trim()
+        message: messageText
       });
-      setComposer("");
       setSelectedThreadId(result.thread.id);
       setMessages((current) => [...current, result.userMessage, result.assistantMessage]);
-      await refreshChannel(selectedChannel.id);
+      setPendingTurn(null);
+      await refreshChannel(selectedChannel.id, { preferredThreadId: result.thread.id });
     } catch (caught) {
+      setComposer(messageText);
+      setPendingTurn(null);
       setError(toErrorMessage(caught));
     } finally {
       setBusy(false);
@@ -325,17 +359,101 @@ export function App() {
         embeddingModelId,
         retrievalMode
       });
+      const orderedThreads = orderThreads(nextSnapshot.threads);
       setChannels((current) => mergeChannels(current, nextSnapshot.channel));
       setSnapshot(nextSnapshot);
       setChannelModelsOpen(false);
-      if (selectedThreadId && !nextSnapshot.threads.some((thread) => thread.id === selectedThreadId)) {
-        setSelectedThreadId(nextSnapshot.threads[0]?.id ?? null);
+      if (selectedThreadId && !orderedThreads.some((thread) => thread.id === selectedThreadId)) {
+        setSelectedThreadId(orderedThreads[0]?.id ?? null);
       }
     } catch (caught) {
       setError(toErrorMessage(caught));
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleSaveChannelSystemPrompt(systemPrompt: string) {
+    if (!selectedChannel) return;
+    setBusy(true);
+    try {
+      const nextSnapshot = await window.fsChat.updateChannelSystemPrompt({
+        channelId: selectedChannel.id,
+        systemPrompt
+      });
+      setChannels((current) => mergeChannels(current, nextSnapshot.channel));
+      setSnapshot(nextSnapshot);
+      setSystemPromptOpen(false);
+    } catch (caught) {
+      setError(toErrorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateThread() {
+    if (!selectedChannel) return;
+    setBusy(true);
+    try {
+      const createThread = requireFsChatMethod("createThread");
+      const thread = await createThread({ channelId: selectedChannel.id });
+      setComposer("");
+      await refreshChannel(selectedChannel.id, { preferredThreadId: thread.id });
+    } catch (caught) {
+      setError(toErrorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRenameThread(threadId: string, title: string) {
+    if (!selectedChannel) return;
+    setBusy(true);
+    try {
+      const updateThreadTitle = requireFsChatMethod("updateThreadTitle");
+      await updateThreadTitle({ threadId, title });
+      await refreshChannel(selectedChannel.id, { preferredThreadId: threadId });
+    } catch (caught) {
+      setError(toErrorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteThread(threadId: string) {
+    if (!selectedChannel) return;
+    setBusy(true);
+    try {
+      const deleteThread = requireFsChatMethod("deleteThread");
+      const nextSnapshot = await deleteThread(threadId);
+      const orderedThreads = orderThreads(nextSnapshot.threads);
+      const nextThreadId =
+        selectedThreadId === threadId ? orderedThreads[0]?.id ?? null : selectedThreadId;
+      setChannels((current) => mergeChannels(current, nextSnapshot.channel));
+      setSnapshot(nextSnapshot);
+      setSelectedThreadId(nextThreadId);
+      setMessages(nextThreadId ? await window.fsChat.getThreadMessages(nextThreadId) : []);
+    } catch (caught) {
+      setError(toErrorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleRequestDeleteThread(threadId: string) {
+    const thread = snapshot?.threads.find((candidate) => candidate.id === threadId);
+    if (!thread) {
+      return;
+    }
+
+    const isSelectedThread = selectedThreadId === threadId;
+    const hasMessages = !isSelectedThread || messages.length > 0;
+    if (hasMessages) {
+      setDeleteThreadPrompt({ threadId, title: thread.title });
+      return;
+    }
+
+    void handleDeleteThread(threadId);
   }
 
   async function handleDeleteChannel() {
@@ -370,6 +488,7 @@ export function App() {
       setSnapshot(null);
       setSelectedThreadId(null);
       setMessages([]);
+      setPendingTurn(null);
       setComposer("");
       setInspection(null);
       setChannelName("");
@@ -380,8 +499,10 @@ export function App() {
       setProgressByChannel({});
       setCancellingByChannel({});
       setDeletePrompt(null);
+      setDeleteThreadPrompt(null);
       setCancelPrompt(null);
       setChannelModelsOpen(false);
+      setSystemPromptOpen(false);
       setCreateOpen(false);
       setSettingsOpen(false);
       setError(null);
@@ -391,6 +512,56 @@ export function App() {
       setBusy(false);
     }
   }
+
+  async function handleOpenExternalUrl(url: string) {
+    try {
+      await window.fsChat.openExternalUrl(url);
+    } catch (caught) {
+      setError(toErrorMessage(caught));
+    }
+  }
+
+  function handleSelectCitation(citation: Citation) {
+    if (!selectedChannel) {
+      return;
+    }
+    setCitationPreview({
+      channelId: selectedChannel.id,
+      citation
+    });
+  }
+
+async function handleOpenCitationFile() {
+  if (!citationPreview) {
+    return;
+  }
+  try {
+      const openChannelFile = requireFsChatMethod("openChannelFile");
+      await openChannelFile({
+      channelId: citationPreview.channelId,
+      relativePath: citationPreview.citation.relativePath
+    });
+    setCitationPreview(null);
+  } catch (caught) {
+    setError(toErrorMessage(caught));
+  }
+}
+
+async function handleRevealCitationFile() {
+  if (!citationPreview) {
+    return;
+  }
+  try {
+      const revealChannelFile = requireFsChatMethod("revealChannelFile");
+      await revealChannelFile({
+      channelId: citationPreview.channelId,
+      relativePath: citationPreview.citation.relativePath
+    });
+    setCitationPreview(null);
+  } catch (caught) {
+    setError(toErrorMessage(caught));
+  }
+}
 
   return (
     <div className="h-screen overflow-hidden bg-shell-gradient text-paper">
@@ -407,6 +578,7 @@ export function App() {
           progress={selectedProgress}
           isCancelling={selectedChannel ? Boolean(cancellingByChannel[selectedChannel.id]) : false}
           onOpenModels={() => setChannelModelsOpen(true)}
+          onOpenSystemPrompt={() => setSystemPromptOpen(true)}
           onDelete={() => {
             if (selectedChannel) {
               setDeletePrompt({ channelId: selectedChannel.id, channelName: selectedChannel.displayName });
@@ -420,9 +592,15 @@ export function App() {
           snapshot={snapshot}
           selectedThread={selectedThread}
           messages={messages}
+          pendingTurn={pendingTurn}
           composer={composer}
           onComposer={setComposer}
           onSelectThread={handleSelectThread}
+          onCreateThread={handleCreateThread}
+          onRenameThread={handleRenameThread}
+          onDeleteThread={handleRequestDeleteThread}
+          onSelectCitation={handleSelectCitation}
+          onOpenExternalUrl={handleOpenExternalUrl}
           onSend={handleSendMessage}
           busy={busy}
         />
@@ -450,6 +628,15 @@ export function App() {
         />
       ) : null}
 
+      {systemPromptOpen && selectedChannel ? (
+        <SystemPromptModal
+          channel={selectedChannel}
+          busy={busy}
+          onClose={() => setSystemPromptOpen(false)}
+          onSave={handleSaveChannelSystemPrompt}
+        />
+      ) : null}
+
       {deletePrompt ? (
         <DeleteChannelToast
           channelName={deletePrompt.channelName}
@@ -457,6 +644,25 @@ export function App() {
           offsetForError={Boolean(error)}
           onClose={() => setDeletePrompt(null)}
           onDelete={() => void handleDeleteChannel()}
+        />
+      ) : null}
+
+      {deleteThreadPrompt ? (
+        <DeleteThreadToast
+          title={deleteThreadPrompt.title}
+          busy={busy}
+          offsetForError={Boolean(error)}
+          onClose={() => setDeleteThreadPrompt(null)}
+          onDelete={() => void handleDeleteThread(deleteThreadPrompt.threadId).finally(() => setDeleteThreadPrompt(null))}
+        />
+      ) : null}
+
+      {citationPreview ? (
+        <CitationPreviewModal
+          citation={citationPreview.citation}
+          onClose={() => setCitationPreview(null)}
+          onOpenFile={() => void handleOpenCitationFile()}
+          onRevealFile={() => void handleRevealCitationFile()}
         />
       ) : null}
 
@@ -693,6 +899,7 @@ function FilesPanel({
   progress,
   isCancelling,
   onOpenModels,
+  onOpenSystemPrompt,
   onDelete,
   onRegenerate,
   onCancel
@@ -707,6 +914,7 @@ function FilesPanel({
   progress?: IndexProgressEvent;
   isCancelling: boolean;
   onOpenModels: () => void | Promise<void>;
+  onOpenSystemPrompt: () => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   onRegenerate: () => void | Promise<void>;
   onCancel: () => void | Promise<void>;
@@ -739,6 +947,9 @@ function FilesPanel({
           <div className="break-anywhere">
             Embedding: {selectedChannel.retrievalMode === "vectorless" ? "Not used" : selectedEmbeddingModel ? formatProviderModelLabel(selectedEmbeddingModel, connectionById[selectedEmbeddingModel.connectionId]) : "Not set"}
           </div>
+          <div className="break-anywhere">
+            Assistant prompt: {selectedChannel.systemPrompt.trim() ? summarizeInlineText(selectedChannel.systemPrompt, 96) : "Default"}
+          </div>
         </div>
       </div>
       {progress && selectedChannel.status === "indexing" ? <ProgressCard progress={progress} /> : null}
@@ -749,6 +960,13 @@ function FilesPanel({
           disabled={isIndexing || isCancelling}
         >
           Channel Models
+        </button>
+        <button
+          className="rounded-full border border-white/10 px-4 py-2 text-sm text-mist disabled:cursor-not-allowed disabled:opacity-35"
+          onClick={() => void onOpenSystemPrompt()}
+          disabled={isIndexing || isCancelling}
+        >
+          Assistant Prompt
         </button>
         <button
           className="rounded-full bg-white/10 px-4 py-2 text-sm text-paper disabled:cursor-not-allowed disabled:opacity-35"
@@ -1007,6 +1225,56 @@ function ChannelModelsModal({
   );
 }
 
+function SystemPromptModal({
+  channel,
+  busy,
+  onClose,
+  onSave
+}: {
+  channel: Channel;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (systemPrompt: string) => void | Promise<void>;
+}) {
+  const [systemPrompt, setSystemPrompt] = useState(channel.systemPrompt);
+
+  return (
+    <Modal title="Assistant Prompt" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="rounded-3xl bg-white/5 p-4 text-sm text-mist">
+          <div className="font-medium text-paper">{channel.displayName}</div>
+          <div className="mt-1 text-xs leading-6 text-mist/75">
+            This system prompt is stored per channel and applied to every session in this workspace.
+          </div>
+        </div>
+        <Field label="System prompt">
+          <textarea
+            value={systemPrompt}
+            onChange={(event) => setSystemPrompt(event.target.value)}
+            rows={10}
+            className="w-full resize-y rounded-[24px] border border-white/10 bg-black/10 px-4 py-3 text-sm leading-7 text-paper outline-none"
+          />
+        </Field>
+        <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
+          Keep this focused on response behavior, tone, citation expectations, and channel-specific rules. Retrieval still comes from the indexed files for this channel.
+        </div>
+        <div className="flex justify-end gap-2">
+          <button className="rounded-full border border-white/10 px-4 py-2 text-sm text-mist" onClick={onClose} disabled={busy}>
+            Close
+          </button>
+          <button
+            className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink disabled:opacity-40"
+            onClick={() => void onSave(systemPrompt)}
+            disabled={busy || !systemPrompt.trim()}
+          >
+            Save Prompt
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function DeleteChannelToast({
   channelName,
   busy,
@@ -1050,6 +1318,89 @@ function DeleteChannelToast({
         </div>
       </div>
     </div>
+  );
+}
+
+function DeleteThreadToast({
+  title,
+  busy,
+  offsetForError,
+  onClose,
+  onDelete
+}: {
+  title: string;
+  busy: boolean;
+  offsetForError: boolean;
+  onClose: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className={`fixed right-5 z-40 w-[min(30rem,calc(100vw-2rem))] ${offsetForError ? "bottom-52" : "bottom-5"}`}>
+      <div className="rounded-[28px] border border-coral/30 bg-[#22131a] px-5 py-4 text-sm text-[#ffe4dc] shadow-panel backdrop-blur-md">
+        <div className="mb-2 flex items-start justify-between gap-3">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb9ab]">Delete session?</div>
+            <div className="mt-2 break-anywhere text-base font-medium text-paper">{title}</div>
+          </div>
+          <button
+            className="shrink-0 rounded-full border border-white/10 px-3 py-1 text-xs text-[#ffd1ca]/80 disabled:opacity-40"
+            onClick={onClose}
+            disabled={busy}
+          >
+            Keep session
+          </button>
+        </div>
+        <div className="break-anywhere text-sm leading-6 text-[#ffd1ca]/85">
+          This session already contains messages. Deleting it will remove the conversation history for this tab.
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            className="rounded-full border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-[#ffd1ca] disabled:opacity-40"
+            onClick={onDelete}
+            disabled={busy}
+          >
+            {busy ? "Deleting..." : "Delete Session"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CitationPreviewModal({
+  citation,
+  onClose,
+  onOpenFile,
+  onRevealFile
+}: {
+  citation: Citation;
+  onClose: () => void;
+  onOpenFile: () => void;
+  onRevealFile: () => void;
+}) {
+  return (
+    <Modal title="Source Preview" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="rounded-3xl bg-white/5 p-4 text-sm text-mist">
+          <div className="break-anywhere font-medium text-paper">{citation.relativePath}</div>
+          <div className="mt-2 text-xs uppercase tracking-[0.18em] text-mist/50">
+            Citation score {citation.score.toFixed(3)}
+          </div>
+        </div>
+        <div className="rounded-[24px] border border-white/10 bg-black/10 p-4">
+          <div className="mb-3 text-xs uppercase tracking-[0.18em] text-mist/50">Grounding snippet</div>
+          <div className="break-anywhere whitespace-pre-wrap text-sm leading-7 text-paper">{citation.snippet}</div>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <button className="rounded-full border border-white/10 px-4 py-2 text-sm text-mist" onClick={onRevealFile}>
+            Reveal In Folder
+          </button>
+          <button className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink" onClick={onOpenFile}>
+            Open File
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -1109,9 +1460,15 @@ function ChatPanel({
   snapshot,
   selectedThread,
   messages,
+  pendingTurn,
   composer,
   onComposer,
   onSelectThread,
+  onCreateThread,
+  onRenameThread,
+  onDeleteThread,
+  onSelectCitation,
+  onOpenExternalUrl,
   onSend,
   busy
 }: {
@@ -1119,12 +1476,91 @@ function ChatPanel({
   snapshot: ChannelSnapshot | null;
   selectedThread: Thread | null;
   messages: Message[];
+  pendingTurn: PendingTurn | null;
   composer: string;
   onComposer: (value: string) => void;
   onSelectThread: (threadId: string) => void | Promise<void>;
+  onCreateThread: () => void | Promise<void>;
+  onRenameThread: (threadId: string, title: string) => void | Promise<void>;
+  onDeleteThread: (threadId: string) => void | Promise<void>;
+  onSelectCitation: (citation: Citation) => void | Promise<void>;
+  onOpenExternalUrl: (url: string) => void | Promise<void>;
   onSend: () => void | Promise<void>;
   busy: boolean;
 }) {
+  const orderedThreads = useMemo(() => orderThreads(snapshot?.threads ?? []), [snapshot?.threads]);
+  const pinnedThreadId = orderedThreads[0]?.id ?? null;
+  const tabListRef = useRef<HTMLDivElement | null>(null);
+  const activeTabRef = useRef<HTMLDivElement | null>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+  const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
+  const [threadTitleDraft, setThreadTitleDraft] = useState("");
+  const messagesViewportRef = useRef<HTMLDivElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const activePendingTurn =
+    pendingTurn &&
+    pendingTurn.channelId === selectedChannel?.id &&
+    (pendingTurn.threadId ? pendingTurn.threadId === selectedThread?.id : !selectedThread)
+      ? pendingTurn
+      : null;
+  const shouldShowPendingTurn = Boolean(activePendingTurn);
+  const visibleMessages = activePendingTurn ? [...messages, activePendingTurn.userMessage] : messages;
+
+  useEffect(() => {
+    const updateOverflow = () => {
+      const element = tabListRef.current;
+      if (!element) {
+        setCanScrollLeft(false);
+        setCanScrollRight(false);
+        return;
+      }
+      setCanScrollLeft(element.scrollLeft > 8);
+      setCanScrollRight(element.scrollLeft + element.clientWidth < element.scrollWidth - 8);
+    };
+
+    updateOverflow();
+    const element = tabListRef.current;
+    if (!element) {
+      return;
+    }
+
+    element.addEventListener("scroll", updateOverflow);
+    window.addEventListener("resize", updateOverflow);
+    return () => {
+      element.removeEventListener("scroll", updateOverflow);
+      window.removeEventListener("resize", updateOverflow);
+    };
+  }, [orderedThreads.length]);
+
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+  }, [selectedThread?.id]);
+
+  useEffect(() => {
+    if (renamingThreadId && !orderedThreads.some((thread) => thread.id === renamingThreadId)) {
+      setRenamingThreadId(null);
+      setThreadTitleDraft("");
+    }
+  }, [orderedThreads, renamingThreadId]);
+
+  useEffect(() => {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const scrollToLatest = () => {
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior: "smooth"
+      });
+      messagesEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+    };
+
+    window.requestAnimationFrame(scrollToLatest);
+  }, [visibleMessages.length, shouldShowPendingTurn, selectedThread?.id]);
+
   if (!selectedChannel) {
     return (
       <main className="glass-panel shell-border min-h-0 min-w-0 flex flex-col items-center justify-center rounded-[28px] p-5 text-center shadow-panel">
@@ -1133,10 +1569,38 @@ function ChatPanel({
       </main>
     );
   }
+
+  function startRenaming(thread: Thread) {
+    setRenamingThreadId(thread.id);
+    setThreadTitleDraft(thread.title);
+  }
+
+  function cancelRenaming() {
+    setRenamingThreadId(null);
+    setThreadTitleDraft("");
+  }
+
+  async function commitRename(thread: Thread) {
+    const nextTitle = threadTitleDraft.trim();
+    if (!nextTitle || nextTitle === thread.title) {
+      cancelRenaming();
+      return;
+    }
+    await onRenameThread(thread.id, nextTitle);
+    cancelRenaming();
+  }
+
+  function scrollTabs(direction: "left" | "right") {
+    tabListRef.current?.scrollBy({
+      left: direction === "left" ? -260 : 260,
+      behavior: "smooth"
+    });
+  }
+
   return (
     <main className="glass-panel shell-border min-h-0 min-w-0 flex flex-col rounded-[28px] p-5 shadow-panel">
-      <div className="mb-4 flex min-w-0 flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
+      <div className="mb-4 min-w-0">
+        <div className="min-w-0">
           <div className="break-anywhere font-display text-[clamp(2rem,2vw+1rem,3rem)] leading-tight text-paper">Chat With {selectedChannel.displayName}</div>
           <div className="break-anywhere mt-2 text-sm text-mist/70">
             {selectedChannel.status === "ready"
@@ -1148,26 +1612,119 @@ function ChatPanel({
                 : "Finish indexing before starting retrieval-backed chat."}
           </div>
         </div>
-        <div className="flex max-w-full flex-wrap gap-2">
-          {snapshot?.threads.map((thread) => (
-            <button key={thread.id} className={`rounded-full px-4 py-2 text-sm ${selectedThread?.id === thread.id ? "bg-ember text-ink" : "bg-white/7 text-mist"}`} onClick={() => void onSelectThread(thread.id)}>
-              {thread.title}
+        <div className="mt-4 rounded-[24px] border border-white/10 bg-black/10 p-3">
+          <div className="mb-2 flex items-center justify-between gap-1">
+          </div>
+          <div className="flex items-center gap-2 overflow-hidden">
+            <button
+              className="shrink-0 rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold text-paper disabled:opacity-40"
+              onClick={() => void onCreateThread()}
+              disabled={busy}
+              title="Add a new chat tab"
+            >
+              +
             </button>
-          ))}
+          <button
+            className="shrink-0 rounded-full border border-white/10 px-3 py-2 text-xs text-mist disabled:opacity-25"
+            onClick={() => scrollTabs("left")}
+            disabled={!canScrollLeft}
+            title="Scroll sessions left"
+          >
+            &lt;
+          </button>
+          <div ref={tabListRef} className="min-w-0 flex-1 overflow-x-auto">
+            <div className="flex min-w-max gap-2 pr-1">
+              {orderedThreads.map((thread) => {
+                const isPinned = thread.id === pinnedThreadId;
+                const isSelected = selectedThread?.id === thread.id;
+                const isRenaming = renamingThreadId === thread.id;
+
+                return (
+                  <div
+                    key={thread.id}
+                    ref={isSelected ? activeTabRef : null}
+                    className={`group flex shrink-0 items-center gap-2 rounded-[18px] border px-3 py-2 transition ${
+                      isSelected
+                        ? "border-ember/60 bg-ember text-ink shadow-[0_0_0_1px_rgba(255,140,37,0.2)]"
+                        : isPinned
+                          ? "border-moss/35 bg-moss/10 text-paper"
+                          : "border-white/10 bg-white/7 text-mist hover:bg-white/10"
+                    }`}
+                  >
+                    {isPinned ? (
+                      <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] ${isSelected ? "bg-black/15 text-ink" : "bg-moss/20 text-moss"}`}>
+                        Default
+                      </span>
+                    ) : null}
+                    {isRenaming ? (
+                      <input
+                        autoFocus
+                        value={threadTitleDraft}
+                        onChange={(event) => setThreadTitleDraft(event.target.value)}
+                        onBlur={() => void commitRename(thread)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            void commitRename(thread);
+                          }
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelRenaming();
+                          }
+                        }}
+                        className={`w-[12rem] min-w-0 rounded-full border px-3 py-1.5 text-sm outline-none ${isSelected ? "border-black/15 bg-white/85 text-ink" : "border-white/10 bg-black/10 text-paper"}`}
+                      />
+                    ) : (
+                      <button
+                        className={`min-w-0 text-left text-sm ${isSelected ? "text-ink" : "text-inherit"}`}
+                        onClick={() => void onSelectThread(thread.id)}
+                        onDoubleClick={() => startRenaming(thread)}
+                        title={thread.title}
+                      >
+                        <span className="block max-w-[14rem] truncate">{thread.title}</span>
+                      </button>
+                    )}
+                    {!isPinned && !isRenaming && isSelected ? (
+                      <button
+                        className={`shrink-0 rounded-full border px-2 py-1 text-[11px] transition ${
+                          isSelected ? "border-black/15 bg-black/10 text-ink" : "border-white/10 bg-black/10 text-mist/80 hover:text-paper"
+                        }`}
+                        onClick={() => void onDeleteThread(thread.id)}
+                        disabled={busy}
+                        title="Close tab"
+                      >
+                        x
+                      </button>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <button
+            className="shrink-0 rounded-full border border-white/10 px-3 py-2 text-xs text-mist disabled:opacity-25"
+            onClick={() => scrollTabs("right")}
+            disabled={!canScrollRight}
+            title="Scroll sessions right"
+          >
+            &gt;
+          </button>
+          </div>
         </div>
       </div>
       <div className="grid min-h-0 flex-1 overflow-hidden grid-cols-[minmax(0,1fr)_260px] gap-4">
         <div className="flex min-h-0 min-w-0 flex-col rounded-[26px] bg-black/10 p-4">
-          <div className="flex-1 space-y-4 overflow-y-auto pr-2">
-            {messages.length === 0 ? (
+          <div ref={messagesViewportRef} className="flex-1 space-y-4 overflow-y-auto pr-2">
+            {visibleMessages.length === 0 && !shouldShowPendingTurn ? (
               <div className="rounded-[22px] border border-dashed border-white/10 p-6 text-sm text-mist/70">Start a thread to query the indexed content in this channel.</div>
             ) : (
-              messages.map((message) => (
+              visibleMessages.map((message) => (
                 <div key={message.id} className={`min-w-0 rounded-[24px] p-4 ${message.role === "assistant" ? "bg-white/7" : "bg-gradient-to-r from-pine/80 to-pine/40"}`}>
                   <div className="mb-2 text-xs uppercase tracking-[0.2em] text-mist/55">{message.role}</div>
                   {message.role === "assistant" ? (
                     <div
                       className="markdown-body break-anywhere text-sm leading-7 text-paper"
+                      onClick={(event) => void handleAssistantContentClick(event, onOpenExternalUrl)}
                       dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(message.content) }}
                     />
                   ) : (
@@ -1176,6 +1733,8 @@ function ChatPanel({
                 </div>
               ))
             )}
+            {shouldShowPendingTurn ? <ThinkingBubble /> : null}
+            <div ref={messagesEndRef} />
           </div>
           <div className="mt-4 rounded-[24px] border border-white/10 bg-white/5 p-3">
             <textarea value={composer} onChange={(event) => onComposer(event.target.value)} placeholder="Ask about any indexed file in this channel..." rows={4} className="w-full resize-none bg-transparent text-sm text-paper outline-none placeholder:text-mist/45" />
@@ -1186,7 +1745,7 @@ function ChatPanel({
         </div>
         <div className="min-h-0 min-w-0 overflow-y-auto rounded-[26px] bg-white/5 p-4">
           <div className="mb-4 text-xs uppercase tracking-[0.3em] text-mist/50">Citations</div>
-          <CitationsPanel messages={messages} />
+          <CitationsPanel messages={messages} onSelectCitation={onSelectCitation} />
         </div>
       </div>
     </main>
@@ -1196,6 +1755,42 @@ function ChatPanel({
 function mergeChannels(current: Channel[], channel: Channel) {
   const others = current.filter((item) => item.id !== channel.id);
   return [...others, channel].sort((left, right) => left.displayName.localeCompare(right.displayName));
+}
+
+function orderThreads(threads: Thread[]) {
+  if (threads.length <= 1) {
+    return threads;
+  }
+
+  const defaultThread = [...threads].sort((left, right) => {
+    const createdComparison = left.createdAt.localeCompare(right.createdAt);
+    if (createdComparison !== 0) {
+      return createdComparison;
+    }
+    return left.title.localeCompare(right.title);
+  })[0];
+
+  const rest = threads
+    .filter((thread) => thread.id !== defaultThread.id)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+  return [defaultThread, ...rest];
+}
+
+function ThinkingBubble() {
+  return (
+    <div className="min-w-0 rounded-[24px] bg-white/7 p-4">
+      <div className="mb-2 text-xs uppercase tracking-[0.2em] text-mist/55">assistant</div>
+      <div className="flex items-center gap-2 text-sm text-paper">
+        <span>Thinking</span>
+        <span className="flex items-center gap-1">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-ember [animation-delay:0ms]" />
+          <span className="h-2 w-2 animate-pulse rounded-full bg-ember/80 [animation-delay:150ms]" />
+          <span className="h-2 w-2 animate-pulse rounded-full bg-ember/60 [animation-delay:300ms]" />
+        </span>
+      </div>
+    </div>
+  );
 }
 
 function mergeProviderDefaults(current: ProviderDefaults[], nextItem: ProviderDefaults) {
@@ -1244,8 +1839,26 @@ function formatRetrievalModeLabel(retrievalMode: RetrievalMode) {
   return retrievalMode === "vectorless" ? "Vectorless manifest-first" : "Vector";
 }
 
+function summarizeInlineText(value: string, maxLength: number) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
 function toErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown error.";
+}
+
+function requireFsChatMethod<T extends keyof Window["fsChat"]>(methodName: T): Window["fsChat"][T] {
+  const candidate = window.fsChat?.[methodName];
+  if (typeof candidate !== "function") {
+    throw new Error(
+      `The desktop app is running an older bridge that does not support "${String(methodName)}". Restart the Electron app and try again.`
+    );
+  }
+  return candidate;
 }
 
 function isChatReady(status: Channel["status"]) {
@@ -1382,7 +1995,10 @@ function renderMarkdownToHtml(markdown: string) {
 function renderInlineMarkdown(text: string) {
   let html = escapeHtml(text);
   html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
+  html = html.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" data-external-link="true" rel="noopener noreferrer nofollow">$1</a>'
+  );
   html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   html = html.replace(/(^|[\s(])\*([^*]+)\*(?=$|[\s).,!?:;])/g, "$1<em>$2</em>");
   return html;
@@ -1395,4 +2011,29 @@ function escapeHtml(text: string) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+async function handleAssistantContentClick(
+  event: ReactMouseEvent<HTMLDivElement>,
+  onOpenExternalUrl: (url: string) => void | Promise<void>
+) {
+  const anchor = findExternalLink(event.target);
+  if (!anchor) {
+    return;
+  }
+
+  event.preventDefault();
+  const href = anchor.getAttribute("href");
+  if (!href) {
+    return;
+  }
+
+  await onOpenExternalUrl(href);
+}
+
+function findExternalLink(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return null;
+  }
+  return target.closest("a[data-external-link='true']") as HTMLAnchorElement | null;
 }
