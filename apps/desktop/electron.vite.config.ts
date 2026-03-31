@@ -4,7 +4,7 @@ import { defineConfig, externalizeDepsPlugin } from "electron-vite";
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin({ exclude: ["@fschat/shared"] })],
     resolve: {
       alias: {
         "@fschat/shared": resolve(__dirname, "../../packages/shared/src/index.ts")
@@ -12,7 +12,7 @@ export default defineConfig({
     }
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin({ exclude: ["@fschat/shared"] })],
     build: {
       rollupOptions: {
         output: {
