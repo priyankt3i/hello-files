@@ -7,6 +7,9 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "build:indexer": "node ../../scripts/build-indexer-binary.mjs",
+    "dist": "npm run build && npm run build:indexer && npx electron-builder --config electron-builder.yml",
+    "dist:dir": "npm run build && npm run build:indexer && npx electron-builder --dir --config electron-builder.yml",
     "typecheck": "tsc --noEmit",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3,keytar",
     "postinstall": "electron-rebuild -f -w better-sqlite3,keytar"

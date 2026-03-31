@@ -9,8 +9,9 @@
   "scripts": {
     "dev": "npm run dev -w @fschat/desktop",
     "build": "npm run build -w @fschat/shared && npm run build -w @fschat/desktop",
+    "build:indexer": "npm run build:indexer -w @fschat/desktop",
+    "dist": "npm run dist -w @fschat/desktop",
     "typecheck": "npm run typecheck -w @fschat/shared && npm run typecheck -w @fschat/desktop",
     "python:check": "python -m py_compile services/indexer/fschat_indexer/*.py"
   }
 }
-

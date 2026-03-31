@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   IndexedDocumentRecord,
@@ -16,6 +18,9 @@ import type {
   WorkerEnvelope
 } from "@fschat/shared";
 
+const require = createRequire(import.meta.url);
+const { app } = require("electron") as typeof import("electron");
+
 type PendingRequest = {
   resolve: (value: any) => void;
   reject: (reason?: unknown) => void;
@@ -23,16 +28,17 @@ type PendingRequest = {
   method: string;
 };
 
-type PythonCommand = {
+type WorkerCommand = {
   command: string;
   args: string[];
+  source: "bundled-binary" | "python";
 };
 
 export class PythonWorkerBridge extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<string, PendingRequest>();
   private activeBuildChannels = new Set<string>();
-  private pythonCommand: PythonCommand | null = null;
+  private workerCommand: WorkerCommand | null = null;
 
   async openIndex(rootPath: string): Promise<{ manifest: IndexManifest }> {
     return this.request("open_index", { rootPath });
@@ -113,13 +119,8 @@ export class PythonWorkerBridge extends EventEmitter {
       return;
     }
 
-    const workerPath = resolve(
-      fileURLToPath(new URL(".", import.meta.url)),
-      "../../../../services/indexer/fschat_indexer/worker.py"
-    );
-
-    const pythonCommand = this.getPythonCommand();
-    const child = spawn(pythonCommand.command, [...pythonCommand.args, "-u", workerPath], {
+    const command = this.getWorkerCommand();
+    const child = spawn(command.command, command.args, {
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.process = child;
@@ -224,16 +225,54 @@ export class PythonWorkerBridge extends EventEmitter {
     });
   }
 
-  private getPythonCommand(): PythonCommand {
-    if (this.pythonCommand) {
-      return this.pythonCommand;
+  private getWorkerCommand(): WorkerCommand {
+    if (this.workerCommand) {
+      return this.workerCommand;
     }
 
-    const customPython = process.env.FSCHAT_PYTHON_BIN?.trim();
-    const candidates: PythonCommand[] = [];
-    if (customPython) {
-      candidates.push({ command: customPython, args: [] });
+    const bundled = this.getBundledWorkerCommand();
+    if (bundled) {
+      this.workerCommand = bundled;
+      return bundled;
     }
+
+    const python = this.getPythonWorkerCommand();
+    this.workerCommand = python;
+    return python;
+  }
+
+  private getBundledWorkerCommand(): WorkerCommand | null {
+    const explicitBinary = process.env.FSCHAT_INDEXER_BIN?.trim();
+    const executableName = process.platform === "win32" ? "fschat-indexer.exe" : "fschat-indexer";
+    const platformSegment = `${platformName(process.platform)}-${process.arch}`;
+    const candidates = [
+      explicitBinary,
+      join(process.resourcesPath, "indexer", platformSegment, executableName),
+      join(process.resourcesPath, "indexer", executableName)
+    ].filter((value): value is string => Boolean(value));
+
+    for (const candidate of candidates) {
+      if (!existsSync(candidate)) {
+        continue;
+      }
+      return { command: candidate, args: [], source: "bundled-binary" };
+    }
+
+    return null;
+  }
+
+  private getPythonWorkerCommand(): WorkerCommand {
+    const workerPath = resolve(
+      fileURLToPath(new URL(".", import.meta.url)),
+      "../../../../services/indexer/fschat_indexer/worker.py"
+    );
+
+    const explicitPython = process.env.FSCHAT_PYTHON_BIN?.trim();
+    const candidates: Array<{ command: string; args: string[] }> = [];
+    if (explicitPython) {
+      candidates.push({ command: explicitPython, args: [] });
+    }
+
     if (process.platform === "win32") {
       candidates.push({ command: "python", args: [] }, { command: "py", args: ["-3"] });
     } else {
@@ -245,17 +284,36 @@ export class PythonWorkerBridge extends EventEmitter {
         stdio: "ignore"
       });
       if (!probe.error && probe.status === 0) {
-        this.pythonCommand = candidate;
-        return candidate;
+        return {
+          command: candidate.command,
+          args: [...candidate.args, "-u", workerPath],
+          source: "python"
+        };
       }
     }
 
     const attempted = candidates.map((candidate) => [candidate.command, ...candidate.args].join(" ")).join(", ");
+    if (app.isPackaged) {
+      throw new Error(
+        `Indexer worker not found. Expected bundled binary in app resources or a valid Python command (${attempted}). ` +
+        "Reinstall the app or set FSCHAT_INDEXER_BIN / FSCHAT_PYTHON_BIN."
+      );
+    }
     throw new Error(
       `Python executable not found. Install Python and ensure one of these commands works: ${attempted}. ` +
       "You can also set FSCHAT_PYTHON_BIN to an explicit executable path."
     );
   }
+}
+
+function platformName(platform: NodeJS.Platform) {
+  if (platform === "win32") {
+    return "windows";
+  }
+  if (platform === "darwin") {
+    return "macos";
+  }
+  return "linux";
 }
 
 function parseWorkerEnvelopes(line: string): WorkerEnvelope[] {

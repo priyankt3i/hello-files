@@ -5,6 +5,7 @@ This folder contains the first contributor-facing docs for Filesystem RAG Chat.
 ## Guides
 
 - [Getting Started](getting-started.md)
+- [Desktop Distribution](distribution.md)
 - [Providers](providers.md)
 - [Indexing](indexing.md)
 - [Troubleshooting](troubleshooting.md)

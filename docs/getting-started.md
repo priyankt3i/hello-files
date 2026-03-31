@@ -59,3 +59,14 @@ npm run rebuild:native -w @fschat/desktop
 - `apps/desktop/src/main/services/app-service.ts`
 - `apps/desktop/src/renderer/app.tsx`
 - `services/indexer/fschat_indexer/worker.py`
+
+## Build Installers
+
+To create packaged desktop installers:
+
+```bash
+npm run build:indexer
+npm run dist
+```
+
+For full release details, see `docs/distribution.md`.
