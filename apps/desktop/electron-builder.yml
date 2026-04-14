@@ -1,0 +1,36 @@
+appId: com.fschat.desktop
+productName: Filesystem RAG Chat
+electronVersion: 35.0.1
+
+asar: true
+asarUnpack:
+  - "**/*.node"
+
+directories:
+  output: ../../dist/desktop
+  buildResources: build
+
+files:
+  - out/**
+  - package.json
+
+extraResources:
+  - from: resources/indexer
+    to: indexer
+    filter:
+      - "**/*"
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - zip
+
+win:
+  target:
+    - nsis
+
+linux:
+  target:
+    - AppImage
+    - deb

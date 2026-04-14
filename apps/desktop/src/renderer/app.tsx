@@ -1564,7 +1564,7 @@ function ChatPanel({
   if (!selectedChannel) {
     return (
       <main className="glass-panel shell-border min-h-0 min-w-0 flex flex-col items-center justify-center rounded-[28px] p-5 text-center shadow-panel">
-        <div className="font-display text-5xl text-paper">Teams-style chat for your filesystem</div>
+        <div className="font-display text-5xl text-paper">Chat with your filesystem</div>
         <div className="mt-4 max-w-2xl text-sm leading-7 text-mist/75">Create a channel from a root folder, index its subdirectories, track gaps in knowledge, and chat against the stored index.</div>
       </main>
     );

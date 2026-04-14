@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { resolve } from "node:path";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   IndexedDocumentRecord,
@@ -16,6 +18,9 @@ import type {
   WorkerEnvelope
 } from "@fschat/shared";
 
+const require = createRequire(import.meta.url);
+const { app } = require("electron") as typeof import("electron");
+
 type PendingRequest = {
   resolve: (value: any) => void;
   reject: (reason?: unknown) => void;
@@ -23,10 +28,17 @@ type PendingRequest = {
   method: string;
 };
 
+type WorkerCommand = {
+  command: string;
+  args: string[];
+  source: "bundled-binary" | "python";
+};
+
 export class PythonWorkerBridge extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<string, PendingRequest>();
   private activeBuildChannels = new Set<string>();
+  private workerCommand: WorkerCommand | null = null;
 
   async openIndex(rootPath: string): Promise<{ manifest: IndexManifest }> {
     return this.request("open_index", { rootPath });
@@ -107,17 +119,14 @@ export class PythonWorkerBridge extends EventEmitter {
       return;
     }
 
-    const workerPath = resolve(
-      fileURLToPath(new URL(".", import.meta.url)),
-      "../../../../services/indexer/fschat_indexer/worker.py"
-    );
-
-    const child = spawn("python", ["-u", workerPath], {
+    const command = this.getWorkerCommand();
+    const child = spawn(command.command, command.args, {
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.process = child;
 
     let workerFailed = false;
+    let stderrBuffer = "";
 
     const rejectAll = (reason: Error) => {
       this.activeBuildChannels.clear();
@@ -146,12 +155,18 @@ export class PythonWorkerBridge extends EventEmitter {
         return;
       }
 
+      const envelopes = parseWorkerEnvelopes(line);
+      if (!envelopes.length) {
+        this.emit("stderr", `[python-worker stdout] ${line}`);
+        return;
+      }
+
       try {
-        const envelope = JSON.parse(line) as WorkerEnvelope;
+        for (const envelope of envelopes) {
         if (envelope.type === "response" && envelope.id) {
           const pending = this.pending.get(envelope.id);
           if (!pending) {
-            return;
+            continue;
           }
 
           this.pending.delete(envelope.id);
@@ -167,7 +182,7 @@ export class PythonWorkerBridge extends EventEmitter {
           ) {
             this.activeBuildChannels.delete(pending.channelId);
           }
-          return;
+          continue;
         }
 
         if (envelope.type === "event" && envelope.method === "progress") {
@@ -180,11 +195,12 @@ export class PythonWorkerBridge extends EventEmitter {
             this.activeBuildChannels.delete(progress.channelId);
           }
           this.emit("progress", progress);
-          return;
+          continue;
         }
 
         if (envelope.type === "event" && envelope.method === "file_update") {
           this.emit("file_update", envelope.payload as IndexFileUpdateEvent);
+        }
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -193,15 +209,173 @@ export class PythonWorkerBridge extends EventEmitter {
     });
 
     child.stderr.on("data", (chunk) => {
-      this.emit("stderr", chunk.toString());
+      const text = chunk.toString();
+      stderrBuffer = `${stderrBuffer}${text}`.slice(-6000);
+      this.emit("stderr", text);
     });
 
     child.on("exit", (code) => {
-      failWorker(new Error(`Python worker exited with code ${code}.`), false);
+      const stderrDetail = stderrBuffer.trim();
+      const suffix = stderrDetail ? `\n${stderrDetail}` : "";
+      failWorker(new Error(`Python worker exited with code ${code}.${suffix}`), false);
     });
 
     child.on("error", (error) => {
       failWorker(error, false);
     });
   }
+
+  private getWorkerCommand(): WorkerCommand {
+    if (this.workerCommand) {
+      return this.workerCommand;
+    }
+
+    const bundled = this.getBundledWorkerCommand();
+    if (bundled) {
+      this.workerCommand = bundled;
+      return bundled;
+    }
+
+    const python = this.getPythonWorkerCommand();
+    this.workerCommand = python;
+    return python;
+  }
+
+  private getBundledWorkerCommand(): WorkerCommand | null {
+    const explicitBinary = process.env.FSCHAT_INDEXER_BIN?.trim();
+    const executableName = process.platform === "win32" ? "fschat-indexer.exe" : "fschat-indexer";
+    const platformSegment = `${platformName(process.platform)}-${process.arch}`;
+    const candidates = [
+      explicitBinary,
+      join(process.resourcesPath, "indexer", platformSegment, executableName),
+      join(process.resourcesPath, "indexer", executableName)
+    ].filter((value): value is string => Boolean(value));
+
+    for (const candidate of candidates) {
+      if (!existsSync(candidate)) {
+        continue;
+      }
+      return { command: candidate, args: [], source: "bundled-binary" };
+    }
+
+    return null;
+  }
+
+  private getPythonWorkerCommand(): WorkerCommand {
+    const workerPath = resolve(
+      fileURLToPath(new URL(".", import.meta.url)),
+      "../../../../services/indexer/fschat_indexer/worker.py"
+    );
+
+    const explicitPython = process.env.FSCHAT_PYTHON_BIN?.trim();
+    const candidates: Array<{ command: string; args: string[] }> = [];
+    if (explicitPython) {
+      candidates.push({ command: explicitPython, args: [] });
+    }
+
+    if (process.platform === "win32") {
+      candidates.push({ command: "python", args: [] }, { command: "py", args: ["-3"] });
+    } else {
+      candidates.push({ command: "python", args: [] }, { command: "python3", args: [] });
+    }
+
+    for (const candidate of candidates) {
+      const probe = spawnSync(candidate.command, [...candidate.args, "--version"], {
+        stdio: "ignore"
+      });
+      if (!probe.error && probe.status === 0) {
+        return {
+          command: candidate.command,
+          args: [...candidate.args, "-u", workerPath],
+          source: "python"
+        };
+      }
+    }
+
+    const attempted = candidates.map((candidate) => [candidate.command, ...candidate.args].join(" ")).join(", ");
+    if (app.isPackaged) {
+      throw new Error(
+        `Indexer worker not found. Expected bundled binary in app resources or a valid Python command (${attempted}). ` +
+        "Reinstall the app or set FSCHAT_INDEXER_BIN / FSCHAT_PYTHON_BIN."
+      );
+    }
+    throw new Error(
+      `Python executable not found. Install Python and ensure one of these commands works: ${attempted}. ` +
+      "You can also set FSCHAT_PYTHON_BIN to an explicit executable path."
+    );
+  }
+}
+
+function platformName(platform: NodeJS.Platform) {
+  if (platform === "win32") {
+    return "windows";
+  }
+  if (platform === "darwin") {
+    return "macos";
+  }
+  return "linux";
+}
+
+function parseWorkerEnvelopes(line: string): WorkerEnvelope[] {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  try {
+    return [JSON.parse(trimmed) as WorkerEnvelope];
+  } catch {
+    const parsed = parseConcatenatedJsonObjects(trimmed);
+    return parsed.map((item) => item as WorkerEnvelope);
+  }
+}
+
+function parseConcatenatedJsonObjects(text: string): unknown[] {
+  const objects: unknown[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      if (depth === 0) {
+        start = index;
+      }
+      depth += 1;
+      continue;
+    }
+
+    if (char === "}") {
+      if (depth === 0) {
+        continue;
+      }
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        const slice = text.slice(start, index + 1);
+        objects.push(JSON.parse(slice));
+        start = -1;
+      }
+    }
+  }
+
+  return objects;
 }

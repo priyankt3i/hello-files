@@ -132,6 +132,7 @@ For deeper project docs, see:
 
 - [Docs Index](docs/README.md)
 - [Getting Started](docs/getting-started.md)
+- [Desktop Distribution](docs/distribution.md)
 - [Providers](docs/providers.md)
 - [Indexing](docs/indexing.md)
 - [Troubleshooting](docs/troubleshooting.md)
