@@ -3,7 +3,7 @@ export const INDEX_VERSION = 3;
 
 export type ChannelStatus = "ready" | "indexing" | "stale" | "error" | "idle";
 export type FileIndexStatus = "indexed" | "failed";
-export type ProviderKind = "openai" | "azure-openai" | "anthropic" | "google" | "ollama";
+export type ProviderKind = "openai" | "openai-codex" | "azure-openai" | "anthropic" | "google" | "ollama";
 export type ModelCapability = "chat" | "embedding" | "vision";
 export type RetrievalMode = "vector" | "vectorless";
 

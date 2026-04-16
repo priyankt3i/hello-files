@@ -43,6 +43,7 @@ import {
   pickDefaultEmbeddingModel,
   selectRelevantDocuments
 } from "../providers/client";
+import { clearCodexCredentials, ensureCodexAuthorized } from "../providers/codex-client";
 import { PythonWorkerBridge } from "./python-worker";
 
 const SECRET_SERVICE = "filesystem-rag-chat";
@@ -184,41 +185,50 @@ export class DesktopAppService {
 
     const credentials = await keytar.findCredentials(SECRET_SERVICE);
     await Promise.all(credentials.map((credential) => keytar.deletePassword(SECRET_SERVICE, credential.account)));
+    clearCodexCredentials();
     this.db.resetAllAppData();
   }
 
   async connectProvider(input: ConnectProviderInput): Promise<ConnectProviderResult> {
-    if (!input.apiKey && input.provider !== "ollama") {
+    if (!input.apiKey && !["ollama", "openai-codex"].includes(input.provider)) {
       throw new Error("API key is required for this provider.");
+    }
+
+    if (input.provider === "openai-codex") {
+      await ensureCodexAuthorized();
     }
 
     const discovery = await discoverProviderModels(input);
     const now = new Date().toISOString();
     const existingConnection =
-      input.provider === "ollama"
+      input.provider === "ollama" || input.provider === "openai-codex"
         ? this.db
             .listProviderConnections()
             .find(
               (connection) =>
-                connection.provider === "ollama" &&
-                (connection.baseUrl || defaultBaseUrl("ollama")) === defaultBaseUrl("ollama")
+                connection.provider === input.provider &&
+                (connection.baseUrl || defaultBaseUrl(input.provider)) === defaultBaseUrl(input.provider)
             ) ?? null
         : null;
     const connectionId = existingConnection?.id ?? randomUUID();
     const secretRef = existingConnection?.secretRef ?? `provider-connection:${connectionId}`;
 
-    if (input.provider !== "ollama" && input.apiKey) {
+    if (!["ollama", "openai-codex"].includes(input.provider) && input.apiKey) {
       await keytar.setPassword(SECRET_SERVICE, secretRef, input.apiKey);
     }
 
     const apiKeyHint =
-      input.provider === "ollama" || !input.apiKey
+      ["ollama", "openai-codex"].includes(input.provider) || !input.apiKey
         ? undefined
         : `${input.apiKey.slice(0, 4)}...${input.apiKey.slice(-4)}`;
 
     const baseName =
       input.connectionName?.trim() ||
-      (input.provider === "ollama" ? "Ollama Local" : `${labelForProvider(input.provider)}${apiKeyHint ? ` ${apiKeyHint}` : ""}`);
+      (input.provider === "ollama"
+        ? "Ollama Local"
+        : input.provider === "openai-codex"
+          ? "OpenAI Codex"
+          : `${labelForProvider(input.provider)}${apiKeyHint ? ` ${apiKeyHint}` : ""}`);
 
     const connection: ProviderConnection = {
       id: connectionId,
@@ -324,13 +334,19 @@ export class DesktopAppService {
     );
 
     if (existing) {
-      this.assertValidChannelModelSelection(resolvedModels.chatModelId, resolvedModels.embeddingModelId);
+      const nextModels = this.enforceProviderRetrievalConstraints(
+        retrievalMode,
+        resolvedModels.preferredConnectionId ?? existing.preferredConnectionId,
+        resolvedModels.chatModelId ?? existing.chatModelId,
+        resolvedModels.embeddingModelId ?? existing.embeddingModelId
+      );
+      this.assertValidChannelModelSelection(nextModels.chatModelId, nextModels.embeddingModelId);
       this.db.updateChannel(existing.id, {
         displayName: input.displayName || existing.displayName,
-        preferredConnectionId: resolvedModels.preferredConnectionId ?? existing.preferredConnectionId,
-        chatModelId: resolvedModels.chatModelId ?? existing.chatModelId,
-        embeddingModelId: resolvedModels.embeddingModelId ?? existing.embeddingModelId,
-        retrievalMode,
+        preferredConnectionId: nextModels.preferredConnectionId,
+        chatModelId: nextModels.chatModelId,
+        embeddingModelId: nextModels.embeddingModelId,
+        retrievalMode: nextModels.retrievalMode,
         systemPrompt: normalizeChannelSystemPrompt(input.systemPrompt, existing.systemPrompt),
         updatedAt: new Date().toISOString()
       });
@@ -339,15 +355,21 @@ export class DesktopAppService {
 
     const now = new Date().toISOString();
     const uniqueName = this.db.getUniqueChannelName(input.displayName || basename(input.rootPath));
+    const nextModels = this.enforceProviderRetrievalConstraints(
+      retrievalMode,
+      resolvedModels.preferredConnectionId,
+      resolvedModels.chatModelId,
+      resolvedModels.embeddingModelId
+    );
     const channel: Channel = {
       id: randomUUID(),
       displayName: uniqueName,
       rootPath: input.rootPath,
       indexPath: join(input.rootPath, INDEX_DIR_NAME),
-      preferredConnectionId: resolvedModels.preferredConnectionId,
-      chatModelId: resolvedModels.chatModelId,
-      embeddingModelId: resolvedModels.embeddingModelId,
-      retrievalMode,
+      preferredConnectionId: nextModels.preferredConnectionId,
+      chatModelId: nextModels.chatModelId,
+      embeddingModelId: nextModels.embeddingModelId,
+      retrievalMode: nextModels.retrievalMode,
       systemPrompt: normalizeChannelSystemPrompt(input.systemPrompt),
       lastIndexedAt: null,
       status: "idle",
@@ -388,14 +410,24 @@ export class DesktopAppService {
       input.chatModelId,
       input.embeddingModelId
     );
-    this.assertValidChannelModelSelection(resolvedModels.chatModelId, resolvedModels.embeddingModelId);
+    const nextModels = this.enforceProviderRetrievalConstraints(
+      retrievalMode,
+      resolvedModels.preferredConnectionId,
+      resolvedModels.chatModelId,
+      resolvedModels.embeddingModelId
+    );
+    this.assertValidChannelModelSelection(nextModels.chatModelId, nextModels.embeddingModelId);
 
-    if (retrievalMode !== channel.retrievalMode) {
+    if (nextModels.retrievalMode !== channel.retrievalMode) {
       this.db.replaceIndexedFiles(channel.id, []);
       nextStatus = "idle";
       nextLastIndexedAt = null;
-    } else if (retrievalMode === "vector" && resolvedModels.embeddingModelId && resolvedModels.embeddingModelId !== channel.embeddingModelId) {
-      const embeddingSelection = await this.resolveModelSelection(resolvedModels.embeddingModelId);
+    } else if (
+      nextModels.retrievalMode === "vector" &&
+      nextModels.embeddingModelId &&
+      nextModels.embeddingModelId !== channel.embeddingModelId
+    ) {
+      const embeddingSelection = await this.resolveModelSelection(nextModels.embeddingModelId);
       const status = await this.worker.getIndexStatus(channel.rootPath);
       const expectedKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
       const matchesExistingIndex = status.exists && status.manifest?.embeddingModelKey === expectedKey;
@@ -412,10 +444,10 @@ export class DesktopAppService {
     }
 
     this.db.updateChannel(channel.id, {
-      preferredConnectionId: resolvedModels.preferredConnectionId,
-      chatModelId: resolvedModels.chatModelId,
-      embeddingModelId: resolvedModels.embeddingModelId,
-      retrievalMode,
+      preferredConnectionId: nextModels.preferredConnectionId,
+      chatModelId: nextModels.chatModelId,
+      embeddingModelId: nextModels.embeddingModelId,
+      retrievalMode: nextModels.retrievalMode,
       status: nextStatus,
       lastIndexedAt: nextLastIndexedAt,
       updatedAt: new Date().toISOString()
@@ -819,7 +851,7 @@ export class DesktopAppService {
   }
 
   private async getProviderSecret(connection: ProviderConnection) {
-    if (connection.provider === "ollama") {
+    if (connection.provider === "ollama" || connection.provider === "openai-codex") {
       return { apiKey: "" };
     }
 
@@ -967,6 +999,34 @@ export class DesktopAppService {
     return mode;
   }
 
+  private enforceProviderRetrievalConstraints(
+    retrievalMode: RetrievalMode,
+    preferredConnectionId: string | null,
+    chatModelId: string | null,
+    embeddingModelId: string | null
+  ) {
+    const preferredConnection = preferredConnectionId ? this.db.getProviderConnection(preferredConnectionId) : null;
+    const chatModel = chatModelId ? this.db.getProviderModel(chatModelId) : null;
+    const chatConnection = chatModel ? this.db.getProviderConnection(chatModel.connectionId) : null;
+    const effectiveProvider = preferredConnection?.provider ?? chatConnection?.provider ?? null;
+
+    if (effectiveProvider === "openai-codex") {
+      return {
+        preferredConnectionId: preferredConnectionId ?? chatConnection?.id ?? null,
+        chatModelId,
+        embeddingModelId: null,
+        retrievalMode: "vectorless" as const
+      };
+    }
+
+    return {
+      preferredConnectionId,
+      chatModelId,
+      embeddingModelId,
+      retrievalMode
+    };
+  }
+
   private async buildVectorIndexOptions(channel: Channel) {
     if (!channel.embeddingModelId) {
       throw new Error("An embedding model is required before indexing vector channels.");
@@ -1072,6 +1132,8 @@ function labelForProvider(provider: ConnectProviderInput["provider"]) {
   switch (provider) {
     case "openai":
       return "OpenAI";
+    case "openai-codex":
+      return "OpenAI Codex";
     case "azure-openai":
       return "Azure OpenAI";
     case "anthropic":

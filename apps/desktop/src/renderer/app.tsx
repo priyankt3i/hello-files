@@ -143,6 +143,8 @@ export function App() {
         : [],
     [models, pendingPreferredConnectionId]
   );
+  const pendingPreferredConnection = pendingPreferredConnectionId ? connectionById[pendingPreferredConnectionId] ?? null : null;
+  const pendingConnectionRequiresVectorless = requiresVectorless(pendingPreferredConnection);
 
   async function refreshBootstrap() {
     setBusy(true);
@@ -209,15 +211,23 @@ export function App() {
       const result = await window.fsChat.inspectRootFolder(rootPath);
       setInspection(result);
       setChannelName(result.defaultDisplayName);
-      setPendingRetrievalMode(result.existingChannel?.retrievalMode ?? "vector");
       const preferredConnectionId =
         result.existingChannel?.preferredConnectionId ??
         pickInitialConnectionId(connections, providerDefaultsByConnectionId) ??
         null;
       setPendingPreferredConnectionId(preferredConnectionId);
       const nextDefaults = preferredConnectionId ? providerDefaultsByConnectionId[preferredConnectionId] : undefined;
+      const preferredConnection = preferredConnectionId ? connectionById[preferredConnectionId] ?? null : null;
+      const nextRetrievalMode = requiresVectorless(preferredConnection)
+        ? "vectorless"
+        : result.existingChannel?.retrievalMode ?? "vector";
+      setPendingRetrievalMode(nextRetrievalMode);
       setPendingChatModelId(result.existingChannel?.chatModelId ?? nextDefaults?.defaultChatModelId ?? null);
-      setPendingEmbeddingModelId(result.existingChannel?.embeddingModelId ?? nextDefaults?.defaultEmbeddingModelId ?? null);
+      setPendingEmbeddingModelId(
+        nextRetrievalMode === "vector"
+          ? result.existingChannel?.embeddingModelId ?? nextDefaults?.defaultEmbeddingModelId ?? null
+          : null
+      );
     } catch (caught) {
       setError(toErrorMessage(caught));
     }
@@ -710,8 +720,14 @@ async function handleRevealCitationFile() {
                       const nextConnectionId = event.target.value || null;
                       setPendingPreferredConnectionId(nextConnectionId);
                       const nextDefaults = nextConnectionId ? providerDefaultsByConnectionId[nextConnectionId] : undefined;
+                      const nextConnection = nextConnectionId ? connectionById[nextConnectionId] ?? null : null;
                       setPendingChatModelId(nextDefaults?.defaultChatModelId ?? null);
-                      setPendingEmbeddingModelId(nextDefaults?.defaultEmbeddingModelId ?? null);
+                      if (requiresVectorless(nextConnection)) {
+                        setPendingRetrievalMode("vectorless");
+                        setPendingEmbeddingModelId(null);
+                      } else {
+                        setPendingEmbeddingModelId(nextDefaults?.defaultEmbeddingModelId ?? null);
+                      }
                     }}
                     className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
                     disabled={connections.length === 0}
@@ -727,10 +743,21 @@ async function handleRevealCitationFile() {
                 <Field label="Retrieval mode">
                   <select
                     value={pendingRetrievalMode}
-                    onChange={(event) => setPendingRetrievalMode(event.target.value as RetrievalMode)}
+                    onChange={(event) => {
+                      const nextMode = event.target.value as RetrievalMode;
+                      if (pendingConnectionRequiresVectorless) {
+                        setPendingRetrievalMode("vectorless");
+                        setPendingEmbeddingModelId(null);
+                        return;
+                      }
+                      setPendingRetrievalMode(nextMode);
+                      if (nextMode !== "vector") {
+                        setPendingEmbeddingModelId(null);
+                      }
+                    }}
                     className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
                   >
-                    <option value="vector">Vector</option>
+                    <option value="vector" disabled={pendingConnectionRequiresVectorless}>Vector</option>
                     <option value="vectorless">Vectorless</option>
                   </select>
                 </Field>
@@ -753,8 +780,9 @@ async function handleRevealCitationFile() {
                   </Field>
                 ) : (
                   <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
-                    Vectorless channels do not need an embedding model. The app will use a manifest-first document pass
-                    before grounding answers in matching file excerpts.
+                    {pendingConnectionRequiresVectorless
+                      ? "OpenAI Codex is chat-only in this app, so Codex channels use vectorless retrieval. The model picker mirrors Cline's ChatGPT Subscription catalog, and the selected Codex model is sent directly before grounding answers in matching file excerpts."
+                      : "Vectorless channels do not need an embedding model. The app will use a manifest-first document pass before grounding answers in matching file excerpts."}
                   </div>
                 )}
                 {pendingRetrievalMode === "vector" && pendingPreferredConnectionId && pendingConnectionEmbeddingModels.length === 0 ? (
@@ -1112,6 +1140,7 @@ function ChannelModelsModal({
   );
   const embeddingChanged = retrievalMode === "vector" && (channel.embeddingModelId ?? "") !== embeddingModelId;
   const preferredConnection = preferredConnectionId ? connectionById[preferredConnectionId] ?? null : null;
+  const connectionRequiresVectorless = requiresVectorless(preferredConnection);
   const selectedChatModel = chatModelId ? models.find((model) => model.id === chatModelId) ?? null : null;
   const selectedEmbeddingModel = embeddingModelId ? models.find((model) => model.id === embeddingModelId) ?? null : null;
 
@@ -1129,8 +1158,14 @@ function ChannelModelsModal({
               const nextConnectionId = event.target.value;
               setPreferredConnectionId(nextConnectionId);
               const nextDefaults = nextConnectionId ? providerDefaultsByConnectionId[nextConnectionId] : undefined;
+              const nextConnection = nextConnectionId ? connectionById[nextConnectionId] ?? null : null;
               setChatModelId(nextDefaults?.defaultChatModelId ?? "");
-              setEmbeddingModelId(nextDefaults?.defaultEmbeddingModelId ?? "");
+              if (requiresVectorless(nextConnection)) {
+                setRetrievalMode("vectorless");
+                setEmbeddingModelId("");
+              } else {
+                setEmbeddingModelId(nextDefaults?.defaultEmbeddingModelId ?? "");
+              }
             }}
             className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
           >
@@ -1145,10 +1180,21 @@ function ChannelModelsModal({
         <Field label="Retrieval mode">
           <select
             value={retrievalMode}
-            onChange={(event) => setRetrievalMode(event.target.value as RetrievalMode)}
+            onChange={(event) => {
+              const nextMode = event.target.value as RetrievalMode;
+              if (connectionRequiresVectorless) {
+                setRetrievalMode("vectorless");
+                setEmbeddingModelId("");
+                return;
+              }
+              setRetrievalMode(nextMode);
+              if (nextMode !== "vector") {
+                setEmbeddingModelId("");
+              }
+            }}
             className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none"
           >
-            <option value="vector">Vector</option>
+            <option value="vector" disabled={connectionRequiresVectorless}>Vector</option>
             <option value="vectorless">Vectorless</option>
           </select>
         </Field>
@@ -1183,7 +1229,9 @@ function ChannelModelsModal({
           </Field>
         ) : (
           <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
-            Vectorless channels use manifest-first document selection and do not require an embedding model.
+            {connectionRequiresVectorless
+              ? "OpenAI Codex is chat-only in this app, so Codex channels use vectorless retrieval and do not require an embedding model. The visible Codex model catalog mirrors Cline, and the selected Codex model is sent directly."
+              : "Vectorless channels use manifest-first document selection and do not require an embedding model."}
           </div>
         )}
         <ModelSelectionHint
@@ -1436,7 +1484,9 @@ function ModelSelectionHint({
       <div className="mt-2 leading-6">
         {retrievalMode === "vector"
           ? "Chat and embedding models are validated independently, and both must come from the same provider connection. The chat model must support chat, and the embedding model must support embeddings."
-          : "Vectorless channels require a chat-capable model. Embedding models are optional because retrieval happens through manifest-first document selection and lexical grounding."}
+          : preferredConnection.provider === "openai-codex"
+            ? "OpenAI Codex is integrated here as a chat-only provider. Codex channels therefore use vectorless retrieval, and embedding models are not used. The visible Codex model list mirrors Cline's ChatGPT Subscription catalog, and this app sends the selected Codex model directly."
+            : "Vectorless channels require a chat-capable model. Embedding models are optional because retrieval happens through manifest-first document selection and lexical grounding."}
       </div>
       {crossProviderOverride ? (
         <div className="mt-2 leading-6 text-amber-100/85">
@@ -1877,7 +1927,15 @@ function pickInitialConnectionId(
     const defaults = providerDefaultsByConnectionId[connection.id];
     return Boolean(defaults?.defaultChatModelId && defaults?.defaultEmbeddingModelId);
   });
-  return withBothDefaults?.id ?? connections[0]?.id ?? null;
+  const withChatDefault = connections.find((connection) => {
+    const defaults = providerDefaultsByConnectionId[connection.id];
+    return Boolean(defaults?.defaultChatModelId);
+  });
+  return withBothDefaults?.id ?? withChatDefault?.id ?? connections[0]?.id ?? null;
+}
+
+function requiresVectorless(connection: ProviderConnection | null | undefined) {
+  return connection?.provider === "openai-codex";
 }
 
 function renderMarkdownToHtml(markdown: string) {

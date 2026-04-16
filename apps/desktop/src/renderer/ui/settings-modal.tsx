@@ -11,6 +11,11 @@ import { Modal } from "./common";
 const PROVIDERS: Array<{ value: ProviderKind; label: string; note: string }> = [
   { value: "openai", label: "OpenAI", note: "Chat and embedding models are discovered automatically." },
   {
+    value: "openai-codex",
+    label: "OpenAI Codex",
+    note: "Codex uses browser-based OAuth in this desktop app. It is treated as chat-only here, so Codex channels should use vectorless retrieval. The model picker mirrors Cline's ChatGPT Subscription catalog, and the selected Codex model is sent directly."
+  },
+  {
     value: "anthropic",
     label: "Anthropic",
     note: "Claude chat models are discovered automatically. Anthropic works for vectorless channels, but vector channels still need embeddings from another provider."
@@ -84,6 +89,7 @@ export function SettingsModal({
   }, [connections, providerDefaults]);
 
   const providerNote = useMemo(() => PROVIDERS.find((item) => item.value === provider)?.note ?? "", [provider]);
+  const providerNeedsApiKey = provider !== "ollama" && provider !== "openai-codex";
 
   return (
     <Modal title="Provider Settings" onClose={onClose}>
@@ -115,25 +121,31 @@ export function SettingsModal({
             <input
               value={apiKey}
               onChange={(event) => setApiKey(event.target.value)}
-              placeholder={provider === "ollama" ? "No API key needed for local Ollama" : "API key"}
+              placeholder={
+                provider === "ollama"
+                  ? "No API key needed for local Ollama"
+                  : provider === "openai-codex"
+                    ? "No API key needed. Browser login opens during connect."
+                    : "API key"
+              }
               type="password"
-              disabled={provider === "ollama"}
+              disabled={!providerNeedsApiKey}
               className="w-full rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-sm text-paper outline-none disabled:opacity-50"
             />
             <button
               className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink disabled:opacity-40"
-              disabled={busy || (provider !== "ollama" && !apiKey.trim())}
+              disabled={busy || (providerNeedsApiKey && !apiKey.trim())}
               onClick={async () => {
                 setBusy(true);
                 try {
                   const result = await onConnect({
                     provider,
                     connectionName: connectionName.trim() || undefined,
-                    apiKey: provider === "ollama" ? undefined : apiKey.trim()
+                    apiKey: providerNeedsApiKey ? apiKey.trim() : undefined
                   });
                   setWarnings(result.warnings);
                   setConnectionName("");
-                  if (provider !== "ollama") {
+                  if (providerNeedsApiKey) {
                     setApiKey("");
                   }
                 } finally {

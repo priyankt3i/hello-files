@@ -7,9 +7,10 @@ import type {
   ProviderModel,
   SearchResult
 } from "@fschat/shared";
+import { callCodexText } from "./codex-client";
 
 type ProviderSecret = {
-  apiKey: string;
+  apiKey?: string;
 };
 
 type DiscoveredModel = Omit<ProviderModel, "id" | "connectionId" | "createdAt" | "updatedAt">;
@@ -21,11 +22,54 @@ type ProviderDiscovery = {
 
 const DEFAULT_BASE_URLS = {
   openai: "https://api.openai.com",
+  "openai-codex": "",
   "azure-openai": "",
   anthropic: "https://api.anthropic.com",
   google: "https://generativelanguage.googleapis.com",
   ollama: "http://127.0.0.1:11434"
 } as const;
+
+const CODEX_DISCOVERED_MODELS: Array<{
+  id: string;
+  displayName: string;
+  description: string;
+}> = [
+  {
+    id: "chatgpt-plan-default",
+    displayName: "Default (ChatGPT plan)",
+    description: "Maps to the app's current Codex fallback model when no specific Codex model is selected."
+  },
+  {
+    id: "gpt-5.4",
+    displayName: "gpt-5.4",
+    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+  },
+  {
+    id: "gpt-5.3-codex",
+    displayName: "gpt-5.3-codex",
+    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+  },
+  {
+    id: "gpt-5.2-codex",
+    displayName: "gpt-5.2-codex",
+    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+  },
+  {
+    id: "gpt-5.1-codex-max",
+    displayName: "gpt-5.1-codex-max",
+    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+  },
+  {
+    id: "gpt-5.1-codex-mini",
+    displayName: "gpt-5.1-codex-mini",
+    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+  },
+  {
+    id: "gpt-5.2",
+    displayName: "gpt-5.2",
+    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+  }
+];
 
 export async function generateAssistantReply(args: {
   connection: ProviderConnection;
@@ -127,6 +171,8 @@ export async function discoverProviderModels(input: ConnectProviderInput): Promi
   switch (input.provider) {
     case "openai":
       return discoverOpenAIModels(input.apiKey || "");
+    case "openai-codex":
+      return discoverCodexModels();
     case "anthropic":
       return discoverAnthropicModels(input.apiKey || "");
     case "google":
@@ -179,6 +225,28 @@ async function discoverOpenAIModels(apiKey: string): Promise<ProviderDiscovery> 
       supportsVision: /vision|gpt-4o|gpt-4\.1|gpt-5/i.test(id)
     })),
     warnings: []
+  };
+}
+
+async function discoverCodexModels(): Promise<ProviderDiscovery> {
+  return {
+    models: CODEX_DISCOVERED_MODELS.map((item) => ({
+      provider: "openai-codex" as const,
+      modelId: item.id,
+      displayName: item.displayName,
+      supportsChat: true,
+      supportsEmbedding: false,
+      supportsVision: true,
+      metadata: JSON.stringify({
+        source: "cline-chatgpt-subscription-catalog",
+        advisoryOnly: item.id !== "chatgpt-plan-default",
+        description: item.description
+      })
+    })),
+    warnings: [
+      "OpenAI Codex uses browser-based OAuth in this app and is treated as chat-only. Codex channels default to vectorless retrieval.",
+      "The visible Codex model list mirrors the ChatGPT Subscription catalog bundled by Cline. This app now sends the selected Codex model directly, but actual support still depends on what the ChatGPT Codex backend accepts for your account."
+    ]
   };
 }
 
@@ -341,7 +409,7 @@ function pickPreferredModel(models: DiscoveredModel[], preferences: string[]) {
 async function callOpenAI(args: {
   baseUrl?: string;
   model?: string;
-  apiKey: string;
+  apiKey?: string;
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
@@ -383,30 +451,39 @@ async function callProviderText(args: {
         history,
         prompt
       });
+    case "openai-codex":
+      return (
+        await callCodexText({
+          model: model.modelId,
+          systemPrompt,
+          history,
+          prompt
+        })
+      ).text;
     case "azure-openai":
       return callAzureOpenAI({
-        baseUrl,
+        baseUrl: baseUrl || "",
         deployment: model.deployment || model.modelId,
         apiVersion: connection.apiVersion || "2024-10-21",
-        apiKey: secret.apiKey,
+        apiKey: secret.apiKey || "",
         systemPrompt,
         history,
         prompt
       });
     case "anthropic":
       return callAnthropic({
-        baseUrl,
+        baseUrl: baseUrl || DEFAULT_BASE_URLS.anthropic,
         model: model.modelId,
-        apiKey: secret.apiKey,
+        apiKey: secret.apiKey || "",
         systemPrompt,
         history,
         prompt
       });
     case "google":
       return callGoogle({
-        baseUrl,
+        baseUrl: baseUrl || DEFAULT_BASE_URLS.google,
         model: model.modelId,
-        apiKey: secret.apiKey,
+        apiKey: secret.apiKey || "",
         systemPrompt,
         history,
         prompt

@@ -137,6 +137,7 @@ For deeper project docs, see:
 - [Indexing](docs/indexing.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Architecture](docs/architecture.md)
+- [Vectorless RAG](vectorlessRAG.md)
 
 ## Contributing
 
