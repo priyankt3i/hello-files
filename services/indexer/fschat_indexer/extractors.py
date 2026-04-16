@@ -9,7 +9,7 @@ import tempfile
 import warnings
 import zipfile
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 from docx import Document
 from openpyxl import load_workbook
@@ -101,29 +101,37 @@ MAX_EMBEDDED_IMAGES_PER_PDF_PAGE = 3
 MAX_EMBEDDED_IMAGES_PER_DOCX = 12
 OCR_MAX_IMAGE_EDGE = 1800
 OCR_MAX_IMAGE_PIXELS = 3_000_000
+HEADER_SCAN_LIMIT = 12
+MAX_PROFILE_HEADERS = 12
 
 _OCR_ENGINE = None
 
 
 def extract_text(path: Path) -> Tuple[str, str]:
+    payload = extract_document(path)
+    return payload["text"], payload["parser"]
+
+
+def extract_document(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return extract_pdf(path), "pdf"
+        return {"text": extract_pdf(path), "parser": "pdf"}
     if suffix == ".docx":
-        return extract_docx(path), "docx"
+        return {"text": extract_docx(path), "parser": "docx"}
     if suffix == ".doc":
-        return extract_doc(path), "doc"
+        return {"text": extract_doc(path), "parser": "doc"}
     if suffix in SPREADSHEET_EXTENSIONS:
-        return extract_workbook(path), "spreadsheet"
+        return extract_workbook_document(path)
     if suffix in LEGACY_SPREADSHEET_EXTENSIONS:
-        return extract_legacy_workbook(path), "spreadsheet-xls"
+        return extract_legacy_workbook_document(path)
     if suffix == ".csv":
-        return extract_csv(path), "csv"
+        return {"text": extract_csv(path), "parser": "csv"}
     if suffix in IMAGE_EXTENSIONS:
-        return extract_image_document(path), "image-ocr"
+        return {"text": extract_image_document(path), "parser": "image-ocr"}
     if suffix in TEXT_EXTENSIONS:
-        return extract_plain_text(path), "text"
-    return extract_unknown(path)
+        return {"text": extract_plain_text(path), "parser": "text"}
+    text, parser = extract_unknown(path)
+    return {"text": text, "parser": parser}
 
 
 def extract_pdf(path: Path) -> str:
@@ -320,6 +328,210 @@ def extract_workbook(path: Path) -> str:
             values = [str(value).strip() for value in row if value is not None and str(value).strip()]
             if values:
                 parts.append(" | ".join(values))
+    return "\n".join(parts)
+
+
+def extract_legacy_workbook_document(path: Path) -> dict[str, Any]:
+    if xlrd is None:
+        raise ValueError("Legacy .xls support requires xlrd.")
+
+    workbook = xlrd.open_workbook(path)
+    sheets = []
+    for sheet in workbook.sheets():
+        rows: list[tuple[int, list[str]]] = []
+        for row_index in range(sheet.nrows):
+            values = [normalize_spreadsheet_cell(sheet.cell_value(row_index, column_index)) for column_index in range(sheet.ncols)]
+            trimmed = trim_trailing_empty_cells(values)
+            if any(trimmed):
+                rows.append((row_index + 1, trimmed))
+        sheets.append({"title": sheet.name, "rows": rows})
+    return build_spreadsheet_document(sheets, "spreadsheet-xls")
+
+
+def extract_workbook_document(path: Path) -> dict[str, Any]:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Conditional Formatting extension is not supported and will be removed",
+            category=UserWarning,
+            module=r"openpyxl\.worksheet\._reader",
+        )
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    sheets = []
+    for sheet in workbook.worksheets:
+        rows: list[tuple[int, list[str]]] = []
+        for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            values = [normalize_spreadsheet_cell(value) for value in row]
+            trimmed = trim_trailing_empty_cells(values)
+            if any(trimmed):
+                rows.append((row_index, trimmed))
+        sheets.append({"title": sheet.title, "rows": rows})
+    return build_spreadsheet_document(sheets, "spreadsheet")
+
+
+def build_spreadsheet_document(sheets: list[dict[str, Any]], parser_name: str) -> dict[str, Any]:
+    parts: list[str] = []
+    row_chunks: list[dict[str, Any]] = []
+    sheet_profiles: list[dict[str, Any]] = []
+    column_hints: list[str] = []
+
+    for sheet in sheets:
+        title = str(sheet.get("title") or "Sheet")
+        rows: list[tuple[int, list[str]]] = sheet.get("rows") or []
+        parts.append(f"# Sheet: {title}")
+        if not rows:
+            sheet_profiles.append({"name": title, "rowCount": 0, "columnCount": 0, "headerHints": []})
+            continue
+
+        header_index = detect_header_row(rows)
+        header_values = sanitize_header_values(rows[header_index][1]) if header_index is not None else []
+        if header_values:
+            parts.append(f"# Header: {' | '.join(header_values)}")
+            column_hints.extend(header_values)
+
+        data_row_count = 0
+        max_column_count = 0
+        for entry_index, (row_number, values) in enumerate(rows):
+            max_column_count = max(max_column_count, len(values))
+            if header_index is not None and entry_index == header_index:
+                continue
+
+            if header_values:
+                row_text = build_labeled_row_text(title, row_number, header_values, values)
+                chunk_type = "spreadsheet-row"
+            else:
+                row_text = build_generic_row_text(title, row_number, values)
+                chunk_type = "spreadsheet-row"
+
+            row_chunks.append(
+                {
+                    "text": row_text,
+                    "chunkType": chunk_type,
+                    "sheetName": title,
+                    "rowNumber": row_number,
+                }
+            )
+            parts.append(row_text)
+            data_row_count += 1
+
+        sheet_profiles.append(
+            {
+                "name": title,
+                "rowCount": data_row_count,
+                "columnCount": max(max_column_count, len(header_values)),
+                "headerHints": header_values[:MAX_PROFILE_HEADERS],
+            }
+        )
+
+    unique_sheet_names = [profile["name"] for profile in sheet_profiles]
+    unique_column_hints = dedupe_preserve_order([item for item in column_hints if item])[:MAX_PROFILE_HEADERS]
+    structure = {
+        "kind": "spreadsheet",
+        "sheetCount": len(sheet_profiles),
+        "rowCount": sum(int(profile["rowCount"]) for profile in sheet_profiles),
+        "sheetNames": unique_sheet_names,
+        "columnHints": unique_column_hints,
+        "sheets": sheet_profiles,
+    }
+
+    return {
+        "text": "\n\n".join(part for part in parts if part.strip()),
+        "parser": parser_name,
+        "chunks": row_chunks,
+        "structure": structure,
+    }
+
+
+def normalize_spreadsheet_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    return str(value).strip()
+
+
+def trim_trailing_empty_cells(values: list[str]) -> list[str]:
+    end = len(values)
+    while end > 0 and not values[end - 1]:
+        end -= 1
+    return values[:end]
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def detect_header_row(rows: list[tuple[int, list[str]]]) -> int | None:
+    best_index: int | None = None
+    best_score = 0.0
+    for index, (_, values) in enumerate(rows[:HEADER_SCAN_LIMIT]):
+        non_empty_values = [value for value in values if value]
+        if len(non_empty_values) < 2:
+            continue
+        score = score_header_candidate(non_empty_values)
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return best_index if best_score >= 2.5 else None
+
+
+def score_header_candidate(values: list[str]) -> float:
+    score = 0.0
+    unique_values = {value.lower() for value in values if value}
+    if len(unique_values) == len(values):
+        score += 0.8
+    for value in values:
+        token_count = len(re.findall(r"[A-Za-z]+", value))
+        digit_count = len(re.findall(r"\d", value))
+        if token_count > 0:
+            score += 1.0
+        if digit_count == 0:
+            score += 0.35
+        if len(value) <= 40:
+            score += 0.2
+        if re.search(r"[A-Za-z]", value) and not re.fullmatch(r"[A-Z]{2,}\d+", value):
+            score += 0.2
+    return score
+
+
+def sanitize_header_values(values: list[str]) -> list[str]:
+    headers: list[str] = []
+    used: set[str] = set()
+    for index, value in enumerate(values, start=1):
+        normalized = re.sub(r"\s+", " ", value).strip(" |:-")
+        candidate = normalized or f"Column {index}"
+        if candidate.lower() in used:
+            candidate = f"{candidate} ({index})"
+        used.add(candidate.lower())
+        headers.append(candidate)
+    return headers
+
+
+def build_labeled_row_text(sheet_name: str, row_number: int, headers: list[str], values: list[str]) -> str:
+    parts = [f"# Sheet: {sheet_name}", f"Row: {row_number}"]
+    for index, value in enumerate(values, start=1):
+        if not value:
+            continue
+        header = headers[index - 1] if index - 1 < len(headers) else f"Column {index}"
+        parts.append(f"{header}: {value}")
+    return "\n".join(parts)
+
+
+def build_generic_row_text(sheet_name: str, row_number: int, values: list[str]) -> str:
+    parts = [f"# Sheet: {sheet_name}", f"Row: {row_number}"]
+    for index, value in enumerate(values, start=1):
+        if not value:
+            continue
+        parts.append(f"Column {index}: {value}")
     return "\n".join(parts)
 
 

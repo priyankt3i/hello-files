@@ -56,7 +56,7 @@ export function App() {
   const [cancelPrompt, setCancelPrompt] = useState<{ channelId: string; channelName: string } | null>(null);
   const [channelModelsOpen, setChannelModelsOpen] = useState(false);
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
-  const [deletePrompt, setDeletePrompt] = useState<{ channelId: string; channelName: string } | null>(null);
+  const [deletePrompt, setDeletePrompt] = useState<{ channelId: string; channelName: string; indexPath: string } | null>(null);
   const [deleteThreadPrompt, setDeleteThreadPrompt] = useState<{ threadId: string; title: string } | null>(null);
   const [citationPreview, setCitationPreview] = useState<{ channelId: string; citation: Citation } | null>(null);
   const [cancellingByChannel, setCancellingByChannel] = useState<Record<string, boolean>>({});
@@ -466,11 +466,11 @@ export function App() {
     void handleDeleteThread(threadId);
   }
 
-  async function handleDeleteChannel() {
+  async function handleDeleteChannel(removeIndex: boolean) {
     if (!deletePrompt) return;
     setBusy(true);
     try {
-      await window.fsChat.deleteChannel(deletePrompt.channelId);
+      await window.fsChat.deleteChannel({ channelId: deletePrompt.channelId, removeIndex });
       setDeletePrompt(null);
       if (selectedChannelId === deletePrompt.channelId) {
         setSelectedChannelId(null);
@@ -591,7 +591,11 @@ async function handleRevealCitationFile() {
           onOpenSystemPrompt={() => setSystemPromptOpen(true)}
           onDelete={() => {
             if (selectedChannel) {
-              setDeletePrompt({ channelId: selectedChannel.id, channelName: selectedChannel.displayName });
+              setDeletePrompt({
+                channelId: selectedChannel.id,
+                channelName: selectedChannel.displayName,
+                indexPath: selectedChannel.indexPath
+              });
             }
           }}
           onRegenerate={handleRegenerateIndex}
@@ -650,10 +654,12 @@ async function handleRevealCitationFile() {
       {deletePrompt ? (
         <DeleteChannelToast
           channelName={deletePrompt.channelName}
+          indexPath={deletePrompt.indexPath}
           busy={busy}
           offsetForError={Boolean(error)}
           onClose={() => setDeletePrompt(null)}
-          onDelete={() => void handleDeleteChannel()}
+          onDeleteChannel={() => void handleDeleteChannel(false)}
+          onDeleteChannelAndIndex={() => void handleDeleteChannel(true)}
         />
       ) : null}
 
@@ -1325,16 +1331,20 @@ function SystemPromptModal({
 
 function DeleteChannelToast({
   channelName,
+  indexPath,
   busy,
   offsetForError,
   onClose,
-  onDelete
+  onDeleteChannel,
+  onDeleteChannelAndIndex
 }: {
   channelName: string;
+  indexPath: string;
   busy: boolean;
   offsetForError: boolean;
   onClose: () => void;
-  onDelete: () => void;
+  onDeleteChannel: () => void;
+  onDeleteChannelAndIndex: () => void;
 }) {
   return (
     <div className={`fixed right-5 z-40 w-[min(30rem,calc(100vw-2rem))] ${offsetForError ? "bottom-52" : "bottom-5"}`}>
@@ -1353,15 +1363,25 @@ function DeleteChannelToast({
           </button>
         </div>
         <div className="break-anywhere text-sm leading-6 text-[#ffd1ca]/85">
-          This removes the channel from the app along with its threads and file status history. It does not delete the source folder or the on-disk `.fschat-index` folder.
+          This removes the channel from the app along with its threads and file status history. You can keep or remove the on-disk index for this folder.
+        </div>
+        <div className="mt-3 break-anywhere rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-xs text-mist/75">
+          Index path: {indexPath}
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
           <button
             className="rounded-full border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-[#ffd1ca] disabled:opacity-40"
-            onClick={onDelete}
+            onClick={onDeleteChannel}
             disabled={busy}
           >
-            {busy ? "Deleting..." : "Delete Channel"}
+            {busy ? "Deleting..." : "Delete Channel Only"}
+          </button>
+          <button
+            className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink disabled:opacity-40"
+            onClick={onDeleteChannelAndIndex}
+            disabled={busy}
+          >
+            {busy ? "Deleting..." : "Delete Channel + Index"}
           </button>
         </div>
       </div>

@@ -6,6 +6,7 @@ import type {
   CreateThreadInput,
   ConnectProviderInput,
   ConnectProviderResult,
+  DeleteChannelInput,
   FileIndexStatus,
   IndexFileUpdateEvent,
   IndexProgressEvent,
@@ -39,7 +40,7 @@ const api = {
   updateChannelModels: (input: UpdateChannelModelsInput): Promise<ChannelSnapshot> => ipcRenderer.invoke("fschat:update-channel-models", input),
   updateChannelSystemPrompt: (input: UpdateChannelSystemPromptInput): Promise<ChannelSnapshot> =>
     ipcRenderer.invoke("fschat:update-channel-system-prompt", input),
-  deleteChannel: (channelId: string) => ipcRenderer.invoke("fschat:delete-channel", channelId),
+  deleteChannel: (input: DeleteChannelInput) => ipcRenderer.invoke("fschat:delete-channel", input),
   loadChannel: (channelId: string): Promise<ChannelSnapshot> => ipcRenderer.invoke("fschat:load-channel", channelId),
   startIndex: (channelId: string) => ipcRenderer.invoke("fschat:start-index", channelId),
   regenerateIndex: (channelId: string) => ipcRenderer.invoke("fschat:regenerate-index", channelId),

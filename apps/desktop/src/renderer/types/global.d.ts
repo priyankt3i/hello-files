@@ -6,6 +6,7 @@ import type {
   CreateThreadInput,
   ConnectProviderInput,
   ConnectProviderResult,
+  DeleteChannelInput,
   FileIndexStatus,
   IndexFileUpdateEvent,
   IndexProgressEvent,
@@ -46,7 +47,7 @@ declare global {
       registerChannel: (input: RegisterChannelInput) => Promise<ChannelSnapshot>;
       updateChannelModels: (input: UpdateChannelModelsInput) => Promise<ChannelSnapshot>;
       updateChannelSystemPrompt: (input: UpdateChannelSystemPromptInput) => Promise<ChannelSnapshot>;
-      deleteChannel: (channelId: string) => Promise<void>;
+      deleteChannel: (input: DeleteChannelInput) => Promise<void>;
       loadChannel: (channelId: string) => Promise<ChannelSnapshot>;
       startIndex: (channelId: string) => Promise<ChannelSnapshot>;
       regenerateIndex: (channelId: string) => Promise<ChannelSnapshot>;

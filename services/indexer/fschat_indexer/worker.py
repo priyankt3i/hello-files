@@ -16,7 +16,7 @@ from uuid import uuid4
 import numpy as np
 
 from embeddings import batched, embed_query, embed_texts
-from extractors import extract_text, normalize_text
+from extractors import extract_document, normalize_text
 from index_store import (
     INDEX_DIR_NAME,
     INDEX_VERSION,
@@ -175,7 +175,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
 
     temp_store = prepare_temp_store(root_path)
     try:
-        previous_manifest = read_manifest(root_path) if index_exists(root_path) else None
+        previous_manifest = None if force else (read_manifest(root_path) if index_exists(root_path) else None)
     except ValueError:
         previous_manifest = None
     previous_file_map: dict[str, dict[str, Any]] = {}
@@ -349,17 +349,20 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         completed_current_file = True
                         continue
 
-                raw_text, parser_name = extract_text(path)
+                extracted = extract_document(path)
+                parser_name = extracted["parser"]
+                raw_text = extracted.get("text") or ""
                 normalized = normalize_text(raw_text)
                 if not normalized:
                     raise ValueError("No extractable text found.")
-                chunks = split_text(normalized)
-                if not chunks:
+                chunk_payloads = build_chunk_payloads(normalized, extracted.get("chunks") or [])
+                if not chunk_payloads:
                     raise ValueError("No extractable text chunks found.")
 
                 file_chunk_entries: list[dict[str, Any]] = []
                 entries_to_embed: list[dict[str, Any]] = []
-                for chunk_index, chunk_text in enumerate(chunks):
+                for chunk_index, chunk_payload in enumerate(chunk_payloads):
+                    chunk_text = chunk_payload["text"]
                     chunk_hash = hash_text(chunk_text)
                     entry = {
                         "chunkId": f"{relative_path}:{chunk_index}:{uuid4().hex[:8]}",
@@ -369,6 +372,12 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         "chunkHash": chunk_hash,
                         "fileHash": file_hash,
                     }
+                    if chunk_payload.get("chunkType"):
+                        entry["chunkType"] = chunk_payload["chunkType"]
+                    if chunk_payload.get("sheetName"):
+                        entry["sheetName"] = chunk_payload["sheetName"]
+                    if chunk_payload.get("rowNumber") is not None:
+                        entry["rowNumber"] = chunk_payload["rowNumber"]
                     cached_vector = previous_vectors_by_hash.get(chunk_hash)
                     if cached_vector is not None:
                         entry["embedding"] = cached_vector
@@ -407,14 +416,23 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         raise ValueError("Failed to create embeddings for one or more chunks.")
 
                 embedded_chunks.extend(file_chunk_entries)
-                document_records.append(build_document_record(relative_path, parser_name, stat, chunks, file_hash))
+                document_records.append(
+                    build_document_record(
+                        relative_path,
+                        parser_name,
+                        stat,
+                        [chunk["text"] for chunk in chunk_payloads],
+                        file_hash,
+                        structure=extracted.get("structure"),
+                    )
+                )
                 record = FileRecord(
                     relative_path=relative_path,
                     status="indexed",
                     size=stat.st_size,
                     mtime=stat.st_mtime,
                     parser=parser_name,
-                    chunks=len(chunks),
+                    chunks=len(chunk_payloads),
                     content_hash=file_hash,
                 )
                 file_records.append(record)
@@ -535,15 +553,20 @@ def search_index(root_path: Path, query: str, top_k: int, options: dict) -> list
         scored_chunks.sort(key=lambda item: item[0], reverse=True)
         results: list[dict[str, Any]] = []
         for score, chunk in scored_chunks[: max(int(top_k), 0)]:
-            results.append(
-                {
-                    "chunkId": chunk["chunkId"],
-                    "relativePath": chunk["relativePath"],
-                    "score": float(score),
-                    "snippet": chunk["snippet"],
-                    "text": chunk["text"],
-                }
-            )
+            item = {
+                "chunkId": chunk["chunkId"],
+                "relativePath": chunk["relativePath"],
+                "score": float(score),
+                "snippet": chunk["snippet"],
+                "text": chunk["text"],
+            }
+            if chunk.get("chunkType"):
+                item["chunkType"] = chunk["chunkType"]
+            if chunk.get("sheetName"):
+                item["sheetName"] = chunk["sheetName"]
+            if chunk.get("rowNumber") is not None:
+                item["rowNumber"] = chunk["rowNumber"]
+            results.append(item)
         return results
 
     embedding_provider = options.get("embeddingProvider") or {}
@@ -575,15 +598,20 @@ def search_index(root_path: Path, query: str, top_k: int, options: dict) -> list
         chunk = bundle["chunkByLabel"].get(int(label))
         if not chunk:
             continue
-        results.append(
-            {
-                "chunkId": chunk["chunkId"],
-                "relativePath": chunk["relativePath"],
-                "score": max(0.0, float(scores[int(label)])),
-                "snippet": chunk["snippet"],
-                "text": chunk["text"],
-            }
-        )
+        item = {
+            "chunkId": chunk["chunkId"],
+            "relativePath": chunk["relativePath"],
+            "score": max(0.0, float(scores[int(label)])),
+            "snippet": chunk["snippet"],
+            "text": chunk["text"],
+        }
+        if chunk.get("chunkType"):
+            item["chunkType"] = chunk["chunkType"]
+        if chunk.get("sheetName"):
+            item["sheetName"] = chunk["sheetName"]
+        if chunk.get("rowNumber") is not None:
+            item["rowNumber"] = chunk["rowNumber"]
+        results.append(item)
     return results
 
 
@@ -614,6 +642,26 @@ def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[st
             break
         cursor += chunk_size - overlap
     return chunks
+
+
+def build_chunk_payloads(normalized_text: str, structured_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if structured_chunks:
+        payloads: list[dict[str, Any]] = []
+        for item in structured_chunks:
+            text = normalize_text(str(item.get("text") or ""))
+            if not text:
+                continue
+            payload: dict[str, Any] = {"text": text}
+            if item.get("chunkType"):
+                payload["chunkType"] = str(item["chunkType"])
+            if item.get("sheetName"):
+                payload["sheetName"] = str(item["sheetName"])
+            if item.get("rowNumber") is not None:
+                payload["rowNumber"] = int(item["rowNumber"])
+            payloads.append(payload)
+        if payloads:
+            return payloads
+    return [{"text": chunk} for chunk in split_text(normalized_text)]
 
 
 def finalize_index(
@@ -696,6 +744,12 @@ def reuse_previous_chunks(
             "chunkHash": chunk["chunkHash"],
             "fileHash": chunk.get("fileHash"),
         }
+        if chunk.get("chunkType"):
+            entry["chunkType"] = chunk["chunkType"]
+        if chunk.get("sheetName"):
+            entry["sheetName"] = chunk["sheetName"]
+        if chunk.get("rowNumber") is not None:
+            entry["rowNumber"] = chunk["rowNumber"]
         if include_embeddings:
             vector = previous_vectors_by_hash.get(chunk.get("chunkHash"))
             if vector is None:
@@ -779,8 +833,14 @@ def build_document_record(
     stat_result,
     chunks: list[str],
     content_hash: str | None,
+    structure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     full_text = "\n\n".join(chunk for chunk in chunks if chunk.strip())
+    summary = summarize_text(full_text)
+    section_hints = extract_section_hints(full_text)
+    if structure and structure.get("kind") == "spreadsheet":
+        summary = summarize_spreadsheet_structure(relative_path, structure)
+        section_hints = extract_spreadsheet_section_hints(structure)
     return {
         "documentId": relative_path,
         "relativePath": relative_path,
@@ -789,9 +849,10 @@ def build_document_record(
         "mtime": stat_result.st_mtime,
         "chunks": len(chunks),
         "tokenEstimate": max(1, math.ceil(len(full_text) / 4)),
-        "summary": summarize_text(full_text),
-        "sectionHints": extract_section_hints(full_text),
+        "summary": summary,
+        "sectionHints": section_hints,
         "contentHash": content_hash,
+        "structure": structure,
     }
 
 
@@ -848,6 +909,33 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
         seen.add(item)
         ordered.append(item)
     return ordered
+
+
+def summarize_spreadsheet_structure(relative_path: str, structure: dict[str, Any]) -> str:
+    sheet_count = int(structure.get("sheetCount") or 0)
+    row_count = int(structure.get("rowCount") or 0)
+    sheet_names = [str(item) for item in structure.get("sheetNames") or [] if str(item).strip()]
+    column_hints = [str(item) for item in structure.get("columnHints") or [] if str(item).strip()]
+    parts = [f"Spreadsheet document {relative_path} with {row_count} rows across {sheet_count} sheets."]
+    if sheet_names:
+        parts.append(f"Sheets: {', '.join(sheet_names[:6])}.")
+    if column_hints:
+        parts.append(f"Columns: {', '.join(column_hints[:8])}.")
+    return summarize_text(" ".join(parts), limit=420)
+
+
+def extract_spreadsheet_section_hints(structure: dict[str, Any], limit: int = 6) -> list[str]:
+    hints: list[str] = []
+    for sheet in structure.get("sheets") or []:
+        name = str(sheet.get("name") or "").strip()
+        header_hints = [str(item) for item in sheet.get("headerHints") or [] if str(item).strip()]
+        if name:
+            hints.append(f"Sheet: {name}")
+        if header_hints:
+            hints.append(f"Columns: {' | '.join(header_hints[:4])}")
+        if len(hints) >= limit:
+            break
+    return dedupe_preserve_order(hints)[:limit]
 
 
 def tokenize_query(text: str) -> list[str]:

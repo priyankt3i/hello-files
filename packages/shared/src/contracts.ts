@@ -79,6 +79,23 @@ export interface IndexedDocumentRecord {
   summary: string;
   sectionHints: string[];
   contentHash?: string;
+  structure?: IndexedDocumentStructure;
+}
+
+export interface IndexedSheetProfile {
+  name: string;
+  rowCount: number;
+  columnCount: number;
+  headerHints: string[];
+}
+
+export interface IndexedDocumentStructure {
+  kind: "spreadsheet";
+  sheetCount: number;
+  rowCount: number;
+  sheetNames: string[];
+  columnHints: string[];
+  sheets?: IndexedSheetProfile[];
 }
 
 export interface Citation {
@@ -148,6 +165,9 @@ export interface SearchResult {
   score: number;
   snippet: string;
   text: string;
+  chunkType?: string;
+  sheetName?: string;
+  rowNumber?: number;
 }
 
 export interface WorkerSearchResponse {
@@ -224,6 +244,11 @@ export interface OpenChannelFileInput {
 export interface CancelIndexInput {
   channelId: string;
   retainPartial: boolean;
+}
+
+export interface DeleteChannelInput {
+  channelId: string;
+  removeIndex?: boolean;
 }
 
 export interface SendMessageInput {

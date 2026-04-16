@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, join, resolve } from "node:path";
 import type { WebContents } from "electron";
@@ -13,6 +13,7 @@ import type {
   CreateThreadInput,
   ConnectProviderInput,
   ConnectProviderResult,
+  DeleteChannelInput,
   IndexedDocumentRecord,
   IndexFileUpdateEvent,
   IndexProgressEvent,
@@ -25,6 +26,7 @@ import type {
   RetrievalMode,
   RefreshProviderModelsResult,
   RegisterChannelInput,
+  SearchResult,
   SendMessageInput,
   SendMessageResult,
   Thread,
@@ -47,6 +49,7 @@ import { clearCodexCredentials, ensureCodexAuthorized } from "../providers/codex
 import { PythonWorkerBridge } from "./python-worker";
 
 const SECRET_SERVICE = "filesystem-rag-chat";
+const INDEX_TEMP_DIR_NAME = ".fschat-index.tmp";
 const require = createRequire(import.meta.url);
 const { app, dialog, shell } = require("electron") as typeof import("electron");
 const keytar = require("keytar") as typeof import("keytar");
@@ -470,13 +473,18 @@ export class DesktopAppService {
     return this.loadChannel(channel.id);
   }
 
-  async deleteChannel(channelId: string) {
+  async deleteChannel(input: string | DeleteChannelInput) {
+    const channelId = typeof input === "string" ? input : input.channelId;
+    const removeIndex = typeof input === "string" ? false : Boolean(input.removeIndex);
     const channel = this.db.getChannel(channelId);
     if (!channel) {
       return;
     }
     if (channel.status === "indexing" && this.worker.hasActiveBuild(channel.id)) {
       throw new Error("Cancel indexing before deleting this channel.");
+    }
+    if (removeIndex) {
+      this.deleteChannelIndexArtifacts(channel.rootPath);
     }
     this.db.deleteChannel(channelId);
   }
@@ -622,6 +630,8 @@ export class DesktopAppService {
       throw new Error("Selected chat model does not support chat.");
     }
     let searchResponse;
+    let contextNotes: string[] = [];
+    let deterministicAssistantText: string | null = null;
 
     if (channel.retrievalMode === "vector") {
       if (!channel.embeddingModelId) {
@@ -648,6 +658,7 @@ export class DesktopAppService {
     } else {
       const documentManifest = await this.worker.listDocuments(channel.rootPath);
       const candidateDocuments = preselectManifestDocuments(documentManifest.documents, input.message, 24);
+      const queryProfile = analyzeSpreadsheetQuery(input.message);
       let selectedDocumentIds = candidateDocuments.slice(0, 3).map((document) => document.documentId);
 
       if (candidateDocuments.length > 0) {
@@ -683,6 +694,34 @@ export class DesktopAppService {
             this.toWorkerBuildOptions({ retrievalMode: "vectorless" })
           );
         }
+        const selectedDocuments = candidateDocuments.filter((document) => selectedDocumentIds.includes(document.documentId));
+        const spreadsheetDocuments = selectedDocuments.filter(isSpreadsheetDocument);
+        if (queryProfile.exhaustive && spreadsheetDocuments.length > 0) {
+          const spreadsheetStructureSummary = summarizeSpreadsheetStructureQuery(spreadsheetDocuments, input.message, queryProfile);
+          if (spreadsheetStructureSummary) {
+            contextNotes = [...contextNotes, ...spreadsheetStructureSummary.notes];
+            if (queryProfile.wantsCount) {
+              deterministicAssistantText = buildSpreadsheetCountAnswer(spreadsheetStructureSummary);
+            }
+          }
+          const spreadsheetDocumentIds = spreadsheetDocuments.map((document) => document.documentId);
+          const exhaustiveLimit = spreadsheetDocuments.reduce((sum, document) => sum + Math.max(document.chunks, 0), 0);
+          if (exhaustiveLimit > 0) {
+            const exhaustiveSearch = await this.worker.search(
+              channel.rootPath,
+              input.message,
+              exhaustiveLimit,
+              this.toWorkerBuildOptions({ retrievalMode: "vectorless", documentIds: spreadsheetDocumentIds })
+            );
+            const spreadsheetSummary = summarizeSpreadsheetSearch(exhaustiveSearch.results, spreadsheetDocuments, queryProfile);
+            if (spreadsheetSummary) {
+              contextNotes = [...contextNotes, ...spreadsheetSummary.notes];
+              searchResponse = {
+                results: spreadsheetSummary.sampleResults
+              };
+            }
+          }
+        }
       } catch (error) {
         if (isInvalidIndexError(error)) {
           await this.invalidateChannelIndex(channel, "This channel's index is outdated or missing. Regenerate the index before chatting.");
@@ -717,15 +756,18 @@ export class DesktopAppService {
       this.db.updateThreadTitle(thread.id, input.message.slice(0, 50) || thread.title);
     }
 
-    const assistantText = await generateAssistantReply({
-      connection: chatSelection.connection,
-      model: chatSelection.model,
-      secret: chatSelection.secret,
-      searchResults: searchResponse.results,
-      history,
-      userMessage: input.message,
-      systemPrompt: channel.systemPrompt
-    });
+    const assistantText =
+      deterministicAssistantText ??
+      (await generateAssistantReply({
+        connection: chatSelection.connection,
+        model: chatSelection.model,
+        secret: chatSelection.secret,
+        searchResults: searchResponse.results,
+        contextNotes,
+        history,
+        userMessage: input.message,
+        systemPrompt: channel.systemPrompt
+      }));
 
     const assistantMessage: Message = {
       id: randomUUID(),
@@ -979,6 +1021,16 @@ export class DesktopAppService {
     }
   }
 
+  private deleteChannelIndexArtifacts(rootPath: string) {
+    const targets = [join(rootPath, INDEX_DIR_NAME), join(rootPath, INDEX_TEMP_DIR_NAME)];
+    for (const target of targets) {
+      if (!existsSync(target)) {
+        continue;
+      }
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+
   private resolveChannelModelSelection(
     preferredConnectionId: string | null,
     chatModelId: string | null,
@@ -1216,7 +1268,11 @@ function resolveSelectedDocumentIds(documentIds: string[], documents: IndexedDoc
 }
 
 function scoreManifestDocument(document: IndexedDocumentRecord, query: string, queryTokens: string[]) {
-  const haystack = [document.relativePath, document.summary, ...document.sectionHints].join(" ").toLowerCase();
+  const structureHints =
+    document.structure?.kind === "spreadsheet"
+      ? [...document.structure.sheetNames, ...document.structure.columnHints]
+      : [];
+  const haystack = [document.relativePath, document.summary, ...document.sectionHints, ...structureHints].join(" ").toLowerCase();
   const lowerQuery = query.toLowerCase().trim();
   let score = 0;
   if (lowerQuery && haystack.includes(lowerQuery)) {
@@ -1236,4 +1292,137 @@ function scoreManifestDocument(document: IndexedDocumentRecord, query: string, q
 
 function tokenizeManifestQuery(query: string) {
   return query.toLowerCase().match(/[a-z0-9]+/g)?.filter((token) => token.length > 1) ?? [];
+}
+
+function isSpreadsheetDocument(document: IndexedDocumentRecord) {
+  return document.structure?.kind === "spreadsheet" || document.parser === "spreadsheet" || document.parser === "spreadsheet-xls";
+}
+
+function analyzeSpreadsheetQuery(query: string) {
+  const normalized = query.toLowerCase();
+  const wantsCount = /\b(count|how many|number of|total)\b/.test(normalized);
+  const wantsList = /\b(list|show all|find all|which rows|which entries)\b/.test(normalized);
+  const wantsFilter = /\b(rows where|entries where|matching rows|matching entries|filter|filtered)\b/.test(normalized);
+  const exhaustive = wantsCount || wantsList;
+  return { wantsCount, wantsList, wantsFilter, exhaustive };
+}
+
+function summarizeSpreadsheetSearch(
+  results: SearchResult[],
+  documents: IndexedDocumentRecord[],
+  queryProfile: ReturnType<typeof analyzeSpreadsheetQuery>
+) {
+  const rowResults = results.filter((item) => item.chunkType === "spreadsheet-row");
+  if (rowResults.length === 0) {
+    return null;
+  }
+
+  const sheetNames = [...new Set(rowResults.map((item) => item.sheetName).filter((item): item is string => Boolean(item)))];
+  const notes: string[] = [];
+  if (queryProfile.wantsCount) {
+    notes.push(
+      `Exact lexical row scan across ${documents.length} selected spreadsheet document(s) found ${rowResults.length} matching rows.` +
+        (sheetNames.length > 0 ? ` Matching sheets: ${sheetNames.slice(0, 6).join(", ")}.` : "")
+    );
+  } else if (queryProfile.wantsList || queryProfile.wantsFilter) {
+    notes.push(
+      `Lexical row scan found ${rowResults.length} matching rows across ${documents.length} selected spreadsheet document(s). Showing the most relevant matches below.` +
+        (sheetNames.length > 0 ? ` Matching sheets: ${sheetNames.slice(0, 6).join(", ")}.` : "")
+    );
+  }
+
+  return {
+    notes,
+    sampleResults: rowResults.slice(0, 24)
+  };
+}
+
+function summarizeSpreadsheetStructureQuery(
+  documents: IndexedDocumentRecord[],
+  query: string,
+  queryProfile: ReturnType<typeof analyzeSpreadsheetQuery>
+) {
+  const notes: string[] = [];
+  const queryTokens = tokenizeManifestQuery(query);
+  const matchedSheets: Array<{ document: IndexedDocumentRecord; name: string; rowCount: number; score: number }> = [];
+  const fallbackSheets: Array<{ document: IndexedDocumentRecord; name: string; rowCount: number }> = [];
+
+  for (const document of documents) {
+    if (document.structure?.kind !== "spreadsheet") {
+      continue;
+    }
+    for (const sheet of document.structure.sheets ?? []) {
+      fallbackSheets.push({ document, name: sheet.name, rowCount: sheet.rowCount });
+      const score = scoreSpreadsheetSheet(sheet.name, sheet.headerHints ?? [], queryTokens);
+      if (score > 0) {
+        matchedSheets.push({ document, name: sheet.name, rowCount: sheet.rowCount, score });
+      }
+    }
+  }
+
+  if (queryProfile.wantsCount) {
+    if (matchedSheets.length > 0) {
+      matchedSheets.sort((left, right) => right.score - left.score);
+      const totalRows = matchedSheets.reduce((sum, sheet) => sum + Math.max(sheet.rowCount, 0), 0);
+      const details = matchedSheets.slice(0, 6).map((sheet) => `${sheet.name} (${sheet.rowCount})`).join(", ");
+      notes.push(`Spreadsheet structure indicates ${totalRows} indexed data rows in sheets matching the question. ${details}`.trim());
+      return {
+        notes,
+        totalRows,
+        matchedByQuestion: true,
+        sheetDetails: matchedSheets.map((sheet) => ({
+          documentPath: sheet.document.relativePath,
+          sheetName: sheet.name,
+          rowCount: sheet.rowCount
+        }))
+      };
+    }
+
+    if (fallbackSheets.length > 0) {
+      const totalRows = fallbackSheets.reduce((sum, sheet) => sum + Math.max(sheet.rowCount, 0), 0);
+      const details = fallbackSheets.slice(0, 6).map((sheet) => `${sheet.name} (${sheet.rowCount})`).join(", ");
+      notes.push(`Spreadsheet structure indicates ${totalRows} indexed data rows across the selected spreadsheet sheets. ${details}`.trim());
+      return {
+        notes,
+        totalRows,
+        matchedByQuestion: false,
+        sheetDetails: fallbackSheets.map((sheet) => ({
+          documentPath: sheet.document.relativePath,
+          sheetName: sheet.name,
+          rowCount: sheet.rowCount
+        }))
+      };
+    }
+  }
+
+  return notes.length > 0 ? { notes } : null;
+}
+
+function scoreSpreadsheetSheet(sheetName: string, headerHints: string[], queryTokens: string[]) {
+  const haystack = [sheetName, ...headerHints].join(" ").toLowerCase();
+  let score = 0;
+  for (const token of new Set(queryTokens)) {
+    const count = haystack.split(token).length - 1;
+    if (count > 0) {
+      score += Math.min(count, 4);
+    }
+  }
+  return score;
+}
+
+function buildSpreadsheetCountAnswer(summary: NonNullable<ReturnType<typeof summarizeSpreadsheetStructureQuery>>) {
+  if (typeof summary.totalRows !== "number") {
+    return null;
+  }
+
+  const leadingSheets = (summary.sheetDetails ?? [])
+    .slice(0, 6)
+    .map((sheet) => `${sheet.sheetName} (${sheet.rowCount})`)
+    .join(", ");
+
+  if (summary.matchedByQuestion) {
+    return `Based on the indexed spreadsheet structure, there are ${summary.totalRows} data rows in sheets matching your question.${leadingSheets ? ` Matching sheets: ${leadingSheets}.` : ""}`;
+  }
+
+  return `Based on the indexed spreadsheet structure, there are ${summary.totalRows} data rows across the selected spreadsheet sheets.${leadingSheets ? ` Sheets counted: ${leadingSheets}.` : ""}`;
 }

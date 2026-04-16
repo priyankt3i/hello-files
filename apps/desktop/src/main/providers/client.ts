@@ -76,20 +76,32 @@ export async function generateAssistantReply(args: {
   model: ProviderModel;
   secret: ProviderSecret;
   searchResults: SearchResult[];
+  contextNotes?: string[];
   history: Message[];
   userMessage: string;
   systemPrompt?: string;
 }): Promise<string> {
-  const { connection, model, secret, searchResults, history, userMessage, systemPrompt } = args;
+  const { connection, model, secret, searchResults, contextNotes = [], history, userMessage, systemPrompt } = args;
+  const noteBlock =
+    contextNotes.length > 0
+      ? ["Context notes:", ...contextNotes.map((note, index) => `- ${note}`), ""].join("\n")
+      : "";
   const contextBlock =
     searchResults.length === 0
-      ? "No indexed documents were retrieved for this question."
-      : searchResults
-          .map(
-            (item, index) =>
-              `[${index + 1}] ${item.relativePath}\nScore: ${item.score.toFixed(3)}\nSnippet:\n${item.text.slice(0, 1500)}`
-          )
-          .join("\n\n");
+      ? `${noteBlock}No indexed documents were retrieved for this question.`.trim()
+      : `${noteBlock}${searchResults
+          .map((item, index) => {
+            const locationParts = [];
+            if (item.sheetName) {
+              locationParts.push(`Sheet: ${item.sheetName}`);
+            }
+            if (typeof item.rowNumber === "number") {
+              locationParts.push(`Row: ${item.rowNumber}`);
+            }
+            const locationBlock = locationParts.length > 0 ? `\nLocation: ${locationParts.join(", ")}` : "";
+            return `[${index + 1}] ${item.relativePath}\nScore: ${item.score.toFixed(3)}${locationBlock}\nSnippet:\n${item.text.slice(0, 1500)}`;
+          })
+          .join("\n\n")}`.trim();
 
   const effectiveSystemPrompt =
     systemPrompt?.trim() ||

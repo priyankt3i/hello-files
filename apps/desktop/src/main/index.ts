@@ -70,7 +70,7 @@ function registerIpc() {
   ipcMain.handle("fschat:register-channel", (_event, input) => getService().registerChannel(input));
   ipcMain.handle("fschat:update-channel-models", (_event, input) => getService().updateChannelModels(input));
   ipcMain.handle("fschat:update-channel-system-prompt", (_event, input) => getService().updateChannelSystemPrompt(input));
-  ipcMain.handle("fschat:delete-channel", (_event, channelId: string) => getService().deleteChannel(channelId));
+  ipcMain.handle("fschat:delete-channel", (_event, input) => getService().deleteChannel(input));
   ipcMain.handle("fschat:load-channel", (_event, channelId: string) => getService().loadChannel(channelId));
   ipcMain.handle("fschat:start-index", (_event, channelId: string) => getService().startIndex(channelId));
   ipcMain.handle("fschat:regenerate-index", (_event, channelId: string) => getService().regenerateIndex(channelId));
