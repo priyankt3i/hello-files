@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide is for running Filesystem RAG Chat locally for development.
+This guide is for running Hello Files locally for development.
 
 ## Prerequisites
 

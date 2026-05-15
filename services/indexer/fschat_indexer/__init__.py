@@ -1,2 +1,1 @@
-"""Filesystem RAG chat indexer package."""
-
+"""Hello Files indexer package."""

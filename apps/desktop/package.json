@@ -1,11 +1,14 @@
 {
   "name": "@fschat/desktop",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "productName": "Hello Files",
+  "description": "Desktop app for indexing local folders and chatting with their contents.",
+  "author": "Hello Files",
   "private": true,
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node ../../scripts/run-desktop-dev.mjs",
     "build": "electron-vite build",
     "build:indexer": "node ../../scripts/build-indexer-binary.mjs",
     "dist": "npm run build && npm run build:indexer && npx electron-builder --config electron-builder.yml",

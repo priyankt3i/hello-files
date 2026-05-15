@@ -1,5 +1,5 @@
-appId: com.fschat.desktop
-productName: Filesystem RAG Chat
+appId: com.hellofiles.desktop
+productName: Hello Files
 electronVersion: 35.0.1
 
 asar: true

@@ -8,8 +8,16 @@ const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const require = createRequire(import.meta.url);
 const { app, BrowserWindow, ipcMain, shell } = require("electron") as typeof import("electron");
 
+const APP_ID = "com.hellofiles.desktop";
+const APP_NAME = "Hello Files";
+
 let mainWindow: ElectronBrowserWindow | null = null;
 let service: DesktopAppService | null = null;
+
+app.setName(APP_NAME);
+if (process.platform === "win32") {
+  app.setAppUserModelId(APP_ID);
+}
 
 async function createWindow() {
   mainWindow = new BrowserWindow({
@@ -17,6 +25,7 @@ async function createWindow() {
     height: 980,
     minWidth: 1200,
     minHeight: 760,
+    title: APP_NAME,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#08111f",
     webPreferences: {

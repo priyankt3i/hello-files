@@ -919,8 +919,8 @@ function Sidebar({
   return (
     <aside className="glass-panel shell-border min-h-0 min-w-0 flex flex-col rounded-2xl p-5 shadow-panel">
       <div className="mb-5">
-        <div className="font-display text-2xl font-semibold tracking-tight text-paper">Filesystem</div>
-        <div className="text-sm text-mist/80">RAG Chat Workspace</div>
+        <div className="font-display text-2xl font-semibold tracking-tight text-paper">Hello Files</div>
+        <div className="text-sm text-mist/80">Local file workspace</div>
       </div>
       <div className="mb-4 grid gap-2">
         <button className="rounded-lg bg-ember px-4 py-2 text-sm font-semibold text-ink" onClick={onOpenCreate}>Create Channel</button>

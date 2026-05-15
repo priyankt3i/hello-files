@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to Filesystem RAG Chat.
+Thanks for contributing to Hello Files.
 
 ## Before You Start
 

@@ -1,6 +1,6 @@
 {
-  "name": "filesystem-rag-chat",
-  "version": "0.1.0",
+  "name": "hello-files",
+  "version": "1.0.0",
   "private": true,
   "workspaces": [
     "apps/*",

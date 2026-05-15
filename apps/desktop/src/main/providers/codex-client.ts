@@ -7,6 +7,7 @@ import { exec } from "node:child_process";
 
 export const DEFAULT_CODEX_MODELS = ["chatgpt-plan-default"];
 export const DEFAULT_CODEX_MODEL = "gpt-5.5";
+const CODEX_CREDENTIALS_FILE = "codex_oauth_credentials.json";
 
 type CodexCredentials = {
   access_token: string;
@@ -27,7 +28,8 @@ const DEFAULT_CONFIG = {
   baseUrl: "https://chatgpt.com/backend-api/codex",
   model: DEFAULT_CODEX_MODEL,
   originator: "cline",
-  credentialsFile: path.join(os.homedir(), ".filesystem-rag-chat", "codex_oauth_credentials.json")
+  credentialsFile: path.join(os.homedir(), ".hello-files", CODEX_CREDENTIALS_FILE),
+  legacyCredentialsFiles: [path.join(os.homedir(), ".filesystem-rag-chat", CODEX_CREDENTIALS_FILE)]
 } as const;
 
 const base64UrlEncode = (input: string) => Buffer.from(input).toString("base64url");
@@ -264,19 +266,20 @@ class CodexOAuthClient {
   }
 
   loadCredentials(): CodexCredentials | null {
-    if (!fs.existsSync(this.config.credentialsFile)) {
-      return null;
+    const credentials = this.readCredentialsFile(this.config.credentialsFile);
+    if (credentials) {
+      return credentials;
     }
 
-    try {
-      const parsed = JSON.parse(fs.readFileSync(this.config.credentialsFile, "utf8"));
-      if (!cleanText(parsed.access_token) || !cleanText(parsed.refresh_token)) {
-        return null;
+    for (const filePath of this.config.legacyCredentialsFiles) {
+      const legacyCredentials = this.readCredentialsFile(filePath);
+      if (legacyCredentials) {
+        this.saveCredentials(legacyCredentials);
+        return legacyCredentials;
       }
-      return parsed;
-    } catch {
-      return null;
     }
+
+    return null;
   }
 
   saveCredentials(credentials: CodexCredentials) {
@@ -285,8 +288,26 @@ class CodexOAuthClient {
   }
 
   clearCredentials() {
-    if (fs.existsSync(this.config.credentialsFile)) {
-      fs.unlinkSync(this.config.credentialsFile);
+    for (const filePath of [this.config.credentialsFile, ...this.config.legacyCredentialsFiles]) {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+  }
+
+  private readCredentialsFile(filePath: string): CodexCredentials | null {
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      if (!cleanText(parsed.access_token) || !cleanText(parsed.refresh_token)) {
+        return null;
+      }
+      return parsed;
+    } catch {
+      return null;
     }
   }
 

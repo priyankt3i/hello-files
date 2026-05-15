@@ -1,6 +1,6 @@
 # Documentation
 
-This folder contains the first contributor-facing docs for Filesystem RAG Chat.
+This folder contains the first contributor-facing docs for Hello Files.
 
 ## Guides
 

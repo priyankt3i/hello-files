@@ -1,4 +1,4 @@
-# Filesystem RAG Chat
+# Hello Files
 
 Windows-first desktop app for indexing local folders and chatting against their contents.
 
@@ -6,7 +6,7 @@ The project combines an Electron desktop shell, a React UI, SQLite app state, an
 
 ## Why This Exists
 
-Filesystem RAG Chat is built for cases where the source of truth lives in files, not in a database or a hosted knowledge base.
+Hello Files is built for cases where the source of truth lives in files, not in a database or a hosted knowledge base.
 
 Examples:
 

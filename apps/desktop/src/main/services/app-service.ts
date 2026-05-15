@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, join, resolve } from "node:path";
 import type { WebContents } from "electron";
@@ -48,7 +48,11 @@ import {
 import { clearCodexCredentials, ensureCodexAuthorized } from "../providers/codex-client";
 import { PythonWorkerBridge } from "./python-worker";
 
-const SECRET_SERVICE = "filesystem-rag-chat";
+const SECRET_SERVICE = "hello-files";
+const LEGACY_SECRET_SERVICES = ["filesystem-rag-chat"];
+const SECRET_SERVICES = [SECRET_SERVICE, ...LEGACY_SECRET_SERVICES];
+const DB_FILE_NAME = "fschat.sqlite";
+const LEGACY_USER_DATA_DIRS = ["Filesystem RAG Chat", "filesystem-rag-chat"];
 const INDEX_TEMP_DIR_NAME = ".fschat-index.tmp";
 const require = createRequire(import.meta.url);
 const { app, dialog, shell } = require("electron") as typeof import("electron");
@@ -58,7 +62,7 @@ const IGNORED_STDERR_PATTERNS = [
   "openpyxl\\worksheet\\_reader.py:329: UserWarning"
 ];
 const DEFAULT_CHANNEL_SYSTEM_PROMPT = [
-  "You are Filesystem RAG Chat.",
+  "You are Hello Files.",
   "Answer using the indexed filesystem context when possible.",
   "If the indexed context is insufficient, say what is missing.",
   "Mention the source file paths inline when making claims."
@@ -70,7 +74,7 @@ export class DesktopAppService {
   private webContents: WebContents | null = null;
 
   constructor() {
-    const dbPath = join(app.getPath("userData"), "fschat.sqlite");
+    const dbPath = resolveDatabasePath();
     this.db = new AppDatabase(dbPath);
     this.worker = new PythonWorkerBridge();
     this.worker.on("progress", (event: IndexProgressEvent) => {
@@ -186,8 +190,17 @@ export class DesktopAppService {
       throw new Error("Cancel active indexing before resetting app data.");
     }
 
-    const credentials = await keytar.findCredentials(SECRET_SERVICE);
-    await Promise.all(credentials.map((credential) => keytar.deletePassword(SECRET_SERVICE, credential.account)));
+    const credentialsByService = await Promise.all(
+      SECRET_SERVICES.map(async (service) => ({
+        service,
+        credentials: await keytar.findCredentials(service)
+      }))
+    );
+    await Promise.all(
+      credentialsByService.flatMap(({ service, credentials }) =>
+        credentials.map((credential) => keytar.deletePassword(service, credential.account))
+      )
+    );
     clearCodexCredentials();
     this.db.resetAllAppData();
   }
@@ -897,11 +910,17 @@ export class DesktopAppService {
       return { apiKey: "" };
     }
 
-    const apiKey = await keytar.getPassword(SECRET_SERVICE, connection.secretRef);
-    if (!apiKey) {
-      throw new Error(`Credentials missing for provider connection "${connection.name}".`);
+    for (const service of SECRET_SERVICES) {
+      const apiKey = await keytar.getPassword(service, connection.secretRef);
+      if (apiKey) {
+        if (service !== SECRET_SERVICE) {
+          await keytar.setPassword(SECRET_SERVICE, connection.secretRef, apiKey);
+        }
+        return { apiKey };
+      }
     }
-    return { apiKey };
+
+    throw new Error(`Credentials missing for provider connection "${connection.name}".`);
   }
 
   private toWorkerBuildOptions(args: {
@@ -1224,6 +1243,27 @@ function buildEmbeddingModelKey(connection: ProviderConnection, model: ProviderM
 function normalizeChannelSystemPrompt(value?: string | null, fallback = DEFAULT_CHANNEL_SYSTEM_PROMPT) {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? normalized : fallback;
+}
+
+function resolveDatabasePath() {
+  const userDataDir = app.getPath("userData");
+  const dbPath = join(userDataDir, DB_FILE_NAME);
+  if (existsSync(dbPath)) {
+    return dbPath;
+  }
+
+  for (const legacyDir of LEGACY_USER_DATA_DIRS) {
+    const legacyDbPath = join(app.getPath("appData"), legacyDir, DB_FILE_NAME);
+    if (!existsSync(legacyDbPath) || legacyDbPath === dbPath) {
+      continue;
+    }
+
+    mkdirSync(userDataDir, { recursive: true });
+    copyFileSync(legacyDbPath, dbPath);
+    return dbPath;
+  }
+
+  return dbPath;
 }
 
 function resolveThreadTitle(value: string | null | undefined, sessionNumber: number) {

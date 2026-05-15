@@ -1,6 +1,6 @@
 # Providers
 
-Filesystem RAG Chat separates provider connections from channel configuration.
+Hello Files separates provider connections from channel configuration.
 
 A provider connection stores connection-level settings such as provider type, base URL, API version, and credentials. A channel then selects a chat model and an embedding model from that connection.
 

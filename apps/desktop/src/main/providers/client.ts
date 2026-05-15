@@ -111,7 +111,7 @@ export async function generateAssistantReply(args: {
   const effectiveSystemPrompt =
     systemPrompt?.trim() ||
     [
-      "You are Filesystem RAG Chat.",
+      "You are Hello Files.",
       "Answer using only the indexed filesystem context when possible.",
       "If the indexed context is insufficient, say what is missing.",
       "Mention the source file paths inline when making claims."
@@ -161,7 +161,7 @@ export async function selectRelevantDocuments(args: {
     model,
     secret,
     systemPrompt: [
-      "You are doing manifest-first document selection for Filesystem RAG Chat.",
+      "You are doing manifest-first document selection for Hello Files.",
       "Choose the smallest useful set of documents for answering the user's question.",
       "Return strict JSON only.",
       `Return this shape: {"document_ids":["..."],"reasoning":"..."}.`,

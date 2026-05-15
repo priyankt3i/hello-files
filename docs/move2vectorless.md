@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document reviews the current Filesystem RAG Chat system and defines a migration strategy for moving from embedding-backed vector retrieval to vectorless RAG while preserving the existing desktop UX, channel workflow, and citation behavior.
+This document reviews the current Hello Files system and defines a migration strategy for moving from embedding-backed vector retrieval to vectorless RAG while preserving the existing desktop UX, channel workflow, and citation behavior.
 
 ## Scope And Assumption
 
