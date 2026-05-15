@@ -807,7 +807,7 @@ async function handleRevealCitationFile() {
                 ) : (
                   <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
                     {pendingConnectionRequiresVectorless
-                      ? "OpenAI Codex is chat-only in this app, so Codex channels use vectorless retrieval. The model picker mirrors Cline's ChatGPT Subscription catalog, and the selected Codex model is sent directly before grounding answers in matching file excerpts."
+                      ? "OpenAI Codex is chat-only in this app, so Codex channels use vectorless retrieval. The model picker uses a bundled Codex-compatible catalog, and the selected Codex model is sent directly before grounding answers in matching file excerpts."
                       : "Vectorless channels do not need an embedding model. The app will use a manifest-first document pass before grounding answers in matching file excerpts."}
                   </div>
                 )}
@@ -1289,7 +1289,7 @@ function ChannelModelsModal({
         ) : (
           <div className="rounded-3xl border border-white/10 bg-white/5 p-4 text-sm text-mist/75">
             {connectionRequiresVectorless
-              ? "OpenAI Codex is chat-only in this app, so Codex channels use vectorless retrieval and do not require an embedding model. The visible Codex model catalog mirrors Cline, and the selected Codex model is sent directly."
+              ? "OpenAI Codex is chat-only in this app, so Codex channels use vectorless retrieval and do not require an embedding model. The visible Codex model catalog is bundled with the app, and the selected Codex model is sent directly."
               : "Vectorless channels use manifest-first document selection and do not require an embedding model."}
           </div>
         )}
@@ -1558,7 +1558,7 @@ function ModelSelectionHint({
         {retrievalMode === "vector"
           ? "Chat and embedding models are validated independently, and both must come from the same provider connection. The chat model must support chat, and the embedding model must support embeddings."
           : preferredConnection.provider === "openai-codex"
-            ? "OpenAI Codex is integrated here as a chat-only provider. Codex channels therefore use vectorless retrieval, and embedding models are not used. The visible Codex model list mirrors Cline's ChatGPT Subscription catalog, and this app sends the selected Codex model directly."
+            ? "OpenAI Codex is integrated here as a chat-only provider. Codex channels therefore use vectorless retrieval, and embedding models are not used. The visible Codex model list is bundled with the app, and this app sends the selected Codex model directly."
             : "Vectorless channels require a chat-capable model. Embedding models are optional because retrieval happens through manifest-first document selection and lexical grounding."}
       </div>
       {crossProviderOverride ? (

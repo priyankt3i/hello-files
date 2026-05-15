@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
-const workerScript = resolve(repoRoot, "services/indexer/fschat_indexer/worker.py");
+const indexerPackageDir = resolve(repoRoot, "services/indexer/fschat_indexer");
+const workerScript = resolve(indexerPackageDir, "worker.py");
 const appResourceRoot = resolve(repoRoot, "apps/desktop/resources/indexer");
 const buildRoot = resolve(repoRoot, "apps/desktop/.indexer-build");
 const pyInstallerConfigDir = resolve(buildRoot, "pyinstaller-config");
@@ -15,6 +16,7 @@ const platformKey = platformName(process.platform);
 const archKey = process.arch;
 const targetDir = resolve(appResourceRoot, `${platformKey}-${archKey}`);
 const binaryName = process.platform === "win32" ? "fschat-indexer.exe" : "fschat-indexer";
+const optionalAnalysisExcludes = ["botocore", "IPython", "pandas", "sqlalchemy"];
 
 if (!existsSync(workerScript)) {
   fail(`Worker script not found: ${workerScript}`);
@@ -37,6 +39,17 @@ const pyInstallerArgs = [
   "--onefile",
   "--name",
   "fschat-indexer",
+  "--paths",
+  indexerPackageDir,
+  "--hidden-import",
+  "embeddings",
+  "--hidden-import",
+  "extractors",
+  "--hidden-import",
+  "index_store",
+  "--hidden-import",
+  "vector_store",
+  ...optionalAnalysisExcludes.flatMap((moduleName) => ["--exclude-module", moduleName]),
   "--distpath",
   targetDir,
   "--workpath",

@@ -36,38 +36,43 @@ const CODEX_DISCOVERED_MODELS: Array<{
 }> = [
   {
     id: "chatgpt-plan-default",
-    displayName: "Default (ChatGPT plan)",
+    displayName: "Default (latest bundled)",
     description: "Maps to the app's current Codex fallback model when no specific Codex model is selected."
+  },
+  {
+    id: "gpt-5.5",
+    displayName: "gpt-5.5",
+    description: "Bundled Codex-compatible model. Actual availability depends on what the ChatGPT Codex backend accepts for your account."
   },
   {
     id: "gpt-5.4",
     displayName: "gpt-5.4",
-    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+    description: "Bundled Codex-compatible model. Actual availability depends on what the ChatGPT Codex backend accepts for your account."
   },
   {
     id: "gpt-5.3-codex",
     displayName: "gpt-5.3-codex",
-    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+    description: "Bundled Codex-compatible model. Actual availability depends on what the ChatGPT Codex backend accepts for your account."
   },
   {
     id: "gpt-5.2-codex",
     displayName: "gpt-5.2-codex",
-    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+    description: "Bundled Codex-compatible model. Actual availability depends on what the ChatGPT Codex backend accepts for your account."
   },
   {
     id: "gpt-5.1-codex-max",
     displayName: "gpt-5.1-codex-max",
-    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+    description: "Bundled Codex-compatible model. Actual availability depends on what the ChatGPT Codex backend accepts for your account."
   },
   {
     id: "gpt-5.1-codex-mini",
     displayName: "gpt-5.1-codex-mini",
-    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+    description: "Bundled Codex-compatible model. Actual availability depends on what the ChatGPT Codex backend accepts for your account."
   },
   {
     id: "gpt-5.2",
     displayName: "gpt-5.2",
-    description: "Mirrors the ChatGPT Subscription model catalog currently bundled by Cline."
+    description: "Bundled Codex-compatible model. Actual availability depends on what the ChatGPT Codex backend accepts for your account."
   }
 ];
 
@@ -250,14 +255,14 @@ async function discoverCodexModels(): Promise<ProviderDiscovery> {
       supportsEmbedding: false,
       supportsVision: true,
       metadata: JSON.stringify({
-        source: "cline-chatgpt-subscription-catalog",
+        source: "bundled-codex-catalog",
         advisoryOnly: item.id !== "chatgpt-plan-default",
         description: item.description
       })
     })),
     warnings: [
       "OpenAI Codex uses browser-based OAuth in this app and is treated as chat-only. Codex channels default to vectorless retrieval.",
-      "The visible Codex model list mirrors the ChatGPT Subscription catalog bundled by Cline. This app now sends the selected Codex model directly, but actual support still depends on what the ChatGPT Codex backend accepts for your account."
+      "OpenAI Codex does not currently expose a live model-list endpoint through this app. Refresh repopulates the bundled Codex-compatible catalog, and actual support still depends on what the ChatGPT Codex backend accepts for your account."
     ]
   };
 }

@@ -6,7 +6,7 @@ import path from "node:path";
 import { exec } from "node:child_process";
 
 export const DEFAULT_CODEX_MODELS = ["chatgpt-plan-default"];
-export const DEFAULT_CODEX_MODEL = "gpt-5.4";
+export const DEFAULT_CODEX_MODEL = "gpt-5.5";
 
 type CodexCredentials = {
   access_token: string;

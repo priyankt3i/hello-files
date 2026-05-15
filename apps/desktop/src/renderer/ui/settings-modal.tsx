@@ -13,7 +13,7 @@ const PROVIDERS: Array<{ value: ProviderKind; label: string; note: string }> = [
   {
     value: "openai-codex",
     label: "OpenAI Codex",
-    note: "Codex uses browser-based OAuth in this desktop app. It is treated as chat-only here, so Codex channels should use vectorless retrieval. The model picker mirrors Cline's ChatGPT Subscription catalog, and the selected Codex model is sent directly."
+    note: "Codex uses browser-based OAuth in this desktop app. It is treated as chat-only here, so Codex channels should use vectorless retrieval. The model picker uses a bundled Codex-compatible catalog, and the selected Codex model is sent directly."
   },
   {
     value: "anthropic",
