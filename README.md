@@ -52,16 +52,16 @@ Notes:
 
 ## Indexed File Coverage
 
-The Python worker currently supports:
+The indexer discovers every regular file under the selected folder, excluding `.fschat-index/` and `.fschat-index.tmp/`. Files that cannot be extracted are recorded as failed files in the UI.
 
-- text and code/config files such as `txt`, `md`, `json`, `xml`, `yaml`, `ini`, `toml`, `log`, `py`, `js`, `ts`, `tsx`, `css`, `sql`, `ps1`, and more
-- `pdf`
-- `docx`
-- `doc` as best effort, strongest on Windows with Microsoft Word installed
-- `xlsx`, `xlsm`, `xls`
-- images such as `png`, `jpg`, `jpeg`, `bmp`, `gif`, `tif`, `tiff`, `webp`
+The Python worker currently has explicit extractors for:
 
-OCR is used on images and on image-heavy content inside supported document formats when the extractor cannot already recover enough text directly.
+- Documents: `.pdf`, `.docx`, `.doc` best effort
+- Spreadsheets: `.xlsx`, `.xlsm`, `.xls`
+- Images and OCR: `.png`, `.jpg`, `.jpeg`, `.bmp`, `.gif`, `.tif`, `.tiff`, `.webp`
+- Text, code, and config: `.txt`, `.md`, `.csv`, `.json`, `.xml`, `.html`, `.htm`, `.yaml`, `.yml`, `.ini`, `.toml`, `.log`, `.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.css`, `.scss`, `.sql`, `.sh`, `.ps1`, `.bat`, `.cmd`, `.java`, `.cs`, `.go`, `.rs`, `.cpp`, `.c`, `.h`, `.hpp`, `.swift`, `.kt`, `.rb`, `.php`, `.swl`
+
+Unknown extensions may still index when Python identifies them as `text/*` or `image/*`, or when the file bytes look like plain text. OCR is used on standalone images and on image-heavy content inside supported document formats when the extractor cannot already recover enough text directly.
 
 ## Monorepo Layout
 
