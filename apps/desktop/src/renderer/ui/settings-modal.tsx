@@ -159,8 +159,8 @@ export function SettingsModal({
 
           {warnings.length > 0 ? (
             <div className="mt-4 rounded-[24px] border border-amber-300/20 bg-amber-400/10 p-4">
-              <div className="mb-2 text-sm font-semibold text-amber-100">Connection notes</div>
-              <div className="space-y-2 text-xs leading-6 text-amber-100/85">
+              <div className="mb-2 text-sm font-semibold text-paper">Connection notes</div>
+              <div className="space-y-2 text-xs leading-6 text-mist">
                 {warnings.map((warning) => (
                   <div key={warning}>{warning}</div>
                 ))}
@@ -257,12 +257,12 @@ export function SettingsModal({
                         </button>
                       </div>
                       {chatModels.length === 0 ? (
-                        <div className="mt-3 rounded-2xl border border-coral/25 bg-coral/10 px-4 py-3 text-sm text-[#ffd1ca]">
+                        <div className="mt-3 rounded-xl border border-coral/25 bg-coral/10 px-4 py-3 text-sm text-coral">
                           This provider connection has no chat-capable models available right now.
                         </div>
                       ) : null}
                       {embeddingModels.length === 0 ? (
-                        <div className="mt-3 rounded-2xl border border-coral/25 bg-coral/10 px-4 py-3 text-sm text-[#ffd1ca]">
+                        <div className="mt-3 rounded-xl border border-coral/25 bg-coral/10 px-4 py-3 text-sm text-coral">
                           This provider connection has no embedding-capable models available right now.
                         </div>
                       ) : null}
@@ -298,15 +298,15 @@ export function SettingsModal({
           </div>
 
           <div className="mt-6 rounded-[24px] border border-coral/20 bg-coral/10 p-4">
-            <div className="text-sm font-semibold text-[#ffd1ca]">Reset App Data</div>
-            <div className="mt-2 text-sm leading-6 text-[#ffd1ca]/85">
+            <div className="text-sm font-semibold text-coral">Reset App Data</div>
+            <div className="mt-2 text-sm leading-6 text-mist">
               This removes all saved channels, provider connections, default models, chat threads, and stored API
               credentials for this app. It does not delete your source folders or any `.fschat-index` folders.
             </div>
             {!confirmReset ? (
               <div className="mt-4">
                 <button
-                  className="rounded-full border border-coral/45 bg-coral/10 px-4 py-2 text-sm font-medium text-[#ffd1ca]"
+                  className="rounded-lg border border-coral/45 bg-coral/10 px-4 py-2 text-sm font-medium text-coral"
                   onClick={() => setConfirmReset(true)}
                 >
                   Reset App Data
@@ -321,7 +321,7 @@ export function SettingsModal({
                   Keep Data
                 </button>
                 <button
-                  className="rounded-full border border-coral/55 bg-coral/15 px-4 py-2 text-sm font-medium text-[#ffd1ca]"
+                  className="rounded-lg border border-coral/55 bg-coral/15 px-4 py-2 text-sm font-medium text-coral"
                   onClick={async () => {
                     setBusy(true);
                     try {

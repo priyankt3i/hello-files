@@ -6,27 +6,33 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        ink: "#08111f",
-        mist: "#cbd5e1",
-        ember: "#ff7a18",
-        pine: "#16324f",
-        paper: "#f8fafc",
-        coral: "#ff5f45",
-        moss: "#7fb069"
+        black: "rgb(var(--color-layer-dark) / <alpha-value>)",
+        white: "rgb(var(--color-layer-light) / <alpha-value>)",
+        ink: "rgb(var(--color-ink) / <alpha-value>)",
+        mist: "rgb(var(--color-mist) / <alpha-value>)",
+        ember: "rgb(var(--color-ember) / <alpha-value>)",
+        pine: "rgb(var(--color-pine) / <alpha-value>)",
+        paper: "rgb(var(--color-paper) / <alpha-value>)",
+        coral: "rgb(var(--color-coral) / <alpha-value>)",
+        moss: "rgb(var(--color-moss) / <alpha-value>)"
       },
       fontFamily: {
-        display: ["Georgia", "serif"],
-        body: ["Segoe UI", "sans-serif"]
+        display: ["Inter", "Segoe UI", "system-ui", "sans-serif"],
+        body: ["Inter", "Segoe UI", "system-ui", "sans-serif"]
       },
       boxShadow: {
-        panel: "0 18px 50px rgba(8, 17, 31, 0.18)"
+        panel: "var(--shadow-panel)"
       },
       backgroundImage: {
-        "shell-gradient":
-          "radial-gradient(circle at top left, rgba(255,122,24,0.18), transparent 32%), radial-gradient(circle at top right, rgba(22,50,79,0.22), transparent 28%), linear-gradient(135deg, #08111f 0%, #10233a 48%, #f4efe6 160%)"
+        "shell-gradient": "var(--background-shell)"
+      },
+      opacity: {
+        6: "0.06",
+        7: "0.07",
+        8: "0.08",
+        12: "0.12"
       }
     }
   },
   plugins: []
 };
-

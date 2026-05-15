@@ -30,6 +30,8 @@ type PendingTurn = {
   userMessage: Message;
 };
 
+type ThemeMode = "light" | "dark";
+
 export function App() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [connections, setConnections] = useState<ProviderConnection[]>([]);
@@ -60,6 +62,10 @@ export function App() {
   const [deleteThreadPrompt, setDeleteThreadPrompt] = useState<{ threadId: string; title: string } | null>(null);
   const [citationPreview, setCitationPreview] = useState<{ channelId: string; citation: Citation } | null>(null);
   const [cancellingByChannel, setCancellingByChannel] = useState<Record<string, boolean>>({});
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    const storedTheme = window.localStorage.getItem("fschat-theme");
+    return storedTheme === "dark" ? "dark" : "light";
+  });
 
   useEffect(() => {
     void refreshBootstrap();
@@ -111,6 +117,12 @@ export function App() {
       offChannel();
     };
   }, [selectedChannelId]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    window.localStorage.setItem("fschat-theme", theme);
+  }, [theme]);
 
   const selectedChannel = channels.find((channel) => channel.id === selectedChannelId) ?? null;
   const connectionById = useMemo(
@@ -576,7 +588,15 @@ async function handleRevealCitationFile() {
   return (
     <div className="h-screen overflow-hidden bg-shell-gradient text-paper">
       <div className="grid h-full grid-cols-[minmax(260px,280px)_minmax(320px,360px)_minmax(0,1fr)] gap-4 overflow-hidden p-4">
-        <Sidebar channels={channels} selectedChannelId={selectedChannelId} onSelect={handleSelectChannel} onOpenCreate={() => setCreateOpen(true)} onOpenSettings={() => setSettingsOpen(true)} />
+        <Sidebar
+          channels={channels}
+          selectedChannelId={selectedChannelId}
+          theme={theme}
+          onThemeChange={setTheme}
+          onSelect={handleSelectChannel}
+          onOpenCreate={() => setCreateOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
         <FilesPanel
           selectedChannel={selectedChannel}
           connectionById={connectionById}
@@ -686,15 +706,15 @@ async function handleRevealCitationFile() {
         <Modal title="Create Channel" onClose={() => setCreateOpen(false)}>
           <div className="space-y-4">
             {!hasChatProviders ? (
-              <div className="rounded-3xl border border-amber-300/20 bg-amber-400/10 p-4 text-sm text-amber-100">
+              <div className="rounded-xl border border-ember/25 bg-ember/10 p-4 text-sm text-paper">
                 <div className="font-medium">Connected models are required before you can create a channel.</div>
-                <div className="mt-1 text-xs text-amber-100/80">
+                <div className="mt-1 text-xs text-mist">
                   Connect at least one provider with a chat-capable model in Settings. Vector channels also need an
                   embedding-capable model.
                 </div>
                 <div className="mt-3">
                   <button
-                    className="rounded-full bg-amber-300 px-4 py-2 text-sm font-semibold text-ink"
+                    className="rounded-lg bg-ember px-4 py-2 text-sm font-semibold text-ink"
                     onClick={() => {
                       setCreateOpen(false);
                       setSettingsOpen(true);
@@ -792,13 +812,13 @@ async function handleRevealCitationFile() {
                   </div>
                 )}
                 {pendingRetrievalMode === "vector" && pendingPreferredConnectionId && pendingConnectionEmbeddingModels.length === 0 ? (
-                  <div className="rounded-3xl border border-coral/25 bg-coral/10 p-4 text-sm text-[#ffd1ca]">
+                  <div className="rounded-xl border border-coral/25 bg-coral/10 p-4 text-sm text-coral">
                     The selected provider connection does not currently expose any embedding-capable models. Refresh the
                     provider or choose a different provider connection.
                   </div>
                 ) : null}
                 {pendingPreferredConnectionId && pendingConnectionChatModels.length === 0 ? (
-                  <div className="rounded-3xl border border-coral/25 bg-coral/10 p-4 text-sm text-[#ffd1ca]">
+                  <div className="rounded-xl border border-coral/25 bg-coral/10 p-4 text-sm text-coral">
                     The selected provider connection does not currently expose any chat-capable models. Refresh the
                     provider or choose a different provider connection.
                   </div>
@@ -862,11 +882,11 @@ async function handleRevealCitationFile() {
       ) : null}
 
       {error ? (
-        <div className="fixed bottom-5 right-5 z-50 w-[min(28rem,calc(100vw-2rem))] rounded-3xl border border-coral/30 bg-[#2f1213] px-5 py-4 text-sm text-[#ffd1ca] shadow-panel">
+        <div className="fixed bottom-5 right-5 z-50 w-[min(28rem,calc(100vw-2rem))] rounded-xl border border-coral/30 bg-coral/10 px-5 py-4 text-sm text-coral shadow-panel">
           <div className="mb-2 flex items-start justify-between gap-3">
-            <div className="text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb6aa]">Error</div>
+            <div className="text-xs font-semibold uppercase text-coral">Error</div>
             <button
-              className="shrink-0 rounded-full border border-white/10 px-3 py-1 text-xs text-[#ffd1ca]/80"
+              className="shrink-0 rounded-lg border border-white/10 px-3 py-1 text-xs text-coral"
               onClick={() => setError(null)}
             >
               Dismiss
@@ -882,33 +902,40 @@ async function handleRevealCitationFile() {
 function Sidebar({
   channels,
   selectedChannelId,
+  theme,
+  onThemeChange,
   onSelect,
   onOpenCreate,
   onOpenSettings
 }: {
   channels: Channel[];
   selectedChannelId: string | null;
+  theme: ThemeMode;
+  onThemeChange: (theme: ThemeMode) => void;
   onSelect: (channelId: string) => void | Promise<void>;
   onOpenCreate: () => void;
   onOpenSettings: () => void;
 }) {
   return (
-    <aside className="glass-panel shell-border min-h-0 min-w-0 flex flex-col rounded-[28px] p-5 shadow-panel">
-      <div className="mb-6">
-        <div className="font-display text-3xl tracking-tight text-paper">Filesystem</div>
+    <aside className="glass-panel shell-border min-h-0 min-w-0 flex flex-col rounded-2xl p-5 shadow-panel">
+      <div className="mb-5">
+        <div className="font-display text-2xl font-semibold tracking-tight text-paper">Filesystem</div>
         <div className="text-sm text-mist/80">RAG Chat Workspace</div>
       </div>
-      <div className="mb-4 flex gap-2">
-        <button className="rounded-full bg-ember px-4 py-2 text-sm font-semibold text-ink" onClick={onOpenCreate}>Create Channel</button>
-        <button className="rounded-full border border-white/10 px-4 py-2 text-sm text-mist" onClick={onOpenSettings}>Settings</button>
+      <div className="mb-4 grid gap-2">
+        <button className="rounded-lg bg-ember px-4 py-2 text-sm font-semibold text-ink" onClick={onOpenCreate}>Create Channel</button>
+        <div className="grid grid-cols-[1fr_auto] gap-2">
+          <button className="rounded-lg border border-white/10 px-4 py-2 text-sm text-mist" onClick={onOpenSettings}>Settings</button>
+          <ThemeSelector theme={theme} onThemeChange={onThemeChange} />
+        </div>
       </div>
-      <div className="mb-3 text-xs uppercase tracking-[0.3em] text-mist/50">Channels</div>
+      <div className="mb-3 text-xs font-semibold uppercase text-mist/55">Channels</div>
       <div className="flex-1 space-y-2 overflow-y-auto pr-1">
         {channels.length === 0 ? (
-          <div className="rounded-3xl border border-dashed border-white/10 p-5 text-sm text-mist/75">Add a folder-backed channel to start indexing and chatting with local knowledge.</div>
+          <div className="rounded-xl border border-dashed border-white/10 p-5 text-sm text-mist/75">Add a folder-backed channel to start indexing and chatting with local knowledge.</div>
         ) : (
           channels.map((channel) => (
-            <button key={channel.id} className={`w-full min-w-0 rounded-3xl p-4 text-left transition ${selectedChannelId === channel.id ? "bg-white/12" : "bg-white/5 hover:bg-white/8"}`} onClick={() => void onSelect(channel.id)}>
+            <button key={channel.id} className={`w-full min-w-0 rounded-xl border-l-4 p-4 text-left transition ${selectedChannelId === channel.id ? "border-ember bg-ember/10" : "border-transparent bg-white/5 hover:bg-white/8"}`} onClick={() => void onSelect(channel.id)}>
               <div className="flex min-w-0 items-center justify-between gap-3">
                 <div className="truncate font-medium text-paper">{channel.displayName}</div>
                 <StatusPill status={channel.status} />
@@ -919,6 +946,32 @@ function Sidebar({
         )}
       </div>
     </aside>
+  );
+}
+
+function ThemeSelector({
+  theme,
+  onThemeChange
+}: {
+  theme: ThemeMode;
+  onThemeChange: (theme: ThemeMode) => void;
+}) {
+  return (
+    <div className="grid grid-cols-2 rounded-lg border border-white/10 bg-black/5 p-1" aria-label="Theme">
+      {(["light", "dark"] as ThemeMode[]).map((mode) => (
+        <button
+          key={mode}
+          className={`rounded-md px-2.5 py-1.5 text-xs font-medium capitalize transition ${
+            theme === mode ? "bg-ember text-ink shadow-sm" : "text-mist hover:bg-white/8 hover:text-paper"
+          }`}
+          onClick={() => onThemeChange(mode)}
+          type="button"
+          aria-pressed={theme === mode}
+        >
+          {mode}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -1012,9 +1065,9 @@ function FilesPanel({
         <button
           className={`rounded-full px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-45 ${
             isCancelling
-              ? "border border-coral/70 bg-coral/25 text-[#ffd1ca] shadow-[0_0_0_1px_rgba(255,122,95,0.2)]"
+              ? "border border-coral/70 bg-coral/20 text-coral"
               : isIndexing
-                ? "border border-coral/60 bg-coral/15 text-[#ffd1ca] shadow-[0_0_0_1px_rgba(255,122,95,0.14)] hover:bg-coral/20"
+                ? "border border-coral/60 bg-coral/10 text-coral hover:bg-coral/20"
                 : "border border-white/10 text-mist"
           }`}
           onClick={() => void onCancel()}
@@ -1060,21 +1113,21 @@ function CancelToast({
 }) {
   return (
     <div className={`fixed right-5 z-40 w-[min(30rem,calc(100vw-2rem))] ${offsetForError ? "bottom-52" : "bottom-5"}`}>
-      <div className="rounded-[28px] border border-coral/30 bg-[#22131a] px-5 py-4 text-sm text-[#ffe4dc] shadow-panel backdrop-blur-md">
+      <div className="rounded-xl border border-coral/30 bg-coral/10 px-5 py-4 text-sm text-paper shadow-panel">
         <div className="mb-2 flex items-start justify-between gap-3">
           <div>
-            <div className="text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb9ab]">Cancel indexing?</div>
+            <div className="text-xs font-semibold uppercase text-coral">Cancel indexing?</div>
             <div className="mt-2 break-anywhere text-base font-medium text-paper">{channelName}</div>
           </div>
           <button
-            className="shrink-0 rounded-full border border-white/10 px-3 py-1 text-xs text-[#ffd1ca]/80 disabled:opacity-40"
+            className="shrink-0 rounded-lg border border-white/10 px-3 py-1 text-xs text-mist disabled:opacity-40"
             onClick={onClose}
             disabled={busy}
           >
             Keep running
           </button>
         </div>
-        <div className="break-anywhere text-sm leading-6 text-[#ffd1ca]/85">
+        <div className="break-anywhere text-sm leading-6 text-mist">
           Choose whether to keep the files that already finished indexing, or discard this in-progress run and leave the last committed index untouched.
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
@@ -1086,7 +1139,7 @@ function CancelToast({
             {busy ? "Cancelling..." : "Retain partial index"}
           </button>
           <button
-            className="rounded-full border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-[#ffd1ca] disabled:opacity-40"
+            className="rounded-lg border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-coral disabled:opacity-40"
             onClick={onDelete}
             disabled={busy}
           >
@@ -1248,17 +1301,17 @@ function ChannelModelsModal({
           connectionById={connectionById}
         />
         {retrievalMode === "vector" && preferredConnectionId && embeddingModels.length === 0 ? (
-          <div className="rounded-3xl border border-coral/25 bg-coral/10 p-4 text-sm text-[#ffd1ca]">
+          <div className="rounded-xl border border-coral/25 bg-coral/10 p-4 text-sm text-coral">
             This provider connection does not currently expose any embedding-capable models.
           </div>
         ) : null}
         {preferredConnectionId && chatModels.length === 0 ? (
-          <div className="rounded-3xl border border-coral/25 bg-coral/10 p-4 text-sm text-[#ffd1ca]">
+          <div className="rounded-xl border border-coral/25 bg-coral/10 p-4 text-sm text-coral">
             This provider connection does not currently expose any chat-capable models.
           </div>
         ) : null}
         {embeddingChanged ? (
-          <div className="rounded-3xl border border-amber-300/20 bg-amber-400/10 p-4 text-sm text-amber-100">
+          <div className="rounded-xl border border-ember/25 bg-ember/10 p-4 text-sm text-paper">
             Changing the embedding model requires a regenerate before this channel can be searched again.
           </div>
         ) : null}
@@ -1348,21 +1401,21 @@ function DeleteChannelToast({
 }) {
   return (
     <div className={`fixed right-5 z-40 w-[min(30rem,calc(100vw-2rem))] ${offsetForError ? "bottom-52" : "bottom-5"}`}>
-      <div className="rounded-[28px] border border-coral/30 bg-[#22131a] px-5 py-4 text-sm text-[#ffe4dc] shadow-panel backdrop-blur-md">
+      <div className="rounded-xl border border-coral/30 bg-coral/10 px-5 py-4 text-sm text-paper shadow-panel">
         <div className="mb-2 flex items-start justify-between gap-3">
           <div>
-            <div className="text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb9ab]">Delete channel?</div>
+            <div className="text-xs font-semibold uppercase text-coral">Delete channel?</div>
             <div className="mt-2 break-anywhere text-base font-medium text-paper">{channelName}</div>
           </div>
           <button
-            className="shrink-0 rounded-full border border-white/10 px-3 py-1 text-xs text-[#ffd1ca]/80 disabled:opacity-40"
+            className="shrink-0 rounded-lg border border-white/10 px-3 py-1 text-xs text-mist disabled:opacity-40"
             onClick={onClose}
             disabled={busy}
           >
             Keep channel
           </button>
         </div>
-        <div className="break-anywhere text-sm leading-6 text-[#ffd1ca]/85">
+        <div className="break-anywhere text-sm leading-6 text-mist">
           This removes the channel from the app along with its threads and file status history. You can keep or remove the on-disk index for this folder.
         </div>
         <div className="mt-3 break-anywhere rounded-2xl border border-white/10 bg-black/10 px-4 py-3 text-xs text-mist/75">
@@ -1370,7 +1423,7 @@ function DeleteChannelToast({
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
           <button
-            className="rounded-full border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-[#ffd1ca] disabled:opacity-40"
+            className="rounded-lg border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-coral disabled:opacity-40"
             onClick={onDeleteChannel}
             disabled={busy}
           >
@@ -1404,26 +1457,26 @@ function DeleteThreadToast({
 }) {
   return (
     <div className={`fixed right-5 z-40 w-[min(30rem,calc(100vw-2rem))] ${offsetForError ? "bottom-52" : "bottom-5"}`}>
-      <div className="rounded-[28px] border border-coral/30 bg-[#22131a] px-5 py-4 text-sm text-[#ffe4dc] shadow-panel backdrop-blur-md">
+      <div className="rounded-xl border border-coral/30 bg-coral/10 px-5 py-4 text-sm text-paper shadow-panel">
         <div className="mb-2 flex items-start justify-between gap-3">
           <div>
-            <div className="text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb9ab]">Delete session?</div>
+            <div className="text-xs font-semibold uppercase text-coral">Delete session?</div>
             <div className="mt-2 break-anywhere text-base font-medium text-paper">{title}</div>
           </div>
           <button
-            className="shrink-0 rounded-full border border-white/10 px-3 py-1 text-xs text-[#ffd1ca]/80 disabled:opacity-40"
+            className="shrink-0 rounded-lg border border-white/10 px-3 py-1 text-xs text-mist disabled:opacity-40"
             onClick={onClose}
             disabled={busy}
           >
             Keep session
           </button>
         </div>
-        <div className="break-anywhere text-sm leading-6 text-[#ffd1ca]/85">
+        <div className="break-anywhere text-sm leading-6 text-mist">
           This session already contains messages. Deleting it will remove the conversation history for this tab.
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
           <button
-            className="rounded-full border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-[#ffd1ca] disabled:opacity-40"
+            className="rounded-lg border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-coral disabled:opacity-40"
             onClick={onDelete}
             disabled={busy}
           >
@@ -1509,7 +1562,7 @@ function ModelSelectionHint({
             : "Vectorless channels require a chat-capable model. Embedding models are optional because retrieval happens through manifest-first document selection and lexical grounding."}
       </div>
       {crossProviderOverride ? (
-        <div className="mt-2 leading-6 text-amber-100/85">
+        <div className="mt-2 leading-6 text-ember">
           These selections are incompatible because they come from different provider connections. Choose both models
           from {preferredConnection.name}.
         </div>

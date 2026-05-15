@@ -3,9 +3,43 @@
 @tailwind utilities;
 
 :root {
+  color-scheme: light;
+  --color-background: 247 247 245;
+  --color-surface: 255 255 255;
+  --color-surface-muted: 242 241 238;
+  --color-border: 223 220 215;
+  --color-layer-light: 43 43 40;
+  --color-layer-dark: 43 43 40;
+  --color-paper: 43 43 40;
+  --color-mist: 105 101 94;
+  --color-ink: 255 255 255;
+  --color-ember: 35 131 226;
+  --color-pine: 226 238 255;
+  --color-coral: 217 76 54;
+  --color-moss: 68 131 97;
+  --background-shell: linear-gradient(180deg, rgb(250 250 249) 0%, rgb(241 241 239) 100%);
+  --shadow-panel: 0 12px 36px rgba(15, 23, 42, 0.08);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  background: rgb(var(--color-background));
+}
+
+:root[data-theme="dark"] {
   color-scheme: dark;
-  font-family: "Segoe UI", sans-serif;
-  background: #08111f;
+  --color-background: 25 25 24;
+  --color-surface: 32 32 31;
+  --color-surface-muted: 42 42 40;
+  --color-border: 63 63 60;
+  --color-layer-light: 248 250 252;
+  --color-layer-dark: 9 9 11;
+  --color-paper: 245 245 244;
+  --color-mist: 168 162 158;
+  --color-ink: 255 255 255;
+  --color-ember: 82 156 255;
+  --color-pine: 45 61 82;
+  --color-coral: 255 113 91;
+  --color-moss: 115 173 130;
+  --background-shell: linear-gradient(180deg, rgb(25 25 24) 0%, rgb(18 18 17) 100%);
+  --shadow-panel: 0 18px 48px rgba(0, 0, 0, 0.28);
 }
 
 html,
@@ -17,8 +51,9 @@ body,
 
 body {
   margin: 0;
-  background: #08111f;
-  color: #f8fafc;
+  background: rgb(var(--color-background));
+  color: rgb(var(--color-paper));
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
 * {
@@ -31,18 +66,74 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(203, 213, 225, 0.25);
+  background: rgb(var(--color-mist) / 0.25);
   border-radius: 999px;
 }
 
 .glass-panel {
-  background: linear-gradient(180deg, rgba(14, 28, 46, 0.85), rgba(12, 22, 35, 0.7));
-  border: 1px solid rgba(203, 213, 225, 0.12);
-  backdrop-filter: blur(18px);
+  background: rgb(var(--color-surface));
+  border: 1px solid rgb(var(--color-border));
 }
 
 .shell-border {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgb(var(--color-border));
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+input,
+select,
+textarea,
+.glass-panel {
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgb(var(--color-ember) / 0.55);
+  outline-offset: 2px;
+}
+
+select option {
+  background: rgb(var(--color-surface));
+  color: rgb(var(--color-paper));
+}
+
+.rounded-2xl,
+.rounded-3xl,
+.rounded-\[18px\],
+.rounded-\[22px\],
+.rounded-\[24px\],
+.rounded-\[26px\],
+.rounded-\[28px\],
+.rounded-\[30px\] {
+  border-radius: 0.5rem;
+}
+
+button.rounded-full,
+input.rounded-full,
+textarea.rounded-\[24px\] {
+  border-radius: 0.5rem;
+}
+
+.tracking-tight,
+.tracking-\[0\.16em\],
+.tracking-\[0\.18em\],
+.tracking-\[0\.2em\],
+.tracking-\[0\.3em\] {
+  letter-spacing: 0;
 }
 
 .break-anywhere {
@@ -82,7 +173,7 @@ body {
 }
 
 .markdown-body strong {
-  color: #ffffff;
+  color: rgb(var(--color-paper));
   font-weight: 700;
 }
 
@@ -91,8 +182,8 @@ body {
 }
 
 .markdown-body code {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(8, 17, 31, 0.55);
+  border: 1px solid rgb(var(--color-border));
+  background: rgb(var(--color-surface-muted));
   border-radius: 0.5rem;
   padding: 0.1rem 0.35rem;
   font-family: "Cascadia Code", "Consolas", monospace;
@@ -101,8 +192,8 @@ body {
 
 .markdown-body pre {
   overflow-x: auto;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(8, 17, 31, 0.75);
+  border: 1px solid rgb(var(--color-border));
+  background: rgb(var(--color-surface-muted));
   border-radius: 1rem;
   padding: 1rem;
 }
@@ -114,13 +205,13 @@ body {
 }
 
 .markdown-body blockquote {
-  border-left: 3px solid rgba(251, 146, 60, 0.7);
+  border-left: 3px solid rgb(var(--color-ember) / 0.65);
   padding-left: 1rem;
-  color: rgba(226, 232, 240, 0.85);
+  color: rgb(var(--color-mist));
 }
 
 .markdown-body a {
-  color: #fbbf24;
+  color: rgb(var(--color-ember));
   text-decoration: underline;
 }
 
@@ -130,7 +221,7 @@ body {
 .markdown-body h4,
 .markdown-body h5,
 .markdown-body h6 {
-  color: #ffffff;
+  color: rgb(var(--color-paper));
   font-weight: 700;
   line-height: 1.25;
 }
