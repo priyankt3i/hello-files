@@ -135,6 +135,7 @@ For deeper project docs, see:
 - [Desktop Distribution](docs/distribution.md)
 - [Providers](docs/providers.md)
 - [Indexing](docs/indexing.md)
+- [Technical Walkthrough](docs/technical-walkthrough.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Architecture](docs/architecture.md)
 - [Vectorless RAG](vectorlessRAG.md)

@@ -8,6 +8,7 @@ This folder contains the first contributor-facing docs for Hello Files.
 - [Desktop Distribution](distribution.md)
 - [Providers](providers.md)
 - [Indexing](indexing.md)
+- [Technical Walkthrough](technical-walkthrough.md)
 - [Troubleshooting](troubleshooting.md)
 - [Architecture](architecture.md)
 - [Move To Vectorless RAG](move2vectorless.md)
