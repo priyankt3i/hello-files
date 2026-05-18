@@ -12,7 +12,9 @@ import type {
   IndexManifest,
   IndexProgressEvent,
   IndexedFileRecord,
+  ResolvedVisualAsset,
   SearchResult,
+  VisualAssetReference,
   WorkerBuildResponse,
   WorkerBuildOptions,
   WorkerEnvelope
@@ -74,6 +76,14 @@ export class PythonWorkerBridge extends EventEmitter {
 
   async listDocuments(rootPath: string): Promise<{ documents: IndexedDocumentRecord[] }> {
     return this.request("list_documents", { rootPath });
+  }
+
+  async resolveVisualAssets(
+    rootPath: string,
+    assets: VisualAssetReference[],
+    maxAssets = 3
+  ): Promise<{ assets: ResolvedVisualAsset[] }> {
+    return this.request("resolve_visual_assets", { rootPath, assets, maxAssets });
   }
 
   async search(rootPath: string, query: string, topK: number, options: WorkerBuildOptions): Promise<{ results: SearchResult[] }> {

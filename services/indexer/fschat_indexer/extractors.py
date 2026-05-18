@@ -115,9 +115,9 @@ def extract_text(path: Path) -> Tuple[str, str]:
 def extract_document(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return {"text": extract_pdf(path), "parser": "pdf"}
+        return extract_pdf_document(path)
     if suffix == ".docx":
-        return {"text": extract_docx(path), "parser": "docx"}
+        return extract_docx_document(path)
     if suffix == ".doc":
         return {"text": extract_doc(path), "parser": "doc"}
     if suffix in SPREADSHEET_EXTENSIONS:
@@ -127,7 +127,7 @@ def extract_document(path: Path) -> dict[str, Any]:
     if suffix == ".csv":
         return {"text": extract_csv(path), "parser": "csv"}
     if suffix in IMAGE_EXTENSIONS:
-        return {"text": extract_image_document(path), "parser": "image-ocr"}
+        return extract_image_file_document(path)
     if suffix in TEXT_EXTENSIONS:
         return {"text": extract_plain_text(path), "parser": "text"}
     text, parser = extract_unknown(path)
@@ -135,10 +135,15 @@ def extract_document(path: Path) -> dict[str, Any]:
 
 
 def extract_pdf(path: Path) -> str:
+    return extract_pdf_document(path)["text"]
+
+
+def extract_pdf_document(path: Path) -> dict[str, Any]:
     if fitz is None:
         raise ValueError("PDF support requires PyMuPDF.")
 
     parts: list[str] = []
+    visual_assets: list[dict[str, Any]] = []
     seen_image_digests: set[int] = set()
     with fitz.open(path) as document:
         for page_index, page in enumerate(document, start=1):
@@ -149,11 +154,17 @@ def extract_pdf(path: Path) -> str:
             should_ocr_page = should_attempt_visual_ocr(page_text, MIN_TEXT_CHARS_FOR_VISUAL_OCR)
             if should_ocr_page:
                 page_ocr = extract_pdf_page_ocr(page)
-                if page_ocr:
-                    parts.append(f"# PDF page {page_index} visual text\n{page_ocr}")
-
-            if not should_ocr_page:
-                continue
+                anchor = f"# PDF page {page_index} visual text"
+                parts.append(f"{anchor}\n{page_ocr or 'No OCR text detected.'}")
+                visual_assets.append(
+                    {
+                        "kind": "pdf-page",
+                        "relativePath": path.name,
+                        "label": f"PDF page {page_index}",
+                        "anchorText": anchor,
+                        "pageNumber": page_index,
+                    }
+                )
 
             for image_index, image_info in enumerate(page.get_images(full=True), start=1):
                 if image_index > MAX_EMBEDDED_IMAGES_PER_PDF_PAGE:
@@ -165,14 +176,27 @@ def extract_pdf(path: Path) -> str:
                 if digest in seen_image_digests:
                     continue
                 seen_image_digests.add(digest)
+                source_name = f"page {page_index} image {image_index}"
                 embedded_text = extract_image_bytes(
                     image_bytes,
-                    f"page {page_index} image {image_index}",
+                    source_name,
                 )
                 if embedded_text:
                     parts.append(embedded_text)
+                    visual_assets.append(
+                        {
+                            **visual_asset_metadata_from_bytes(
+                                image_bytes,
+                                kind="pdf-image",
+                                source_name=source_name,
+                                relative_path=path.name,
+                            ),
+                            "pageNumber": page_index,
+                            "imageIndex": image_index,
+                        }
+                    )
 
-    return "\n\n".join(part for part in parts if part.strip())
+    return {"text": "\n\n".join(part for part in parts if part.strip()), "parser": "pdf", "visualAssets": visual_assets}
 
 
 def extract_pdf_page_ocr(page) -> str:
@@ -185,8 +209,13 @@ def extract_pdf_page_ocr(page) -> str:
 
 
 def extract_docx(path: Path) -> str:
+    return extract_docx_document(path)["text"]
+
+
+def extract_docx_document(path: Path) -> dict[str, Any]:
     document = Document(path)
     parts: list[str] = []
+    visual_assets: list[dict[str, Any]] = []
 
     paragraph_text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
     if paragraph_text:
@@ -196,13 +225,12 @@ def extract_docx(path: Path) -> str:
     if table_text:
         parts.append(table_text)
 
-    visible_text = "\n\n".join(part for part in parts if part.strip())
-    if should_attempt_visual_ocr(visible_text, MIN_TEXT_CHARS_FOR_DOC_IMAGE_OCR):
-        embedded_images = extract_docx_embedded_images(path)
-        if embedded_images:
-            parts.append(embedded_images)
+    embedded_images, embedded_assets = extract_docx_embedded_images(path)
+    if embedded_images:
+        parts.append(embedded_images)
+        visual_assets.extend(embedded_assets)
 
-    return "\n\n".join(part for part in parts if part.strip())
+    return {"text": "\n\n".join(part for part in parts if part.strip()), "parser": "docx", "visualAssets": visual_assets}
 
 
 def extract_docx_tables(document: Document) -> str:
@@ -216,8 +244,9 @@ def extract_docx_tables(document: Document) -> str:
     return "\n".join(rows)
 
 
-def extract_docx_embedded_images(path: Path) -> str:
+def extract_docx_embedded_images(path: Path) -> tuple[str, list[dict[str, Any]]]:
     parts: list[str] = []
+    visual_assets: list[dict[str, Any]] = []
     with zipfile.ZipFile(path) as archive:
         for name in archive.namelist():
             if not name.startswith("word/media/"):
@@ -228,7 +257,18 @@ def extract_docx_embedded_images(path: Path) -> str:
             image_text = extract_image_bytes(image_bytes, name)
             if image_text:
                 parts.append(image_text)
-    return "\n\n".join(parts)
+                visual_assets.append(
+                    {
+                        **visual_asset_metadata_from_bytes(
+                            image_bytes,
+                            kind="docx-image",
+                            source_name=name,
+                            relative_path=path.name,
+                        ),
+                        "mediaPath": name,
+                    }
+                )
+    return "\n\n".join(parts), visual_assets
 
 
 def extract_doc(path: Path) -> str:
@@ -560,6 +600,26 @@ def extract_image_document(path: Path) -> str:
         return describe_image(image, source_name=path.name)
 
 
+def extract_image_file_document(path: Path) -> dict[str, Any]:
+    if Image is None:
+        raise ValueError("Image support requires Pillow.")
+    image_bytes = path.read_bytes()
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        text = describe_image(image, source_name=path.name)
+    return {
+        "text": text,
+        "parser": "image-ocr",
+        "visualAssets": [
+            visual_asset_metadata_from_bytes(
+                image_bytes,
+                kind="image-file",
+                source_name=path.name,
+                relative_path=path.name,
+            )
+        ],
+    }
+
+
 def extract_image_bytes(image_bytes: bytes, source_name: str) -> str:
     if Image is None:
         return ""
@@ -594,6 +654,27 @@ def describe_image(image, source_name: str) -> str:
         metadata.append("No OCR text detected.")
 
     return "\n".join(metadata).strip()
+
+
+def visual_asset_metadata_from_bytes(image_bytes: bytes, kind: str, source_name: str, relative_path: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "kind": kind,
+        "relativePath": relative_path,
+        "label": source_name,
+        "anchorText": f"# Visual asset: {source_name}",
+    }
+    if Image is None:
+        return payload
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            payload["width"] = int(image.width)
+            payload["height"] = int(image.height)
+            mime_type = Image.MIME.get(getattr(image, "format", "") or "")
+            if mime_type:
+                payload["mimeType"] = mime_type
+    except Exception:
+        pass
+    return payload
 
 
 def ocr_image(image) -> str:

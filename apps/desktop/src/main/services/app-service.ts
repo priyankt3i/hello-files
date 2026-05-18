@@ -23,6 +23,7 @@ import type {
   ProviderConnection,
   ProviderDefaults,
   ProviderModel,
+  ResolvedVisualAsset,
   RetrievalMode,
   RefreshProviderModelsResult,
   RegisterChannelInput,
@@ -33,6 +34,7 @@ import type {
   UpdateChannelSystemPromptInput,
   UpdateThreadTitleInput,
   UpdateChannelModelsInput,
+  VisualAssetReference,
   WorkerBuildResponse,
   WorkerBuildOptions
 } from "@fschat/shared";
@@ -645,6 +647,7 @@ export class DesktopAppService {
     let searchResponse;
     let contextNotes: string[] = [];
     let deterministicAssistantText: string | null = null;
+    let visualAssets: ResolvedVisualAsset[] = [];
 
     if (channel.retrievalMode === "vector") {
       if (!channel.embeddingModelId) {
@@ -743,6 +746,13 @@ export class DesktopAppService {
       }
     }
 
+    visualAssets = await this.resolveVisualContext(
+      channel.rootPath,
+      chatSelection.connection,
+      chatSelection.model,
+      searchResponse.results
+    );
+
     const now = new Date().toISOString();
     const existingThread = input.threadId ? this.db.listThreads(channel.id).find((candidate) => candidate.id === input.threadId) : null;
     const thread: Thread =
@@ -777,6 +787,7 @@ export class DesktopAppService {
         secret: chatSelection.secret,
         searchResults: searchResponse.results,
         contextNotes,
+        visualAssets,
         history,
         userMessage: input.message,
         systemPrompt: channel.systemPrompt
@@ -921,6 +932,52 @@ export class DesktopAppService {
     }
 
     throw new Error(`Credentials missing for provider connection "${connection.name}".`);
+  }
+
+  private async resolveVisualContext(
+    rootPath: string,
+    connection: ProviderConnection,
+    model: ProviderModel,
+    results: SearchResult[]
+  ): Promise<ResolvedVisualAsset[]> {
+    if (!model.supportsVision || !providerSupportsMultimodalInput(connection.provider)) {
+      return [];
+    }
+
+    const selected: VisualAssetReference[] = [];
+    const seen = new Set<string>();
+    for (const result of results.slice(0, 5)) {
+      for (const asset of result.visualAssets ?? []) {
+        const key = [
+          asset.kind,
+          asset.relativePath,
+          asset.pageNumber ?? "",
+          asset.imageIndex ?? "",
+          asset.mediaPath ?? ""
+        ].join("|");
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        selected.push(asset);
+        if (selected.length >= 3) {
+          break;
+        }
+      }
+      if (selected.length >= 3) {
+        break;
+      }
+    }
+
+    if (selected.length === 0) {
+      return [];
+    }
+
+    try {
+      return (await this.worker.resolveVisualAssets(rootPath, selected, 3)).assets;
+    } catch {
+      return [];
+    }
   }
 
   private toWorkerBuildOptions(args: {
@@ -1289,6 +1346,10 @@ function deriveCancelledChannelStatus(files: IndexedFileRecord[]): Exclude<Chann
     return "error";
   }
   return "idle";
+}
+
+function providerSupportsMultimodalInput(provider: ProviderConnection["provider"]) {
+  return ["openai", "openai-codex", "azure-openai", "anthropic", "google", "ollama"].includes(provider);
 }
 
 function preselectManifestDocuments(documents: IndexedDocumentRecord[], query: string, limit: number) {
