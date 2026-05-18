@@ -5,6 +5,7 @@ import type {
   ProviderConnection,
   ProviderKind,
   ProviderModel,
+  ResolvedVisualAsset,
   SearchResult
 } from "@fschat/shared";
 import { callCodexText } from "./codex-client";
@@ -82,11 +83,12 @@ export async function generateAssistantReply(args: {
   secret: ProviderSecret;
   searchResults: SearchResult[];
   contextNotes?: string[];
+  visualAssets?: ResolvedVisualAsset[];
   history: Message[];
   userMessage: string;
   systemPrompt?: string;
 }): Promise<string> {
-  const { connection, model, secret, searchResults, contextNotes = [], history, userMessage, systemPrompt } = args;
+  const { connection, model, secret, searchResults, contextNotes = [], visualAssets = [], history, userMessage, systemPrompt } = args;
   const noteBlock =
     contextNotes.length > 0
       ? ["Context notes:", ...contextNotes.map((note, index) => `- ${note}`), ""].join("\n")
@@ -122,15 +124,43 @@ export async function generateAssistantReply(args: {
     content: message.content
   }));
 
-  const prompt = ["Indexed context:", contextBlock, "", `User question: ${userMessage}`].join("\n");
-  return callProviderText({
+  const visualBlock =
+    visualAssets.length > 0
+      ? [
+          "Relevant visual assets are attached for inspection.",
+          ...visualAssets.map((item, index) => {
+            const locationParts = [];
+            if (item.asset.pageNumber) {
+              locationParts.push(`page ${item.asset.pageNumber}`);
+            }
+            if (item.asset.mediaPath) {
+              locationParts.push(item.asset.mediaPath);
+            }
+            const location = locationParts.length > 0 ? ` (${locationParts.join(", ")})` : "";
+            return `[V${index + 1}] ${item.asset.relativePath}${location}: ${item.asset.label}`;
+          }),
+          "Use visual details only when they are visible in the attached assets or supported by indexed text."
+        ].join("\n")
+      : "";
+
+  const prompt = ["Indexed context:", contextBlock, visualBlock, "", `User question: ${userMessage}`].filter(Boolean).join("\n");
+  const request = {
     connection,
     model,
     secret,
     systemPrompt: effectiveSystemPrompt,
     history: recentHistory,
     prompt
-  });
+  };
+  if (visualAssets.length === 0) {
+    return callProviderText(request);
+  }
+
+  try {
+    return await callProviderText({ ...request, images: visualAssets });
+  } catch {
+    return callProviderText(request);
+  }
 }
 
 export async function selectRelevantDocuments(args: {
@@ -430,7 +460,9 @@ async function callOpenAI(args: {
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
+  images?: ResolvedVisualAsset[];
 }) {
+  const userContent = buildOpenAIUserContent(args.prompt, args.images ?? []);
   const response = await fetch(joinUrl(args.baseUrl || DEFAULT_BASE_URLS.openai, "/v1/chat/completions"), {
     method: "POST",
     headers: {
@@ -440,7 +472,7 @@ async function callOpenAI(args: {
     body: JSON.stringify({
       model: args.model,
       temperature: 0.2,
-      messages: [{ role: "system", content: args.systemPrompt }, ...args.history, { role: "user", content: args.prompt }]
+      messages: [{ role: "system", content: args.systemPrompt }, ...args.history, { role: "user", content: userContent }]
     })
   });
   const data = await expectJson(response);
@@ -454,8 +486,9 @@ async function callProviderText(args: {
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
+  images?: ResolvedVisualAsset[];
 }) {
-  const { connection, model, secret, systemPrompt, history, prompt } = args;
+  const { connection, model, secret, systemPrompt, history, prompt, images = [] } = args;
   const baseUrl = connection.baseUrl || DEFAULT_BASE_URLS[connection.provider];
 
   switch (connection.provider) {
@@ -466,7 +499,8 @@ async function callProviderText(args: {
         apiKey: secret.apiKey,
         systemPrompt,
         history,
-        prompt
+        prompt,
+        images
       });
     case "openai-codex":
       return (
@@ -474,7 +508,8 @@ async function callProviderText(args: {
           model: model.modelId,
           systemPrompt,
           history,
-          prompt
+          prompt,
+          images
         })
       ).text;
     case "azure-openai":
@@ -485,7 +520,8 @@ async function callProviderText(args: {
         apiKey: secret.apiKey || "",
         systemPrompt,
         history,
-        prompt
+        prompt,
+        images
       });
     case "anthropic":
       return callAnthropic({
@@ -494,7 +530,8 @@ async function callProviderText(args: {
         apiKey: secret.apiKey || "",
         systemPrompt,
         history,
-        prompt
+        prompt,
+        images
       });
     case "google":
       return callGoogle({
@@ -503,7 +540,8 @@ async function callProviderText(args: {
         apiKey: secret.apiKey || "",
         systemPrompt,
         history,
-        prompt
+        prompt,
+        images
       });
     case "ollama":
       return callOllama({
@@ -511,7 +549,8 @@ async function callProviderText(args: {
         model: model.modelId,
         systemPrompt,
         history,
-        prompt
+        prompt,
+        images
       });
     default:
       throw new Error(`Unsupported provider: ${connection.provider as string}`);
@@ -526,10 +565,12 @@ async function callAzureOpenAI(args: {
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
+  images?: ResolvedVisualAsset[];
 }) {
   if (!args.baseUrl || !args.deployment) {
     throw new Error("Azure OpenAI requires base URL and deployment.");
   }
+  const userContent = buildOpenAIUserContent(args.prompt, args.images ?? []);
   const endpoint = joinUrl(
     args.baseUrl,
     `/openai/deployments/${encodeURIComponent(args.deployment)}/chat/completions?api-version=${encodeURIComponent(args.apiVersion)}`
@@ -542,7 +583,7 @@ async function callAzureOpenAI(args: {
     },
     body: JSON.stringify({
       temperature: 0.2,
-      messages: [{ role: "system", content: args.systemPrompt }, ...args.history, { role: "user", content: args.prompt }]
+      messages: [{ role: "system", content: args.systemPrompt }, ...args.history, { role: "user", content: userContent }]
     })
   });
   const data = await expectJson(response);
@@ -556,7 +597,9 @@ async function callAnthropic(args: {
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
+  images?: ResolvedVisualAsset[];
 }) {
+  const userContent = buildAnthropicUserContent(args.prompt, args.images ?? []);
   const response = await fetch(joinUrl(args.baseUrl, "/v1/messages"), {
     method: "POST",
     headers: {
@@ -568,7 +611,7 @@ async function callAnthropic(args: {
       model: args.model,
       max_tokens: 1400,
       system: args.systemPrompt,
-      messages: [...args.history, { role: "user", content: args.prompt }]
+      messages: [...args.history, { role: "user", content: userContent }]
     })
   });
   const data = await expectJson(response);
@@ -582,6 +625,7 @@ async function callGoogle(args: {
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
+  images?: ResolvedVisualAsset[];
 }) {
   if (!args.model) {
     throw new Error("Google provider requires a chat model.");
@@ -600,7 +644,7 @@ async function callGoogle(args: {
       systemInstruction: {
         parts: [{ text: args.systemPrompt }]
       },
-      contents: [...historyParts, { role: "user", parts: [{ text: args.prompt }] }]
+      contents: [...historyParts, { role: "user", parts: buildGoogleUserParts(args.prompt, args.images ?? []) }]
     })
   });
   const data = await expectJson(response);
@@ -613,7 +657,10 @@ async function callOllama(args: {
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
+  images?: ResolvedVisualAsset[];
 }) {
+  const images = (args.images ?? []).map((item) => item.dataBase64);
+  const userMessage = images.length > 0 ? { role: "user", content: args.prompt, images } : { role: "user", content: args.prompt };
   const response = await fetch(joinUrl(args.baseUrl, "/api/chat"), {
     method: "POST",
     headers: {
@@ -622,7 +669,7 @@ async function callOllama(args: {
     body: JSON.stringify({
       model: args.model,
       stream: false,
-      messages: [{ role: "system", content: args.systemPrompt }, ...args.history, { role: "user", content: args.prompt }]
+      messages: [{ role: "system", content: args.systemPrompt }, ...args.history, userMessage]
     })
   });
   const data = await expectJson(response);
@@ -635,6 +682,50 @@ async function expectJson(response: Response) {
     throw new Error(`Provider request failed (${response.status}): ${text}`);
   }
   return response.json();
+}
+
+function buildOpenAIUserContent(prompt: string, images: ResolvedVisualAsset[]) {
+  if (images.length === 0) {
+    return prompt;
+  }
+  return [
+    { type: "text", text: prompt },
+    ...images.map((image) => ({
+      type: "image_url",
+      image_url: {
+        url: `data:${image.mimeType};base64,${image.dataBase64}`
+      }
+    }))
+  ];
+}
+
+function buildAnthropicUserContent(prompt: string, images: ResolvedVisualAsset[]) {
+  if (images.length === 0) {
+    return prompt;
+  }
+  return [
+    ...images.map((image) => ({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: image.mimeType,
+        data: image.dataBase64
+      }
+    })),
+    { type: "text", text: prompt }
+  ];
+}
+
+function buildGoogleUserParts(prompt: string, images: ResolvedVisualAsset[]) {
+  return [
+    { text: prompt },
+    ...images.map((image) => ({
+      inlineData: {
+        mimeType: image.mimeType,
+        data: image.dataBase64
+      }
+    }))
+  ];
 }
 
 function joinUrl(base: string, path: string) {

@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { exec } from "node:child_process";
+import type { ResolvedVisualAsset } from "@fschat/shared";
 
 export const DEFAULT_CODEX_MODELS = ["chatgpt-plan-default"];
 export const DEFAULT_CODEX_MODEL = "gpt-5.5";
@@ -428,11 +429,13 @@ class CodexOAuthClient {
     prompt,
     instructions = "",
     model,
+    images = [],
     store = false
   }: {
     prompt: string;
     instructions?: string;
     model?: string;
+    images?: ResolvedVisualAsset[];
     store?: boolean;
   }) {
     let { accessToken, credentials } = await this.getAccessToken();
@@ -465,7 +468,7 @@ class CodexOAuthClient {
           input: [
             {
               role: "user",
-              content: [{ type: "input_text", text: prompt }]
+              content: buildCodexInputContent(prompt, images)
             }
           ],
           stream: true,
@@ -644,6 +647,7 @@ export async function callCodexText(args: {
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   model?: string;
+  images?: ResolvedVisualAsset[];
 }) {
   const normalizeRequestedModel = (value?: string) => {
     const cleaned = cleanText(value);
@@ -659,7 +663,8 @@ export async function callCodexText(args: {
     codexClient.requestResponse({
       model,
       instructions: args.systemPrompt,
-      prompt: buildCodexPrompt(args.history, args.prompt)
+      prompt: buildCodexPrompt(args.history, args.prompt),
+      images: args.images ?? []
     });
 
   let payload;
@@ -686,4 +691,14 @@ export async function callCodexText(args: {
     text: codexClient.parseResponseText(payload),
     usage: codexClient.parseUsage(payload)
   };
+}
+
+function buildCodexInputContent(prompt: string, images: ResolvedVisualAsset[]) {
+  return [
+    { type: "input_text", text: prompt },
+    ...images.map((image) => ({
+      type: "input_image",
+      image_url: `data:${image.mimeType};base64,${image.dataBase64}`
+    }))
+  ];
 }

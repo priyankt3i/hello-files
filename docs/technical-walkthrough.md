@@ -255,6 +255,18 @@ When the user sends a message:
 
 The answer generation path is intentionally separate from the retrieval path. Both vector and vectorless retrieval return the same search result contract.
 
+## Selective Multimodal Enrichment
+
+Visual content still starts with OCR so image-heavy files remain searchable as text. During indexing, the worker also records lightweight visual asset references on chunks that came from rendered PDF pages, embedded PDF images, DOCX media, or standalone image files.
+
+At answer time, the main process only resolves visual assets when all of these are true:
+
+- a retrieved chunk has visual asset references
+- the selected chat model is marked as vision-capable
+- the provider adapter supports multimodal request payloads
+
+The worker then reopens the original source file, renders or extracts at most three selected images, resizes them, and returns base64 image payloads to the main process. The provider prompt includes the normal retrieved text plus those selected images. If image resolution or provider enrichment fails, the app falls back to the existing text-only answer path.
+
 ## Provider Layer
 
 The provider system models accounts as reusable connections, then stores discovered models under those connections.
@@ -266,7 +278,7 @@ Supported provider adapters include:
 - Anthropic
 - Google Gemini
 - Ollama
-- OpenAI Codex path used by the app as chat-only/vectorless
+- OpenAI Codex path used by the app for vectorless chat and selected visual enrichment
 
 Provider discovery records whether each model supports chat, embeddings, and vision. Credentials are not stored in SQLite; the app stores a secret reference and retrieves the actual secret through `keytar` where applicable.
 
@@ -282,6 +294,7 @@ Request examples:
 - `cancel_build`
 - `list_files`
 - `list_documents`
+- `resolve_visual_assets`
 - `search`
 
 Event examples:
@@ -341,7 +354,7 @@ Source content stays in the selected folder. The local index is stored in `.fsch
 
 ### What leaves the machine?
 
-The app sends retrieved text snippets and recent conversation context to the selected chat provider when answering. Vector mode also sends chunks and queries to the selected embedding provider. Ollama can keep provider calls local when configured locally.
+The app sends retrieved text snippets and recent conversation context to the selected chat provider when answering. If selective multimodal enrichment is triggered, it also sends the selected rendered/extracted visual assets to the chat provider. Vector mode sends chunks and queries to the selected embedding provider. Ollama can keep provider calls local when configured locally.
 
 ### How are citations generated?
 

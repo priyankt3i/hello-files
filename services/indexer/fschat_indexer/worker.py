@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import math
 import re
 import sys
 import traceback
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +34,16 @@ from index_store import (
     write_manifest,
 )
 from vector_store import clear_index_cache, get_vectors_for_labels, load_index_bundle, release_index_bundle, write_vector_store
+
+try:
+    import fitz  # type: ignore
+except ImportError:
+    fitz = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 
 @dataclass
@@ -73,6 +86,9 @@ class CancelledBuild(RuntimeError):
 
 CANCELLED_CHANNELS: dict[str, CancelRequest] = {}
 BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+VISION_MAX_IMAGE_EDGE = 1600
+VISION_MAX_IMAGE_PIXELS = 2_500_000
+VISUAL_QUERY_TOKENS = {"chart", "charts", "graph", "graphs", "image", "images", "diagram", "diagrams", "figure", "figures", "screenshot", "screenshots", "visual", "visuals"}
 
 
 def emit_response(request_id: str | None, ok: bool, payload: Any = None, error: str | None = None) -> None:
@@ -145,6 +161,12 @@ def handle_request(request: dict[str, Any]) -> None:
 
         if method == "list_documents":
             emit_response(request_id, True, {"documents": read_documents(Path(payload["rootPath"]))})
+            return
+
+        if method == "resolve_visual_assets":
+            root_path = Path(payload["rootPath"])
+            assets = resolve_visual_assets(root_path, payload.get("assets") or [], int(payload.get("maxAssets", 3)))
+            emit_response(request_id, True, {"assets": assets})
             return
 
         if method == "search":
@@ -355,7 +377,8 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                 normalized = normalize_text(raw_text)
                 if not normalized:
                     raise ValueError("No extractable text found.")
-                chunk_payloads = build_chunk_payloads(normalized, extracted.get("chunks") or [])
+                visual_assets = normalize_visual_assets(extracted.get("visualAssets") or [], relative_path)
+                chunk_payloads = build_chunk_payloads(normalized, extracted.get("chunks") or [], visual_assets)
                 if not chunk_payloads:
                     raise ValueError("No extractable text chunks found.")
 
@@ -378,6 +401,8 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         entry["sheetName"] = chunk_payload["sheetName"]
                     if chunk_payload.get("rowNumber") is not None:
                         entry["rowNumber"] = chunk_payload["rowNumber"]
+                    if chunk_payload.get("visualAssets"):
+                        entry["visualAssets"] = chunk_payload["visualAssets"]
                     cached_vector = previous_vectors_by_hash.get(chunk_hash)
                     if cached_vector is not None:
                         entry["embedding"] = cached_vector
@@ -546,7 +571,13 @@ def search_index(root_path: Path, query: str, top_k: int, options: dict) -> list
         for chunk in read_chunk_metadata(root_path):
             if selected_document_ids and chunk.get("relativePath") not in selected_document_ids:
                 continue
-            score = lexical_chunk_score(query_tokens, query_lower, chunk.get("text", ""), chunk.get("relativePath", ""))
+            score = lexical_chunk_score(
+                query_tokens,
+                query_lower,
+                chunk.get("text", ""),
+                chunk.get("relativePath", ""),
+                has_visual_assets=bool(chunk.get("visualAssets")),
+            )
             if score <= 0:
                 continue
             scored_chunks.append((score, chunk))
@@ -566,6 +597,8 @@ def search_index(root_path: Path, query: str, top_k: int, options: dict) -> list
                 item["sheetName"] = chunk["sheetName"]
             if chunk.get("rowNumber") is not None:
                 item["rowNumber"] = chunk["rowNumber"]
+            if chunk.get("visualAssets"):
+                item["visualAssets"] = chunk["visualAssets"]
             results.append(item)
         return results
 
@@ -611,8 +644,126 @@ def search_index(root_path: Path, query: str, top_k: int, options: dict) -> list
             item["sheetName"] = chunk["sheetName"]
         if chunk.get("rowNumber") is not None:
             item["rowNumber"] = chunk["rowNumber"]
+        if chunk.get("visualAssets"):
+            item["visualAssets"] = chunk["visualAssets"]
         results.append(item)
     return results
+
+
+def resolve_visual_assets(root_path: Path, assets: list[dict[str, Any]], max_assets: int) -> list[dict[str, Any]]:
+    resolved: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for asset in assets:
+        if len(resolved) >= max(max_assets, 0):
+            break
+        if not isinstance(asset, dict):
+            continue
+        key = (
+            asset.get("kind"),
+            asset.get("relativePath"),
+            asset.get("pageNumber"),
+            asset.get("imageIndex"),
+            asset.get("mediaPath"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            image_bytes = resolve_visual_asset_bytes(root_path, asset)
+            if not image_bytes:
+                continue
+            mime_type, data_base64 = encode_visual_image(image_bytes)
+            resolved.append({"asset": asset, "mimeType": mime_type, "dataBase64": data_base64})
+        except Exception:
+            continue
+    return resolved
+
+
+def resolve_visual_asset_bytes(root_path: Path, asset: dict[str, Any]) -> bytes:
+    source_path = safe_source_path(root_path, str(asset.get("relativePath") or ""))
+    kind = str(asset.get("kind") or "")
+
+    if kind == "pdf-page":
+        if fitz is None:
+            return b""
+        page_number = int(asset.get("pageNumber") or 0)
+        if page_number <= 0:
+            return b""
+        with fitz.open(source_path) as document:
+            if page_number > len(document):
+                return b""
+            page = document[page_number - 1]
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            return pixmap.tobytes("png")
+
+    if kind == "pdf-image":
+        if fitz is None:
+            return b""
+        page_number = int(asset.get("pageNumber") or 0)
+        image_index = int(asset.get("imageIndex") or 0)
+        if page_number <= 0 or image_index <= 0:
+            return b""
+        with fitz.open(source_path) as document:
+            if page_number > len(document):
+                return b""
+            images = document[page_number - 1].get_images(full=True)
+            if image_index > len(images):
+                return b""
+            image = document.extract_image(images[image_index - 1][0])
+            return image.get("image") or b""
+
+    if kind == "docx-image":
+        media_path = str(asset.get("mediaPath") or "")
+        if not media_path.startswith("word/media/"):
+            return b""
+        with zipfile.ZipFile(source_path) as archive:
+            return archive.read(media_path)
+
+    if kind == "image-file":
+        return source_path.read_bytes()
+
+    return b""
+
+
+def safe_source_path(root_path: Path, relative_path: str) -> Path:
+    root = root_path.resolve()
+    candidate = (root / relative_path).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("Visual asset path is outside the indexed root.")
+    if not candidate.exists() or not candidate.is_file():
+        raise FileNotFoundError("Visual asset source file not found.")
+    return candidate
+
+
+def encode_visual_image(image_bytes: bytes) -> tuple[str, str]:
+    if Image is None:
+        return "image/png", base64.b64encode(image_bytes).decode("ascii")
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        prepared = resize_image_for_vision(image).convert("RGB")
+        output = io.BytesIO()
+        prepared.save(output, format="JPEG", quality=85, optimize=True)
+        return "image/jpeg", base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def resize_image_for_vision(image):
+    if Image is None:
+        return image
+
+    width, height = image.size
+    longest_edge = max(width, height)
+    pixel_count = width * height
+    if longest_edge <= VISION_MAX_IMAGE_EDGE and pixel_count <= VISION_MAX_IMAGE_PIXELS:
+        return image
+
+    edge_scale = VISION_MAX_IMAGE_EDGE / max(longest_edge, 1)
+    pixel_scale = (VISION_MAX_IMAGE_PIXELS / max(pixel_count, 1)) ** 0.5
+    scale = min(edge_scale, pixel_scale, 1.0)
+    if scale >= 1.0:
+        return image
+
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    resampling_module = getattr(Image, "Resampling", Image)
+    return image.resize(new_size, resampling_module.LANCZOS)
 
 
 def discover_files(root_path: Path, on_progress=None) -> list[Path]:
@@ -644,7 +795,12 @@ def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[st
     return chunks
 
 
-def build_chunk_payloads(normalized_text: str, structured_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_chunk_payloads(
+    normalized_text: str,
+    structured_chunks: list[dict[str, Any]],
+    visual_assets: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    visual_assets = visual_assets or []
     if structured_chunks:
         payloads: list[dict[str, Any]] = []
         for item in structured_chunks:
@@ -658,10 +814,39 @@ def build_chunk_payloads(normalized_text: str, structured_chunks: list[dict[str,
                 payload["sheetName"] = str(item["sheetName"])
             if item.get("rowNumber") is not None:
                 payload["rowNumber"] = int(item["rowNumber"])
+            if item.get("visualAssets"):
+                payload["visualAssets"] = list(item["visualAssets"])
             payloads.append(payload)
         if payloads:
             return payloads
-    return [{"text": chunk} for chunk in split_text(normalized_text)]
+    return [
+        {"text": chunk, **({"visualAssets": assets} if (assets := visual_assets_for_chunk(chunk, visual_assets)) else {})}
+        for chunk in split_text(normalized_text)
+    ]
+
+
+def normalize_visual_assets(assets: list[dict[str, Any]], relative_path: str) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        label = str(asset.get("label") or "").strip()
+        kind = str(asset.get("kind") or "").strip()
+        if not label or not kind:
+            continue
+        item = dict(asset)
+        item["relativePath"] = relative_path
+        normalized.append(item)
+    return normalized
+
+
+def visual_assets_for_chunk(chunk_text: str, visual_assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for asset in visual_assets:
+        anchor = str(asset.get("anchorText") or "").strip()
+        if anchor and anchor in chunk_text:
+            matched.append(asset)
+    return matched
 
 
 def finalize_index(
@@ -750,6 +935,8 @@ def reuse_previous_chunks(
             entry["sheetName"] = chunk["sheetName"]
         if chunk.get("rowNumber") is not None:
             entry["rowNumber"] = chunk["rowNumber"]
+        if chunk.get("visualAssets"):
+            entry["visualAssets"] = chunk["visualAssets"]
         if include_embeddings:
             vector = previous_vectors_by_hash.get(chunk.get("chunkHash"))
             if vector is None:
@@ -942,7 +1129,13 @@ def tokenize_query(text: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(token) > 1]
 
 
-def lexical_chunk_score(query_tokens: list[str], query_lower: str, text: str, relative_path: str) -> float:
+def lexical_chunk_score(
+    query_tokens: list[str],
+    query_lower: str,
+    text: str,
+    relative_path: str,
+    has_visual_assets: bool = False,
+) -> float:
     haystack = f"{relative_path}\n{text}".lower()
     if not haystack.strip():
         return 0.0
@@ -958,6 +1151,8 @@ def lexical_chunk_score(query_tokens: list[str], query_lower: str, text: str, re
             score += min(count, 8) * 0.65
         if token in path_lower:
             score += 1.5
+    if has_visual_assets and any(token in VISUAL_QUERY_TOKENS for token in query_tokens):
+        score += 3.0
     score += unique_matches * 0.9
     return score
 

@@ -105,6 +105,27 @@ export interface Citation {
   snippet: string;
 }
 
+export type VisualAssetKind = "pdf-page" | "pdf-image" | "docx-image" | "image-file";
+
+export interface VisualAssetReference {
+  kind: VisualAssetKind;
+  relativePath: string;
+  label: string;
+  anchorText?: string;
+  pageNumber?: number;
+  imageIndex?: number;
+  mediaPath?: string;
+  width?: number;
+  height?: number;
+  mimeType?: string;
+}
+
+export interface ResolvedVisualAsset {
+  asset: VisualAssetReference;
+  mimeType: string;
+  dataBase64: string;
+}
+
 export interface Thread {
   id: string;
   channelId: string;
@@ -168,6 +189,7 @@ export interface SearchResult {
   chunkType?: string;
   sheetName?: string;
   rowNumber?: number;
+  visualAssets?: VisualAssetReference[];
 }
 
 export interface WorkerSearchResponse {

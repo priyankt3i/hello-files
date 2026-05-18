@@ -33,17 +33,24 @@ def write_vector_store(index_path: Path, chunks: list[dict], embedding_dimension
     metadata_rows = []
     vectors = []
     for label, chunk in enumerate(chunks):
-        metadata_rows.append(
-            {
-                "label": label,
-                "chunkId": chunk["chunkId"],
-                "relativePath": chunk["relativePath"],
-                "snippet": chunk["snippet"],
-                "text": chunk["text"],
-                "chunkHash": chunk["chunkHash"],
-                "fileHash": chunk["fileHash"],
-            }
-        )
+        row = {
+            "label": label,
+            "chunkId": chunk["chunkId"],
+            "relativePath": chunk["relativePath"],
+            "snippet": chunk["snippet"],
+            "text": chunk["text"],
+            "chunkHash": chunk["chunkHash"],
+            "fileHash": chunk["fileHash"],
+        }
+        if chunk.get("chunkType"):
+            row["chunkType"] = chunk["chunkType"]
+        if chunk.get("sheetName"):
+            row["sheetName"] = chunk["sheetName"]
+        if chunk.get("rowNumber") is not None:
+            row["rowNumber"] = chunk["rowNumber"]
+        if chunk.get("visualAssets"):
+            row["visualAssets"] = chunk["visualAssets"]
+        metadata_rows.append(row)
         if "embedding" in chunk:
             vectors.append(chunk["embedding"])
 
