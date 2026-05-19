@@ -13,6 +13,7 @@ import type {
   RetrievalMode,
   Thread
 } from "@fschat/shared";
+import helloFilesLogo from "./assets/hello-files-logo.png";
 import { CitationsPanel, Field, FileRow, Modal, ProgressCard, StatusPill } from "./ui/common";
 import { SettingsModal } from "./ui/settings-modal";
 
@@ -917,9 +918,12 @@ function Sidebar({
 }) {
   return (
     <aside className="glass-panel shell-border min-h-0 min-w-0 flex flex-col rounded-2xl p-5 shadow-panel">
-      <div className="mb-5">
-        <div className="font-display text-2xl font-semibold tracking-tight text-paper">Hello Files</div>
-        <div className="text-sm text-mist/80">Local file workspace</div>
+      <div className="mb-5 flex min-w-0 items-center gap-3">
+        <img src={helloFilesLogo} alt="" className="h-12 w-12 shrink-0 rounded-lg object-contain" />
+        <div className="min-w-0">
+          <div className="font-display text-2xl font-semibold tracking-tight text-paper">Hello Files</div>
+          <div className="text-sm text-mist/80">Local file workspace</div>
+        </div>
       </div>
       <div className="mb-4 grid gap-2">
         <button className="rounded-lg bg-ember px-4 py-2 text-sm font-semibold text-ink" onClick={onOpenCreate}>Create Channel</button>
@@ -1684,6 +1688,7 @@ function ChatPanel({
   if (!selectedChannel) {
     return (
       <main className="glass-panel shell-border min-h-0 min-w-0 flex flex-col items-center justify-center rounded-[28px] p-5 text-center shadow-panel">
+        <img src={helloFilesLogo} alt="" className="mb-6 h-24 w-24 object-contain" />
         <div className="font-display text-5xl text-paper">Chat with your filesystem</div>
         <div className="mt-4 max-w-2xl text-sm leading-7 text-mist/75">Create a channel from a root folder, index its subdirectories, track gaps in knowledge, and chat against the stored index.</div>
       </main>
