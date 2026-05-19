@@ -22,3 +22,5 @@ This folder contains the first contributor-facing docs for Hello Files.
 - anyone debugging provider, indexing, or desktop-app behavior
 
 ## Scope
+
+These docs cover the local development workflow, packaging flow, provider behavior, indexing internals, vectorless retrieval, and troubleshooting notes for the current desktop app. They are not a hosted-service operations guide or a complete product manual yet.
