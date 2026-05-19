@@ -13,5 +13,8 @@
     "dist": "npm run dist -w @fschat/desktop",
     "typecheck": "npm run typecheck -w @fschat/shared && npm run typecheck -w @fschat/desktop",
     "python:check": "python -m py_compile services/indexer/fschat_indexer/*.py"
+  },
+  "devDependencies": {
+    "electron": "35.0.1"
   }
 }
