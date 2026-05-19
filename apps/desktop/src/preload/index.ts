@@ -22,6 +22,7 @@ import type {
 } from "@fschat/shared";
 
 const api = {
+  rendererReady: (): void => ipcRenderer.send("fschat:renderer-ready"),
   bootstrap: (): Promise<BootstrapResponse> => ipcRenderer.invoke("fschat:bootstrap"),
   selectRootFolder: () => ipcRenderer.invoke("fschat:select-root-folder"),
   inspectRootFolder: (rootPath: string) => ipcRenderer.invoke("fschat:inspect-root-folder", rootPath),

@@ -27,6 +27,7 @@ import type {
 declare global {
   interface Window {
     fsChat: {
+      rendererReady: () => void;
       bootstrap: () => Promise<BootstrapResponse>;
       selectRootFolder: () => Promise<string | null>;
       inspectRootFolder: (rootPath: string) => Promise<{

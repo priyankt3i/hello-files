@@ -17,6 +17,11 @@ files:
 extraResources:
   - from: build/hello-files-logo.ico
     to: hello-files-logo.ico
+  - from: src/renderer/assets
+    to: splash
+    filter:
+      - splash.html
+      - hello-files-splash.png
   - from: resources/indexer
     to: indexer
     filter:

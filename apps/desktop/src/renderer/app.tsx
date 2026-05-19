@@ -14,6 +14,7 @@ import type {
   Thread
 } from "@fschat/shared";
 import helloFilesLogo from "./assets/hello-files-logo.png";
+import helloFilesSplash from "./assets/hello-files-splash.png";
 import { CitationsPanel, Field, FileRow, Modal, ProgressCard, StatusPill } from "./ui/common";
 import { SettingsModal } from "./ui/settings-modal";
 
@@ -34,6 +35,8 @@ type PendingTurn = {
 type ThemeMode = "light" | "dark";
 
 export function App() {
+  const bootStartedRef = useRef(false);
+  const rendererReadySentRef = useRef(false);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [connections, setConnections] = useState<ProviderConnection[]>([]);
   const [providerDefaults, setProviderDefaults] = useState<ProviderDefaults[]>([]);
@@ -45,6 +48,7 @@ export function App() {
   const [pendingTurn, setPendingTurn] = useState<PendingTurn | null>(null);
   const [composer, setComposer] = useState("");
   const [busy, setBusy] = useState(false);
+  const [startupReady, setStartupReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progressByChannel, setProgressByChannel] = useState<Record<string, IndexProgressEvent>>({});
   const [createOpen, setCreateOpen] = useState(false);
@@ -69,7 +73,14 @@ export function App() {
   });
 
   useEffect(() => {
+    if (bootStartedRef.current) {
+      return;
+    }
+    bootStartedRef.current = true;
     void refreshBootstrap();
+  }, []);
+
+  useEffect(() => {
     const offProgress = window.fsChat.onIndexProgress((event) => {
       if (event.channelId === "global") {
         setError(event.message ?? "Background error.");
@@ -118,6 +129,14 @@ export function App() {
       offChannel();
     };
   }, [selectedChannelId]);
+
+  useEffect(() => {
+    if (!startupReady || rendererReadySentRef.current) {
+      return;
+    }
+    rendererReadySentRef.current = true;
+    window.fsChat.rendererReady();
+  }, [startupReady]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -184,6 +203,7 @@ export function App() {
       setError(toErrorMessage(caught));
     } finally {
       setBusy(false);
+      setStartupReady(true);
     }
   }
 
@@ -585,6 +605,10 @@ async function handleRevealCitationFile() {
     setError(toErrorMessage(caught));
   }
 }
+
+  if (!startupReady) {
+    return <SplashScreen />;
+  }
 
   return (
     <div className="h-screen overflow-hidden bg-shell-gradient text-paper">
@@ -1915,6 +1939,25 @@ function ThinkingBubble() {
         </span>
       </div>
     </div>
+  );
+}
+
+function SplashScreen() {
+  return (
+    <main className="relative h-screen w-screen overflow-hidden bg-shell-gradient text-paper">
+      <img src={helloFilesSplash} alt="Hello Files" className="absolute inset-0 h-full w-full object-cover" />
+      <div className="absolute inset-x-0 bottom-[clamp(2rem,9vh,4rem)] flex justify-center">
+        <div
+          className="relative h-[30px] w-[min(300px,68vw)] overflow-hidden border-[3px] border-paper bg-white/60"
+          role="status"
+          aria-label="Loading chats"
+          aria-live="polite"
+        >
+          <div className="splash-progress-fill absolute inset-y-0 left-0 w-[62%] bg-ember" aria-hidden="true" />
+          <div className="absolute inset-0 text-center text-[13px] font-bold leading-6 text-black">Loading Chats...</div>
+        </div>
+      </div>
+    </main>
   );
 }
 

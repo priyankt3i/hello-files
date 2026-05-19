@@ -225,3 +225,21 @@ textarea.rounded-\[24px\] {
   font-weight: 700;
   line-height: 1.25;
 }
+
+.splash-progress-fill {
+  animation: splash-progress 1.8s ease-in-out infinite;
+}
+
+@keyframes splash-progress {
+  0% {
+    transform: translateX(-70%);
+  }
+
+  55% {
+    transform: translateX(38%);
+  }
+
+  100% {
+    transform: translateX(112%);
+  }
+}
