@@ -80,6 +80,8 @@ export interface IndexedDocumentRecord {
   sectionHints: string[];
   contentHash?: string;
   structure?: IndexedDocumentStructure;
+  visualAssetSummary?: IndexedDocumentVisualSummary;
+  visualAssets?: VisualAssetReference[];
 }
 
 export interface IndexedSheetProfile {
@@ -106,6 +108,13 @@ export interface Citation {
 }
 
 export type VisualAssetKind = "pdf-page" | "pdf-image" | "docx-image" | "image-file";
+
+export interface IndexedDocumentVisualSummary {
+  total: number;
+  byKind: Partial<Record<VisualAssetKind, number>>;
+  pages: number[];
+  labels: string[];
+}
 
 export interface VisualAssetReference {
   kind: VisualAssetKind;

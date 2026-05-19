@@ -648,6 +648,7 @@ export class DesktopAppService {
     let contextNotes: string[] = [];
     let deterministicAssistantText: string | null = null;
     let visualAssets: ResolvedVisualAsset[] = [];
+    let documentManifestDocuments: IndexedDocumentRecord[] = [];
 
     if (channel.retrievalMode === "vector") {
       if (!channel.embeddingModelId) {
@@ -673,6 +674,7 @@ export class DesktopAppService {
       }
     } else {
       const documentManifest = await this.worker.listDocuments(channel.rootPath);
+      documentManifestDocuments = documentManifest.documents;
       const candidateDocuments = preselectManifestDocuments(documentManifest.documents, input.message, 24);
       const queryProfile = analyzeSpreadsheetQuery(input.message);
       let selectedDocumentIds = candidateDocuments.slice(0, 3).map((document) => document.documentId);
@@ -746,11 +748,24 @@ export class DesktopAppService {
       }
     }
 
+    if (isVisualInventoryQuery(input.message)) {
+      if (documentManifestDocuments.length === 0) {
+        try {
+          documentManifestDocuments = (await this.worker.listDocuments(channel.rootPath)).documents;
+        } catch {
+          documentManifestDocuments = [];
+        }
+      }
+      contextNotes = [...contextNotes, ...summarizeVisualInventoryNotes(documentManifestDocuments)];
+    }
+
     visualAssets = await this.resolveVisualContext(
       channel.rootPath,
       chatSelection.connection,
       chatSelection.model,
-      searchResponse.results
+      searchResponse.results,
+      documentManifestDocuments,
+      input.message
     );
 
     const now = new Date().toISOString();
@@ -938,7 +953,9 @@ export class DesktopAppService {
     rootPath: string,
     connection: ProviderConnection,
     model: ProviderModel,
-    results: SearchResult[]
+    results: SearchResult[],
+    documents: IndexedDocumentRecord[] = [],
+    query = ""
   ): Promise<ResolvedVisualAsset[]> {
     if (!model.supportsVision || !providerSupportsMultimodalInput(connection.provider)) {
       return [];
@@ -966,6 +983,31 @@ export class DesktopAppService {
       }
       if (selected.length >= 3) {
         break;
+      }
+    }
+
+    if (selected.length < 3 && isVisualInventoryQuery(query)) {
+      for (const document of documents) {
+        for (const asset of document.visualAssets ?? []) {
+          const key = [
+            asset.kind,
+            asset.relativePath,
+            asset.pageNumber ?? "",
+            asset.imageIndex ?? "",
+            asset.mediaPath ?? ""
+          ].join("|");
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          selected.push(asset);
+          if (selected.length >= 3) {
+            break;
+          }
+        }
+        if (selected.length >= 3) {
+          break;
+        }
       }
     }
 
@@ -1352,6 +1394,41 @@ function providerSupportsMultimodalInput(provider: ProviderConnection["provider"
   return ["openai", "openai-codex", "azure-openai", "anthropic", "google", "ollama"].includes(provider);
 }
 
+function isVisualInventoryQuery(query: string) {
+  return /\b(image|images|photo|photos|picture|pictures|chart|charts|graph|graphs|diagram|diagrams|figure|figures|screenshot|screenshots|visual|visuals)\b/i.test(query);
+}
+
+function summarizeVisualInventoryNotes(documents: IndexedDocumentRecord[]) {
+  const documentsWithVisuals = documents.filter((document) => (document.visualAssetSummary?.total ?? 0) > 0);
+  if (documentsWithVisuals.length === 0) {
+    return [
+      "Indexed visual inventory does not record embedded raster images for the selected documents. Vector-drawn charts or table-like layouts may still exist but are not confirmed by image metadata."
+    ];
+  }
+
+  const notes = [
+    "Indexed visual inventory is based on stored metadata for PDF pages/images, DOCX media, and standalone image files. It does not fully detect vector-drawn charts."
+  ];
+  for (const document of documentsWithVisuals.slice(0, 8)) {
+    const summary = document.visualAssetSummary;
+    if (!summary) {
+      continue;
+    }
+    const kindSummary = Object.entries(summary.byKind ?? {})
+      .map(([kind, count]) => `${count} ${kind}`)
+      .join(", ");
+    const pageNumbers = summary.pages ?? [];
+    const assetLabels = summary.labels ?? [];
+    const pages = pageNumbers.length > 0 ? ` Pages: ${pageNumbers.slice(0, 12).join(", ")}.` : "";
+    const labels = assetLabels.length > 0 ? ` Samples: ${assetLabels.slice(0, 5).join(" | ")}.` : "";
+    notes.push(`${document.relativePath}: ${summary.total} indexed visual asset(s)${kindSummary ? ` (${kindSummary})` : ""}.${pages}${labels}`);
+  }
+  if (documentsWithVisuals.length > 8) {
+    notes.push(`${documentsWithVisuals.length - 8} additional document(s) also contain indexed visual assets.`);
+  }
+  return notes;
+}
+
 function preselectManifestDocuments(documents: IndexedDocumentRecord[], query: string, limit: number) {
   const queryTokens = tokenizeManifestQuery(query);
   return [...documents]
@@ -1373,7 +1450,12 @@ function scoreManifestDocument(document: IndexedDocumentRecord, query: string, q
     document.structure?.kind === "spreadsheet"
       ? [...document.structure.sheetNames, ...document.structure.columnHints]
       : [];
-  const haystack = [document.relativePath, document.summary, ...document.sectionHints, ...structureHints].join(" ").toLowerCase();
+  const visualHints = [
+    ...(document.visualAssetSummary?.labels ?? []),
+    ...Object.keys(document.visualAssetSummary?.byKind ?? {}),
+    ...((document.visualAssets ?? []).map((asset) => asset.label))
+  ];
+  const haystack = [document.relativePath, document.summary, ...document.sectionHints, ...structureHints, ...visualHints].join(" ").toLowerCase();
   const lowerQuery = query.toLowerCase().trim();
   let score = 0;
   if (lowerQuery && haystack.includes(lowerQuery)) {
@@ -1387,6 +1469,9 @@ function scoreManifestDocument(document: IndexedDocumentRecord, query: string, q
     if (document.relativePath.toLowerCase().includes(token)) {
       score += 1.5;
     }
+  }
+  if ((document.visualAssetSummary?.total ?? 0) > 0 && isVisualInventoryQuery(query)) {
+    score += 4;
   }
   return score;
 }
