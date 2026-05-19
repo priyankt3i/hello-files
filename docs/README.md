@@ -1,5 +1,7 @@
 # Documentation
 
+![Hello Files banner](assets/hello-files-banner.png)
+
 This folder contains the first contributor-facing docs for Hello Files.
 
 ## Guides

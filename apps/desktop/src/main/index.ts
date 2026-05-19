@@ -1,4 +1,5 @@
 import type { BrowserWindow as ElectronBrowserWindow } from "electron";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,8 @@ const { app, BrowserWindow, ipcMain, shell } = require("electron") as typeof imp
 
 const APP_ID = "com.hellofiles.desktop";
 const APP_NAME = "Hello Files";
+const DEV_ICON_PATH = join(__dirname, "../../build/hello-files-logo.ico");
+const PACKAGED_ICON_PATH = join(process.resourcesPath, "hello-files-logo.ico");
 
 let mainWindow: ElectronBrowserWindow | null = null;
 let service: DesktopAppService | null = null;
@@ -28,6 +31,7 @@ async function createWindow() {
     title: APP_NAME,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#08111f",
+    icon: resolveWindowIcon(),
     webPreferences: {
       preload: join(__dirname, "../preload/index.cjs"),
       contextIsolation: true,
@@ -116,6 +120,11 @@ function attachNavigationGuards(window: ElectronBrowserWindow) {
     event.preventDefault();
     void openExternalUrl(url);
   });
+}
+
+function resolveWindowIcon() {
+  const iconPath = app.isPackaged ? PACKAGED_ICON_PATH : DEV_ICON_PATH;
+  return existsSync(iconPath) ? iconPath : undefined;
 }
 
 async function openExternalUrl(url: string) {

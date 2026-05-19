@@ -1,5 +1,7 @@
 # Hello Files
 
+![Hello Files banner](docs/assets/hello-files-banner.png)
+
 Windows-first desktop app for indexing local folders and chatting against their contents.
 
 The project combines an Electron desktop shell, a React UI, SQLite app state, and a Python indexing worker that extracts text, builds embeddings, and stores a local searchable index beside the source folder.
