@@ -181,7 +181,8 @@ export async function selectRelevantDocuments(args: {
         `Chunks: ${document.chunks}`,
         `Estimated tokens: ${document.tokenEstimate}`,
         `Summary: ${document.summary || "None"}`,
-        document.sectionHints.length > 0 ? `Section hints: ${document.sectionHints.join(" | ")}` : "Section hints: None"
+        document.sectionHints.length > 0 ? `Section hints: ${document.sectionHints.join(" | ")}` : "Section hints: None",
+        formatDocumentVisualSummary(document)
       ].join("\n")
     )
     .join("\n\n");
@@ -212,6 +213,19 @@ export async function selectRelevantDocuments(args: {
     reasoning: typeof parsed?.reasoning === "string" ? parsed.reasoning : undefined,
     rawResponse
   };
+}
+
+function formatDocumentVisualSummary(document: IndexedDocumentRecord) {
+  const summary = document.visualAssetSummary;
+  if (!summary || summary.total <= 0) {
+    return "Visual assets: None recorded";
+  }
+  const kinds = Object.entries(summary.byKind ?? {})
+    .map(([kind, count]) => `${kind}: ${count}`)
+    .join(", ");
+  const pages = summary.pages?.length ? ` Pages: ${summary.pages.slice(0, 12).join(", ")}.` : "";
+  const labels = summary.labels?.length ? ` Samples: ${summary.labels.slice(0, 6).join(" | ")}.` : "";
+  return `Visual assets: ${summary.total}${kinds ? ` (${kinds})` : ""}.${pages}${labels}`;
 }
 
 export async function discoverProviderModels(input: ConnectProviderInput): Promise<ProviderDiscovery> {

@@ -89,6 +89,8 @@ BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 VISION_MAX_IMAGE_EDGE = 1600
 VISION_MAX_IMAGE_PIXELS = 2_500_000
 VISUAL_QUERY_TOKENS = {"chart", "charts", "graph", "graphs", "image", "images", "diagram", "diagrams", "figure", "figures", "screenshot", "screenshots", "visual", "visuals"}
+MAX_DOCUMENT_VISUAL_ASSETS = 24
+MAX_VISUAL_SUMMARY_LABELS = 12
 
 
 def emit_response(request_id: str | None, ok: bool, payload: Any = None, error: str | None = None) -> None:
@@ -320,6 +322,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         if previous_document:
                             document_records.append(reused_document_record(previous_document, stat))
                         elif record.status == "indexed":
+                            reused_visual_assets = visual_assets_from_chunks(reused_chunks)
                             document_records.append(
                                 build_document_record(
                                     relative_path,
@@ -327,6 +330,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                                     stat,
                                     [chunk["text"] for chunk in reused_chunks],
                                     record.content_hash,
+                                    visual_assets=reused_visual_assets,
                                 )
                             )
                         if record.status == "indexed":
@@ -354,6 +358,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         if previous_document:
                             document_records.append(reused_document_record(previous_document, stat, content_hash=file_hash))
                         elif record.status == "indexed":
+                            reused_visual_assets = visual_assets_from_chunks(reused_chunks)
                             document_records.append(
                                 build_document_record(
                                     relative_path,
@@ -361,6 +366,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                                     stat,
                                     [chunk["text"] for chunk in reused_chunks],
                                     record.content_hash,
+                                    visual_assets=reused_visual_assets,
                                 )
                             )
                         if record.status == "indexed":
@@ -449,6 +455,7 @@ def build_index(channel_id: str, root_path: Path, options: dict, force: bool = F
                         [chunk["text"] for chunk in chunk_payloads],
                         file_hash,
                         structure=extracted.get("structure"),
+                        visual_assets=visual_assets,
                     )
                 )
                 record = FileRecord(
@@ -849,6 +856,32 @@ def visual_assets_for_chunk(chunk_text: str, visual_assets: list[dict[str, Any]]
     return matched
 
 
+def visual_assets_from_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    assets: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for chunk in chunks:
+        for asset in chunk.get("visualAssets") or []:
+            if not isinstance(asset, dict):
+                continue
+            key = visual_asset_key(asset)
+            if key in seen:
+                continue
+            seen.add(key)
+            assets.append(asset)
+    return assets
+
+
+def visual_asset_key(asset: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        asset.get("kind"),
+        asset.get("relativePath"),
+        asset.get("pageNumber"),
+        asset.get("imageIndex"),
+        asset.get("mediaPath"),
+        asset.get("label"),
+    )
+
+
 def finalize_index(
     temp_store: Path,
     root_path: Path,
@@ -1021,6 +1054,7 @@ def build_document_record(
     chunks: list[str],
     content_hash: str | None,
     structure: dict[str, Any] | None = None,
+    visual_assets: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     full_text = "\n\n".join(chunk for chunk in chunks if chunk.strip())
     summary = summarize_text(full_text)
@@ -1028,6 +1062,8 @@ def build_document_record(
     if structure and structure.get("kind") == "spreadsheet":
         summary = summarize_spreadsheet_structure(relative_path, structure)
         section_hints = extract_spreadsheet_section_hints(structure)
+    normalized_visual_assets = summarize_document_visual_assets(visual_assets or [])
+    visual_summary = build_visual_asset_summary(normalized_visual_assets)
     return {
         "documentId": relative_path,
         "relativePath": relative_path,
@@ -1040,6 +1076,8 @@ def build_document_record(
         "sectionHints": section_hints,
         "contentHash": content_hash,
         "structure": structure,
+        "visualAssetSummary": visual_summary,
+        "visualAssets": normalized_visual_assets[:MAX_DOCUMENT_VISUAL_ASSETS],
     }
 
 
@@ -1057,6 +1095,63 @@ def summarize_text(text: str, limit: int = 420) -> str:
     if len(compact) <= limit:
         return compact
     return f"{compact[: limit - 3].rstrip()}..."
+
+
+def summarize_document_visual_assets(visual_assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summarized: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for asset in visual_assets:
+        if not isinstance(asset, dict):
+            continue
+        key = visual_asset_key(asset)
+        if key in seen:
+            continue
+        seen.add(key)
+        item = {
+            key_name: asset[key_name]
+            for key_name in [
+                "kind",
+                "relativePath",
+                "label",
+                "anchorText",
+                "pageNumber",
+                "imageIndex",
+                "mediaPath",
+                "width",
+                "height",
+                "mimeType",
+            ]
+            if key_name in asset
+        }
+        summarized.append(item)
+    return summarized
+
+
+def build_visual_asset_summary(visual_assets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not visual_assets:
+        return None
+
+    by_kind: dict[str, int] = {}
+    pages: list[int] = []
+    labels: list[str] = []
+    for asset in visual_assets:
+        kind = str(asset.get("kind") or "").strip()
+        if kind:
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+        page_number = asset.get("pageNumber")
+        if isinstance(page_number, int) and page_number not in pages:
+            pages.append(page_number)
+        label = str(asset.get("label") or "").strip()
+        if label and label not in labels:
+            labels.append(label)
+
+    pages.sort()
+    return {
+        "total": len(visual_assets),
+        "byKind": by_kind,
+        "pages": pages,
+        "labels": labels[:MAX_VISUAL_SUMMARY_LABELS],
+    }
 
 
 def extract_section_hints(text: str, limit: int = 6) -> list[str]:

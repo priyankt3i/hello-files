@@ -168,7 +168,7 @@ Unknown extensions may still index if Python identifies them as text or image MI
 Each indexed folder gets a hidden `.fschat-index/` directory. Current index files include:
 
 - `manifest.json`: version, root path, retrieval mode, file list, counts, timestamps, and vector metadata when applicable
-- `documents.json`: file-level document summaries and structure hints
+- `documents.json`: file-level document summaries, structure hints, and visual inventory metadata
 - `chunk_metadata.jsonl`: chunk text, source path, hash, snippets, and optional spreadsheet row metadata
 - `vectors.npy`: normalized embedding matrix for vector indexes only
 
@@ -258,6 +258,8 @@ The answer generation path is intentionally separate from the retrieval path. Bo
 ## Selective Multimodal Enrichment
 
 Visual content still starts with OCR so image-heavy files remain searchable as text. During indexing, the worker also records lightweight visual asset references on chunks that came from rendered PDF pages, embedded PDF images, DOCX media, or standalone image files.
+
+The worker also aggregates a document-level visual inventory into `documents.json`. This records counts by visual asset kind, pages with indexed visuals, and sample labels. Inventory questions such as "are there images or charts in these documents?" can therefore be answered from metadata before any image is sent to a model. The inventory confirms embedded/raster visual assets; vector-drawn charts and table-like layouts may still need separate chart/layout detection.
 
 At answer time, the main process only resolves visual assets when all of these are true:
 
