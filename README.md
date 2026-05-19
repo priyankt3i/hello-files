@@ -79,6 +79,8 @@ For visual content, the worker also records lightweight image references for ren
 
 ## How It Works
 
+![Hello Files data flow](docs/assets/dataflow.png)
+
 1. Create a channel for a local folder.
 2. Choose a provider connection, chat model, and retrieval mode. Vector channels also choose an embedding model.
 3. The Python worker extracts text, chunks content, and writes either a vector index or vectorless manifest-first index.
