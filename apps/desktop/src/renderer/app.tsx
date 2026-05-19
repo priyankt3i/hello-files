@@ -687,7 +687,6 @@ async function handleRevealCitationFile() {
         <DeleteThreadToast
           title={deleteThreadPrompt.title}
           busy={busy}
-          offsetForError={Boolean(error)}
           onClose={() => setDeleteThreadPrompt(null)}
           onDelete={() => void handleDeleteThread(deleteThreadPrompt.threadId).finally(() => setDeleteThreadPrompt(null))}
         />
@@ -1445,36 +1444,34 @@ function DeleteChannelToast({
 function DeleteThreadToast({
   title,
   busy,
-  offsetForError,
   onClose,
   onDelete
 }: {
   title: string;
   busy: boolean;
-  offsetForError: boolean;
   onClose: () => void;
   onDelete: () => void;
 }) {
   return (
-    <div className={`fixed right-5 z-40 w-[min(30rem,calc(100vw-2rem))] ${offsetForError ? "bottom-52" : "bottom-5"}`}>
-      <div className="rounded-xl border border-coral/30 bg-coral/10 px-5 py-4 text-sm text-paper shadow-panel">
-        <div className="mb-2 flex items-start justify-between gap-3">
-          <div>
-            <div className="text-xs font-semibold uppercase text-coral">Delete session?</div>
-            <div className="mt-2 break-anywhere text-base font-medium text-paper">{title}</div>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+      <div className="glass-panel shell-border w-full max-w-md rounded-[28px] p-5 shadow-panel">
+        <div className="mb-4 flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-coral">Delete session?</div>
+            <div className="mt-3 break-anywhere text-lg font-semibold leading-7 text-paper">{title}</div>
+            <div className="mt-3 text-sm leading-6 text-mist/80">
+              This session already contains messages. Deleting it will remove the conversation history for this tab.
+            </div>
           </div>
+        </div>
+        <div className="mt-6 flex flex-wrap justify-end gap-3">
           <button
-            className="shrink-0 rounded-lg border border-white/10 px-3 py-1 text-xs text-mist disabled:opacity-40"
+            className="rounded-lg border border-white/10 px-4 py-2 text-sm text-mist disabled:opacity-40"
             onClick={onClose}
             disabled={busy}
           >
-            Keep session
+            Keep Session
           </button>
-        </div>
-        <div className="break-anywhere text-sm leading-6 text-mist">
-          This session already contains messages. Deleting it will remove the conversation history for this tab.
-        </div>
-        <div className="mt-4 flex flex-wrap gap-2">
           <button
             className="rounded-lg border border-coral/50 bg-coral/10 px-4 py-2 text-sm font-medium text-coral disabled:opacity-40"
             onClick={onDelete}
