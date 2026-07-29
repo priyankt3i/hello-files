@@ -49,6 +49,31 @@ import {
 } from "../providers/client";
 import { clearCodexCredentials, ensureCodexAuthorized } from "../providers/codex-client";
 import { PythonWorkerBridge } from "./python-worker";
+import {
+  DEFAULT_CHANNEL_SYSTEM_PROMPT,
+  buildEmbeddingModelKey,
+  deriveCancelledChannelStatus,
+  deriveChannelStatusFromFiles,
+  isInvalidIndexError,
+  isMissingProviderConfigurationError,
+  labelForProvider,
+  normalizeChannelSystemPrompt,
+  providerSupportsMultimodalInput,
+  resolveThreadTitle
+} from "./channel-helpers";
+import {
+  preselectManifestDocuments,
+  resolveSelectedDocumentIds,
+  summarizeVisualInventoryNotes,
+  isVisualInventoryQuery
+} from "./retrieval-helpers";
+import {
+  analyzeSpreadsheetQuery,
+  buildSpreadsheetCountAnswer,
+  isSpreadsheetDocument,
+  summarizeSpreadsheetSearch,
+  summarizeSpreadsheetStructureQuery
+} from "./spreadsheet-helpers";
 
 const SECRET_SERVICE = "hello-files";
 const LEGACY_SECRET_SERVICES = ["filesystem-rag-chat"];
@@ -63,12 +88,6 @@ const IGNORED_STDERR_PATTERNS = [
   "Conditional Formatting extension is not supported and will be removed",
   "openpyxl\\worksheet\\_reader.py:329: UserWarning"
 ];
-const DEFAULT_CHANNEL_SYSTEM_PROMPT = [
-  "You are Hello Files.",
-  "Answer using the indexed filesystem context when possible.",
-  "If the indexed context is insufficient, say what is missing.",
-  "Mention the source file paths inline when making claims."
-].join(" ");
 
 export class DesktopAppService {
   private db: AppDatabase;
@@ -1298,51 +1317,6 @@ export class DesktopAppService {
   }
 }
 
-function labelForProvider(provider: ConnectProviderInput["provider"]) {
-  switch (provider) {
-    case "openai":
-      return "OpenAI";
-    case "openai-codex":
-      return "OpenAI Codex";
-    case "azure-openai":
-      return "Azure OpenAI";
-    case "anthropic":
-      return "Anthropic";
-    case "google":
-      return "Google Gemini";
-    case "ollama":
-      return "Ollama";
-    default:
-      return provider;
-  }
-}
-
-function isInvalidIndexError(error: unknown) {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return error.message.includes("Unsupported index version") || error.message.includes("Index manifest not found");
-}
-
-function isMissingProviderConfigurationError(error: unknown) {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return (
-    error.message.includes("Provider model not found") ||
-    error.message.includes("Provider connection not found") ||
-    error.message.includes("Credentials missing for provider connection")
-  );
-}
-
-function buildEmbeddingModelKey(connection: ProviderConnection, model: ProviderModel) {
-  return [connection.provider, connection.baseUrl || "", connection.apiVersion || "", model.deployment || "", model.modelId].join("|");
-}
-
-function normalizeChannelSystemPrompt(value?: string | null, fallback = DEFAULT_CHANNEL_SYSTEM_PROMPT) {
-  const normalized = value?.trim();
-  return normalized && normalized.length > 0 ? normalized : fallback;
-}
 
 function resolveDatabasePath() {
   const userDataDir = app.getPath("userData");
@@ -1365,250 +1339,3 @@ function resolveDatabasePath() {
   return dbPath;
 }
 
-function resolveThreadTitle(value: string | null | undefined, sessionNumber: number) {
-  const normalized = value?.trim();
-  return normalized && normalized.length > 0 ? normalized : `Session ${sessionNumber}`;
-}
-
-function deriveChannelStatusFromFiles(files: IndexedFileRecord[]): Exclude<ChannelStatus, "indexing"> {
-  if (files.some((file) => file.status === "indexed")) {
-    return "ready";
-  }
-  if (files.some((file) => file.status === "failed")) {
-    return "error";
-  }
-  return "idle";
-}
-
-function deriveCancelledChannelStatus(files: IndexedFileRecord[]): Exclude<ChannelStatus, "indexing"> {
-  if (files.some((file) => file.status === "indexed")) {
-    return "stale";
-  }
-  if (files.some((file) => file.status === "failed")) {
-    return "error";
-  }
-  return "idle";
-}
-
-function providerSupportsMultimodalInput(provider: ProviderConnection["provider"]) {
-  return ["openai", "openai-codex", "azure-openai", "anthropic", "google", "ollama"].includes(provider);
-}
-
-function isVisualInventoryQuery(query: string) {
-  return /\b(image|images|photo|photos|picture|pictures|chart|charts|graph|graphs|diagram|diagrams|figure|figures|screenshot|screenshots|visual|visuals)\b/i.test(query);
-}
-
-function summarizeVisualInventoryNotes(documents: IndexedDocumentRecord[]) {
-  const documentsWithVisuals = documents.filter((document) => (document.visualAssetSummary?.total ?? 0) > 0);
-  if (documentsWithVisuals.length === 0) {
-    return [
-      "Indexed visual inventory does not record embedded raster images for the selected documents. Vector-drawn charts or table-like layouts may still exist but are not confirmed by image metadata."
-    ];
-  }
-
-  const notes = [
-    "Indexed visual inventory is based on stored metadata for PDF pages/images, DOCX media, and standalone image files. It does not fully detect vector-drawn charts."
-  ];
-  for (const document of documentsWithVisuals.slice(0, 8)) {
-    const summary = document.visualAssetSummary;
-    if (!summary) {
-      continue;
-    }
-    const kindSummary = Object.entries(summary.byKind ?? {})
-      .map(([kind, count]) => `${count} ${kind}`)
-      .join(", ");
-    const pageNumbers = summary.pages ?? [];
-    const assetLabels = summary.labels ?? [];
-    const pages = pageNumbers.length > 0 ? ` Pages: ${pageNumbers.slice(0, 12).join(", ")}.` : "";
-    const labels = assetLabels.length > 0 ? ` Samples: ${assetLabels.slice(0, 5).join(" | ")}.` : "";
-    notes.push(`${document.relativePath}: ${summary.total} indexed visual asset(s)${kindSummary ? ` (${kindSummary})` : ""}.${pages}${labels}`);
-  }
-  if (documentsWithVisuals.length > 8) {
-    notes.push(`${documentsWithVisuals.length - 8} additional document(s) also contain indexed visual assets.`);
-  }
-  return notes;
-}
-
-function preselectManifestDocuments(documents: IndexedDocumentRecord[], query: string, limit: number) {
-  const queryTokens = tokenizeManifestQuery(query);
-  return [...documents]
-    .sort((left, right) => {
-      const leftScore = scoreManifestDocument(left, query, queryTokens);
-      const rightScore = scoreManifestDocument(right, query, queryTokens);
-      return rightScore - leftScore;
-    })
-    .slice(0, limit);
-}
-
-function resolveSelectedDocumentIds(documentIds: string[], documents: IndexedDocumentRecord[]) {
-  const validIds = new Set(documents.map((document) => document.documentId));
-  return documentIds.filter((documentId) => validIds.has(documentId));
-}
-
-function scoreManifestDocument(document: IndexedDocumentRecord, query: string, queryTokens: string[]) {
-  const structureHints =
-    document.structure?.kind === "spreadsheet"
-      ? [...document.structure.sheetNames, ...document.structure.columnHints]
-      : [];
-  const visualHints = [
-    ...(document.visualAssetSummary?.labels ?? []),
-    ...Object.keys(document.visualAssetSummary?.byKind ?? {}),
-    ...((document.visualAssets ?? []).map((asset) => asset.label))
-  ];
-  const haystack = [document.relativePath, document.summary, ...document.sectionHints, ...structureHints, ...visualHints].join(" ").toLowerCase();
-  const lowerQuery = query.toLowerCase().trim();
-  let score = 0;
-  if (lowerQuery && haystack.includes(lowerQuery)) {
-    score += 5;
-  }
-  for (const token of new Set(queryTokens)) {
-    const count = haystack.split(token).length - 1;
-    if (count > 0) {
-      score += Math.min(count, 6);
-    }
-    if (document.relativePath.toLowerCase().includes(token)) {
-      score += 1.5;
-    }
-  }
-  if ((document.visualAssetSummary?.total ?? 0) > 0 && isVisualInventoryQuery(query)) {
-    score += 4;
-  }
-  return score;
-}
-
-function tokenizeManifestQuery(query: string) {
-  return query.toLowerCase().match(/[a-z0-9]+/g)?.filter((token) => token.length > 1) ?? [];
-}
-
-function isSpreadsheetDocument(document: IndexedDocumentRecord) {
-  return document.structure?.kind === "spreadsheet" || document.parser === "spreadsheet" || document.parser === "spreadsheet-xls";
-}
-
-function analyzeSpreadsheetQuery(query: string) {
-  const normalized = query.toLowerCase();
-  const wantsCount = /\b(count|how many|number of|total)\b/.test(normalized);
-  const wantsList = /\b(list|show all|find all|which rows|which entries)\b/.test(normalized);
-  const wantsFilter = /\b(rows where|entries where|matching rows|matching entries|filter|filtered)\b/.test(normalized);
-  const exhaustive = wantsCount || wantsList;
-  return { wantsCount, wantsList, wantsFilter, exhaustive };
-}
-
-function summarizeSpreadsheetSearch(
-  results: SearchResult[],
-  documents: IndexedDocumentRecord[],
-  queryProfile: ReturnType<typeof analyzeSpreadsheetQuery>
-) {
-  const rowResults = results.filter((item) => item.chunkType === "spreadsheet-row");
-  if (rowResults.length === 0) {
-    return null;
-  }
-
-  const sheetNames = [...new Set(rowResults.map((item) => item.sheetName).filter((item): item is string => Boolean(item)))];
-  const notes: string[] = [];
-  if (queryProfile.wantsCount) {
-    notes.push(
-      `Exact lexical row scan across ${documents.length} selected spreadsheet document(s) found ${rowResults.length} matching rows.` +
-        (sheetNames.length > 0 ? ` Matching sheets: ${sheetNames.slice(0, 6).join(", ")}.` : "")
-    );
-  } else if (queryProfile.wantsList || queryProfile.wantsFilter) {
-    notes.push(
-      `Lexical row scan found ${rowResults.length} matching rows across ${documents.length} selected spreadsheet document(s). Showing the most relevant matches below.` +
-        (sheetNames.length > 0 ? ` Matching sheets: ${sheetNames.slice(0, 6).join(", ")}.` : "")
-    );
-  }
-
-  return {
-    notes,
-    sampleResults: rowResults.slice(0, 24)
-  };
-}
-
-function summarizeSpreadsheetStructureQuery(
-  documents: IndexedDocumentRecord[],
-  query: string,
-  queryProfile: ReturnType<typeof analyzeSpreadsheetQuery>
-) {
-  const notes: string[] = [];
-  const queryTokens = tokenizeManifestQuery(query);
-  const matchedSheets: Array<{ document: IndexedDocumentRecord; name: string; rowCount: number; score: number }> = [];
-  const fallbackSheets: Array<{ document: IndexedDocumentRecord; name: string; rowCount: number }> = [];
-
-  for (const document of documents) {
-    if (document.structure?.kind !== "spreadsheet") {
-      continue;
-    }
-    for (const sheet of document.structure.sheets ?? []) {
-      fallbackSheets.push({ document, name: sheet.name, rowCount: sheet.rowCount });
-      const score = scoreSpreadsheetSheet(sheet.name, sheet.headerHints ?? [], queryTokens);
-      if (score > 0) {
-        matchedSheets.push({ document, name: sheet.name, rowCount: sheet.rowCount, score });
-      }
-    }
-  }
-
-  if (queryProfile.wantsCount) {
-    if (matchedSheets.length > 0) {
-      matchedSheets.sort((left, right) => right.score - left.score);
-      const totalRows = matchedSheets.reduce((sum, sheet) => sum + Math.max(sheet.rowCount, 0), 0);
-      const details = matchedSheets.slice(0, 6).map((sheet) => `${sheet.name} (${sheet.rowCount})`).join(", ");
-      notes.push(`Spreadsheet structure indicates ${totalRows} indexed data rows in sheets matching the question. ${details}`.trim());
-      return {
-        notes,
-        totalRows,
-        matchedByQuestion: true,
-        sheetDetails: matchedSheets.map((sheet) => ({
-          documentPath: sheet.document.relativePath,
-          sheetName: sheet.name,
-          rowCount: sheet.rowCount
-        }))
-      };
-    }
-
-    if (fallbackSheets.length > 0) {
-      const totalRows = fallbackSheets.reduce((sum, sheet) => sum + Math.max(sheet.rowCount, 0), 0);
-      const details = fallbackSheets.slice(0, 6).map((sheet) => `${sheet.name} (${sheet.rowCount})`).join(", ");
-      notes.push(`Spreadsheet structure indicates ${totalRows} indexed data rows across the selected spreadsheet sheets. ${details}`.trim());
-      return {
-        notes,
-        totalRows,
-        matchedByQuestion: false,
-        sheetDetails: fallbackSheets.map((sheet) => ({
-          documentPath: sheet.document.relativePath,
-          sheetName: sheet.name,
-          rowCount: sheet.rowCount
-        }))
-      };
-    }
-  }
-
-  return notes.length > 0 ? { notes } : null;
-}
-
-function scoreSpreadsheetSheet(sheetName: string, headerHints: string[], queryTokens: string[]) {
-  const haystack = [sheetName, ...headerHints].join(" ").toLowerCase();
-  let score = 0;
-  for (const token of new Set(queryTokens)) {
-    const count = haystack.split(token).length - 1;
-    if (count > 0) {
-      score += Math.min(count, 4);
-    }
-  }
-  return score;
-}
-
-function buildSpreadsheetCountAnswer(summary: NonNullable<ReturnType<typeof summarizeSpreadsheetStructureQuery>>) {
-  if (typeof summary.totalRows !== "number") {
-    return null;
-  }
-
-  const leadingSheets = (summary.sheetDetails ?? [])
-    .slice(0, 6)
-    .map((sheet) => `${sheet.sheetName} (${sheet.rowCount})`)
-    .join(", ");
-
-  if (summary.matchedByQuestion) {
-    return `Based on the indexed spreadsheet structure, there are ${summary.totalRows} data rows in sheets matching your question.${leadingSheets ? ` Matching sheets: ${leadingSheets}.` : ""}`;
-  }
-
-  return `Based on the indexed spreadsheet structure, there are ${summary.totalRows} data rows across the selected spreadsheet sheets.${leadingSheets ? ` Sheets counted: ${leadingSheets}.` : ""}`;
-}
