@@ -381,14 +381,18 @@ def extract_workbook_document(path: Path) -> dict[str, Any]:
         )
         workbook = load_workbook(path, read_only=True, data_only=True)
     sheets = []
-    for sheet in workbook.worksheets:
-        rows: list[tuple[int, list[str]]] = []
-        for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-            values = [normalize_spreadsheet_cell(value) for value in row]
-            trimmed = trim_trailing_empty_cells(values)
-            if any(trimmed):
-                rows.append((row_index, trimmed))
-        sheets.append({"title": sheet.title, "rows": rows})
+    try:
+        for sheet in workbook.worksheets:
+            rows: list[tuple[int, list[str]]] = []
+            for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                values = [normalize_spreadsheet_cell(value) for value in row]
+                trimmed = trim_trailing_empty_cells(values)
+                if any(trimmed):
+                    rows.append((row_index, trimmed))
+            sheets.append({"title": sheet.title, "rows": rows})
+    finally:
+        # A read-only workbook keeps the file open; on Windows that locks the .xlsx until garbage collection.
+        workbook.close()
     return build_spreadsheet_document(sheets, "spreadsheet")
 
 

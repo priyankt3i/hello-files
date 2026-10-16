@@ -67,6 +67,7 @@ from index_store import (
     temp_index_path,
     write_marker,
 )
+from spreadsheet_sql import SpreadsheetQueryError, spreadsheet_query, spreadsheet_schema
 from vector_store import clear_index_cache, cosine_scores, load_vector_matrix, quantize_vector
 
 try:
@@ -382,9 +383,52 @@ def handle_request(request: dict[str, Any]) -> None:
             emit_response(request_id, True, {"results": result})
             return
 
+        if method == "spreadsheet_schema":
+            root_path, index_path = request_paths(payload)
+            document_ids = payload.get("documentIds")
+            if document_ids is not None and not isinstance(document_ids, list):
+                raise ValueError("documentIds must be a list.")
+            submit_spreadsheet_request(request_id, lambda: spreadsheet_schema(root_path, index_path, document_ids))
+            return
+
+        if method == "spreadsheet_query":
+            root_path, index_path = request_paths(payload)
+            document_ids = payload.get("documentIds")
+            if not isinstance(document_ids, list):
+                raise SpreadsheetQueryError("documentIds must be a list of spreadsheet documents.")
+            sql, max_rows = payload.get("sql"), payload.get("maxRows")
+            submit_spreadsheet_request(
+                request_id, lambda: spreadsheet_query(root_path, index_path, document_ids, sql, max_rows)
+            )
+            return
+
         raise ValueError(f"Unknown method '{method}'.")
+    except SpreadsheetQueryError as exc:
+        # An expected, user-facing problem (bad SQL, unreadable sheet): no traceback.
+        emit_response(request_id, False, error=str(exc))
     except Exception as exc:
         emit_response(request_id, False, error=report_exception(exc))
+
+
+_SPREADSHEET_LOCK = threading.Lock()
+
+
+def submit_spreadsheet_request(request_id: str | None, task: Callable[[], Any]) -> None:
+    """Run a spreadsheet calculation off the protocol thread: parsing a large workbook can take
+    many seconds and must not block searches or cancel requests. Calculations run one at a time."""
+
+    def run() -> None:
+        try:
+            with _SPREADSHEET_LOCK:
+                result = task()
+            emit_response(request_id, True, result)
+        except SpreadsheetQueryError as exc:
+            # An expected, user-facing problem (bad SQL, unreadable sheet): no traceback.
+            emit_response(request_id, False, error=str(exc))
+        except Exception as exc:
+            emit_response(request_id, False, error=report_exception(exc))
+
+    threading.Thread(target=run, name="spreadsheet-calc", daemon=True).start()
 
 
 # ---------------------------------------------------------------------------

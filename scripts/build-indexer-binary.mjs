@@ -49,6 +49,8 @@ const pyInstallerArgs = [
   "index_store",
   "--hidden-import",
   "vector_store",
+  "--hidden-import",
+  "spreadsheet_sql",
   ...optionalAnalysisExcludes.flatMap((moduleName) => ["--exclude-module", moduleName]),
   "--distpath",
   targetDir,

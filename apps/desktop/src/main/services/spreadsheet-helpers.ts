@@ -1,8 +1,14 @@
 import type { IndexedDocumentRecord, SearchResult } from "@fschat/shared";
 import { tokenizeManifestQuery } from "./retrieval-helpers";
+import { detectAnalyticalIntent, isTabularDocumentPath } from "./spreadsheet-sql";
 
 export function isSpreadsheetDocument(document: IndexedDocumentRecord): boolean {
   return document.structure?.kind === "spreadsheet" || document.parser === "spreadsheet" || document.parser === "spreadsheet-xls";
+}
+
+/** Spreadsheets and CSVs: everything the worker can load as exact tables (a superset of isSpreadsheetDocument). */
+export function isTabularDocument(document: IndexedDocumentRecord): boolean {
+  return isSpreadsheetDocument(document) || isTabularDocumentPath(document.relativePath, document.parser);
 }
 
 export function analyzeSpreadsheetQuery(query: string) {
@@ -11,7 +17,16 @@ export function analyzeSpreadsheetQuery(query: string) {
   const wantsList = /\b(list|show all|find all|which rows|which entries)\b/.test(normalized);
   const wantsFilter = /\b(rows where|entries where|matching rows|matching entries|filter|filtered)\b/.test(normalized);
   const exhaustive = wantsCount || wantsList;
-  return { wantsCount, wantsList, wantsFilter, exhaustive, plainRowCount: wantsCount && !wantsFilter && isPlainRowCountQuery(normalized) };
+  // "analytical" questions (totals, averages, groups, trends, charts) are answered by an exact SQL calculation.
+  const analytical = detectAnalyticalIntent(query).analytical;
+  return {
+    wantsCount,
+    wantsList,
+    wantsFilter,
+    exhaustive,
+    analytical,
+    plainRowCount: wantsCount && !wantsFilter && isPlainRowCountQuery(normalized)
+  };
 }
 
 /**
@@ -21,11 +36,15 @@ export function analyzeSpreadsheetQuery(query: string) {
  */
 export function isPlainRowCountQuery(query: string): boolean {
   const normalized = query.toLowerCase();
-  if (!/(rows?|records?|entries|lines)/.test(normalized)) {
+  if (!/\b(rows?|records?|entries|lines)\b/.test(normalized)) {
     return false;
   }
-  return !/(where|with|whose|that|which|having|has|have|contain|contains|containing|equal|equals|greater|less|more than|fewer|above|below|after|before|between|over|under|exceed|exceeds|is|are not|status|named|called|marked)|[<>=]/.test(
-    normalized.replace(/how many (rows?|records?|entries|lines) (are|is) (there )?(in|on)/, "")
+  // Grouped, distinct or time-bucketed counts are calculations, not the sheet's size.
+  if (/\b(per|by|each|group|grouped|break ?down|distinct|unique|average|avg|sum|trend|over time|monthly|quarterly|weekly|yearly|daily|chart|plot)\b/.test(normalized)) {
+    return false;
+  }
+  return !/\b(where|with|whose|that|which|having|has|have|contain|contains|containing|equal|equals|greater|less|more than|fewer|above|below|after|before|between|over|under|exceed|exceeds|is|are not|status|named|called|marked)\b|[<>=]/.test(
+    normalized.replace(/\bhow many (rows?|records?|entries|lines) (are|is) (there )?(in|on)\b/, "")
   );
 }
 

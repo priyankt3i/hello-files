@@ -9,6 +9,7 @@ import type {
   BootstrapResponse,
   CancelIndexInput,
   Channel,
+  Citation,
   ChannelStatus,
   ChannelSnapshot,
   CreateThreadInput,
@@ -20,6 +21,7 @@ import type {
   IndexProgressEvent,
   IndexedFileRecord,
   Message,
+  MessageCalculation,
   OpenChannelFileInput,
   ProviderConnection,
   ProviderDefaults,
@@ -47,6 +49,7 @@ import {
   generateAssistantReply,
   pickDefaultChatModel,
   pickDefaultEmbeddingModel,
+  requestSpreadsheetSql,
   selectRelevantDocuments
 } from "../providers/client";
 import { clearCodexCredentials, ensureCodexAuthorized } from "../providers/codex-client";
@@ -74,9 +77,27 @@ import {
   analyzeSpreadsheetQuery,
   buildSpreadsheetCountAnswer,
   isSpreadsheetDocument,
+  isTabularDocument,
   summarizeSpreadsheetSearch,
   summarizeSpreadsheetStructureQuery
 } from "./spreadsheet-helpers";
+import {
+  buildCalculation,
+  buildCalculationCitations,
+  buildCalculationNote,
+  buildSqlGenerationPrompt,
+  parseSqlReply
+} from "./spreadsheet-sql";
+
+/** The exact-calculation outcome that sendMessage folds into the answer call and the stored message. */
+type ExactCalculation = {
+  contextNote: string;
+  citations: Citation[];
+  calculation: MessageCalculation;
+};
+
+/** At most this many spreadsheets are loaded for one calculation. */
+const MAX_CALCULATION_DOCUMENTS = 4;
 
 const SECRET_SERVICE = "hello-files";
 const LEGACY_SECRET_SERVICES = ["filesystem-rag-chat"];
@@ -800,8 +821,12 @@ export class DesktopAppService {
     let searchResponse;
     let contextNotes: string[] = [];
     let deterministicAssistantText: string | null = null;
+    let exactCalculation: ExactCalculation | null = null;
     let visualAssets: ResolvedVisualAsset[] = [];
     let documentManifestDocuments: IndexedDocumentRecord[] = [];
+    const queryProfile = analyzeSpreadsheetQuery(input.message);
+    const existingThread = input.threadId ? this.db.listThreads(channel.id).find((candidate) => candidate.id === input.threadId) : null;
+    const history = existingThread ? this.db.listMessages(existingThread.id) : [];
 
     if (channel.retrievalMode === "vector") {
       if (!channel.embeddingModelId) {
@@ -825,11 +850,33 @@ export class DesktopAppService {
         }
         throw error;
       }
+      if (queryProfile.analytical) {
+        // Semantic retrieval returns excerpts, not documents: pick the spreadsheets to calculate over.
+        try {
+          documentManifestDocuments = (await this.worker.listDocuments(channelIndexTarget(channel))).documents;
+        } catch {
+          documentManifestDocuments = [];
+        }
+        const retrievedPaths = new Set(searchResponse.results.map((item) => item.relativePath));
+        const spreadsheets = documentManifestDocuments.filter(isTabularDocument);
+        const retrieved = spreadsheets.filter((document) => retrievedPaths.has(document.relativePath));
+        const others = preselectManifestDocuments(
+          spreadsheets.filter((document) => !retrievedPaths.has(document.relativePath)),
+          input.message,
+          MAX_CALCULATION_DOCUMENTS
+        );
+        exactCalculation = await this.tryExactSpreadsheetCalculation({
+          channel,
+          chatSelection,
+          documents: [...retrieved, ...others].slice(0, MAX_CALCULATION_DOCUMENTS),
+          question: input.message,
+          history
+        });
+      }
     } else {
       const documentManifest = await this.worker.listDocuments(channelIndexTarget(channel));
       documentManifestDocuments = documentManifest.documents;
       const candidateDocuments = preselectManifestDocuments(documentManifest.documents, input.message, 24);
-      const queryProfile = analyzeSpreadsheetQuery(input.message);
       let selectedDocumentIds = candidateDocuments.slice(0, 3).map((document) => document.documentId);
 
       if (candidateDocuments.length > 0) {
@@ -867,7 +914,25 @@ export class DesktopAppService {
         }
         const selectedDocuments = candidateDocuments.filter((document) => selectedDocumentIds.includes(document.documentId));
         const spreadsheetDocuments = selectedDocuments.filter(isSpreadsheetDocument);
-        if (queryProfile.exhaustive && spreadsheetDocuments.length > 0) {
+        // Exact calculation: prefer the spreadsheets the model picked, else the best-matching candidates.
+        const selectedTabular = selectedDocuments.filter(isTabularDocument);
+        const calculationDocuments = (selectedTabular.length > 0 ? selectedTabular : candidateDocuments.filter(isTabularDocument)).slice(
+          0,
+          MAX_CALCULATION_DOCUMENTS
+        );
+        const calculate = () =>
+          this.tryExactSpreadsheetCalculation({
+            channel,
+            chatSelection,
+            documents: calculationDocuments,
+            question: input.message,
+            history
+          });
+        // Unfiltered "how many rows" questions keep the zero-LLM structure answer below.
+        if (queryProfile.analytical && !queryProfile.plainRowCount && calculationDocuments.length > 0) {
+          exactCalculation = await calculate();
+        }
+        if (!exactCalculation && queryProfile.exhaustive && spreadsheetDocuments.length > 0) {
           const spreadsheetStructureSummary = summarizeSpreadsheetStructureQuery(spreadsheetDocuments, input.message, queryProfile);
           if (spreadsheetStructureSummary) {
             contextNotes = [...contextNotes, ...spreadsheetStructureSummary.notes];
@@ -892,6 +957,10 @@ export class DesktopAppService {
               };
             }
           }
+        }
+        // A plain row count the structure could not answer (e.g. a CSV) still gets an exact count.
+        if (!exactCalculation && !deterministicAssistantText && queryProfile.analytical && queryProfile.plainRowCount && calculationDocuments.length > 0) {
+          exactCalculation = await calculate();
         }
       } catch (error) {
         if (isInvalidIndexError(error)) {
@@ -922,8 +991,6 @@ export class DesktopAppService {
     );
 
     const askedAt = new Date().toISOString();
-    const existingThread = input.threadId ? this.db.listThreads(channel.id).find((candidate) => candidate.id === input.threadId) : null;
-    const history = existingThread ? this.db.listMessages(existingThread.id) : [];
 
     // Ask the model before writing anything, so a failed call does not leave an unanswered question behind.
     const assistantText =
@@ -933,7 +1000,8 @@ export class DesktopAppService {
         model: chatSelection.model,
         secret: chatSelection.secret,
         searchResults: searchResponse.results,
-        contextNotes,
+        // The exact result goes first so it outranks the lexical row-scan notes.
+        contextNotes: exactCalculation ? [exactCalculation.contextNote, ...contextNotes] : contextNotes,
         visualAssets,
         history,
         userMessage: input.message,
@@ -967,12 +1035,16 @@ export class DesktopAppService {
       threadId: thread.id,
       role: "assistant",
       content: assistantText,
-      citations: searchResponse.results.map((item) => ({
-        relativePath: item.relativePath,
-        chunkId: item.chunkId,
-        score: item.score,
-        snippet: item.snippet
-      })),
+      citations: [
+        ...(exactCalculation?.citations ?? []),
+        ...searchResponse.results.map((item) => ({
+          relativePath: item.relativePath,
+          chunkId: item.chunkId,
+          score: item.score,
+          snippet: item.snippet
+        }))
+      ],
+      ...(exactCalculation ? { calculation: exactCalculation.calculation } : {}),
       createdAt: new Date().toISOString()
     };
 
@@ -988,6 +1060,89 @@ export class DesktopAppService {
       userMessage,
       assistantMessage
     };
+  }
+
+  /**
+   * Exact spreadsheet calculation for analytical questions ("total premium by state"):
+   *   1. the worker reports each sheet's tables, columns, types and sample rows (read from the original files);
+   *   2. ONE chat-model call turns the question plus that schema into a SELECT;
+   *   3. the worker runs it under a SQLite authorizer (read-only, whitelisted functions, 5 s limit, row cap);
+   *   4. on a SQL error, ONE repair call receives the error; after that we give up.
+   * Returns null whenever the question is not answerable this way or anything fails; the caller then falls back
+   * to the row-excerpt behaviour. This method never throws, and neither model-generated SQL nor errors
+   * are shown to the user except the sanitised `calculation` detail of a successful result.
+   *
+   * Data policy: the SQL-generation call sends table/column names, the values of low-cardinality text columns
+   * and 3 sample rows per sheet to the chat provider. It goes through the channel's chat model, which
+   * resolveModelSelection() already checked against the data policy, so it is the same trust boundary
+   * as the chat call (local-only channels keep this on the local Ollama endpoint).
+   */
+  private async tryExactSpreadsheetCalculation(args: {
+    channel: Channel;
+    chatSelection: { connection: ProviderConnection; model: ProviderModel; secret: { apiKey?: string } };
+    documents: IndexedDocumentRecord[];
+    question: string;
+    history: Message[];
+  }): Promise<ExactCalculation | null> {
+    const { channel, chatSelection, documents, question, history } = args;
+    const documentIds = documents.slice(0, MAX_CALCULATION_DOCUMENTS).map((document) => document.documentId);
+    if (documentIds.length === 0) {
+      return null;
+    }
+    const target = channelIndexTarget(channel);
+    try {
+      const schema = await this.worker.spreadsheetSchema(target, documentIds);
+      if (!schema.documents.some((document) => document.sheets.length > 0)) {
+        return null;
+      }
+      const recentQuestions = history.filter((message) => message.role === "user").map((message) => message.content);
+      const ask = async (repair?: { sql: string; error: string }) => {
+        const { systemPrompt, prompt } = buildSqlGenerationPrompt({ question, schema, recentQuestions, repair });
+        return parseSqlReply(
+          await requestSpreadsheetSql({
+            connection: chatSelection.connection,
+            model: chatSelection.model,
+            secret: chatSelection.secret,
+            systemPrompt,
+            prompt
+          })
+        );
+      };
+
+      let reply = await ask();
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (reply.kind === "none") {
+          return null;
+        }
+        let failure: { sql: string; error: string };
+        if (reply.kind === "sql") {
+          try {
+            const result = await this.worker.spreadsheetQuery(target, documentIds, reply.sql);
+            if (result.tablesUsed.length === 0) {
+              return null;
+            }
+            return {
+              contextNote: buildCalculationNote({ sql: reply.sql, result, schema }),
+              citations: buildCalculationCitations({ result, schema }),
+              calculation: buildCalculation({ sql: reply.sql, result })
+            };
+          } catch (error) {
+            failure = { sql: reply.sql, error: error instanceof Error ? error.message : String(error) };
+          }
+        } else {
+          failure = { sql: "(no valid query)", error: reply.reason };
+        }
+        if (attempt === 1) {
+          console.warn(`[hello-files] Exact calculation gave up after a repair attempt: ${failure.error}`);
+          return null;
+        }
+        reply = await ask(failure);
+      }
+      return null;
+    } catch (error) {
+      console.warn("[hello-files] Exact spreadsheet calculation unavailable:", error);
+      return null;
+    }
   }
 
   /**

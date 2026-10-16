@@ -399,6 +399,9 @@
   overflow-x: auto;
   color: rgb(var(--text));
 }
+.rich-figure {
+  cursor: zoom-in;
+}
 .rich-figure svg {
   max-width: 100%;
   height: auto;

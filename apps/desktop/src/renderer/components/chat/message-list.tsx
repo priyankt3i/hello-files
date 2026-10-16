@@ -182,6 +182,21 @@ function AssistantMessage({
       <AssistantAvatar />
       <div className="min-w-0 flex-1">
         <RichMarkdown content={message.content} />
+        {message.calculation ? (
+          <details className="mt-3 rounded-md border border-border bg-surface text-xs">
+            <summary className="cursor-pointer select-none px-2.5 py-1.5 font-medium text-text-muted hover:text-text">
+              How this was calculated
+            </summary>
+            <div className="space-y-2 border-t border-border px-2.5 py-2">
+              {message.calculation.sheets.length > 0 ? (
+                <div className="break-anywhere text-text-muted">Calculated from {message.calculation.sheets.join(", ")}.</div>
+              ) : null}
+              <pre className="max-h-60 overflow-auto whitespace-pre-wrap rounded-sm bg-surface-2 p-2 font-mono text-2xs text-text">
+                <code>{message.calculation.sql}</code>
+              </pre>
+            </div>
+          </details>
+        ) : null}
         {message.citations.length > 0 ? (
           <div className="mt-3 flex flex-wrap items-center gap-1.5">
             <span className="mr-0.5 text-2xs font-medium uppercase tracking-wide text-text-muted">Sources</span>

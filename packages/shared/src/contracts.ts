@@ -169,12 +169,22 @@ export interface Thread {
   updatedAt: string;
 }
 
+/** How an exact spreadsheet answer was computed. Shown in a collapsed "How this was calculated" detail. */
+export interface MessageCalculation {
+  /** The read-only SELECT that produced the numbers (sanitised, length-capped). */
+  sql: string;
+  /** Human-readable sheet labels the query read, e.g. "claims.xlsx > Claims". */
+  sheets: string[];
+}
+
 export interface Message {
   id: string;
   threadId: string;
   role: "user" | "assistant" | "system";
   content: string;
   citations: Citation[];
+  /** Present only when the answer's numbers were calculated exactly from spreadsheet data. */
+  calculation?: MessageCalculation;
   createdAt: string;
 }
 
@@ -234,6 +244,56 @@ export interface WorkerSearchResponse {
 
 export interface WorkerDocumentsResponse {
   documents: IndexedDocumentRecord[];
+}
+
+export type SpreadsheetColumnType = "integer" | "real" | "text" | "date";
+
+export interface SpreadsheetColumnSchema {
+  /** Sanitised SQL column name. */
+  name: string;
+  /** Header text as it appears in the sheet. */
+  original: string;
+  type: SpreadsheetColumnType;
+  nonNull: number;
+  /** Text companion column holding cells that could not be read as numbers/dates. */
+  rawColumn?: string;
+  coerceFailures?: number;
+  /** Distinct values of a low-cardinality text column. */
+  values?: string[];
+}
+
+export interface SpreadsheetSheetSchema {
+  sheet: string;
+  /** Stable, sanitised SQL table name. */
+  table: string;
+  rowCount: number;
+  headerRow: number | null;
+  columns: SpreadsheetColumnSchema[];
+  /** Up to 3 rows, aligned with `columns`. */
+  sampleRows: unknown[][];
+}
+
+export interface WorkerSpreadsheetSchemaResponse {
+  documents: Array<{ document: string; sheets: SpreadsheetSheetSchema[] }>;
+  skipped: Array<{ document: string; reason: string }>;
+  truncatedDocuments: boolean;
+}
+
+export interface SpreadsheetTableRef {
+  document: string;
+  sheet: string;
+  table: string;
+}
+
+export interface WorkerSpreadsheetQueryResponse {
+  columns: string[];
+  rows: unknown[][];
+  /** Rows returned (not the size of the full result when `truncated`). */
+  rowCount: number;
+  truncated: boolean;
+  tablesUsed: SpreadsheetTableRef[];
+  skipped?: Array<{ document: string; reason: string }>;
+  sql: string;
 }
 
 export interface ConnectProviderInput {

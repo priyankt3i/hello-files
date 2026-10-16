@@ -14,6 +14,8 @@ import type {
   ResolvedVisualAsset,
   SearchResult,
   VisualAssetReference,
+  WorkerSpreadsheetQueryResponse,
+  WorkerSpreadsheetSchemaResponse,
   WorkerBuildResponse,
   WorkerBuildOptions,
   WorkerEnvelope
@@ -81,6 +83,21 @@ export class PythonWorkerBridge extends EventEmitter {
 
   async search(target: IndexTarget, query: string, topK: number, options: WorkerBuildOptions): Promise<{ results: SearchResult[] }> {
     return this.request("search", { ...target, query, topK, options });
+  }
+
+  /** Tables, columns, inferred types and sample rows for spreadsheet documents (read from the original files). */
+  async spreadsheetSchema(target: IndexTarget, documentIds?: string[]): Promise<WorkerSpreadsheetSchemaResponse> {
+    return this.request("spreadsheet_schema", { ...target, documentIds });
+  }
+
+  /** Runs one read-only SELECT over the given spreadsheets. Rejects with a clean message when the SQL is invalid. */
+  async spreadsheetQuery(
+    target: IndexTarget,
+    documentIds: string[],
+    sql: string,
+    maxRows?: number
+  ): Promise<WorkerSpreadsheetQueryResponse> {
+    return this.request("spreadsheet_query", { ...target, documentIds, sql, maxRows });
   }
 
   private async request<TResponse>(method: string, payload: unknown): Promise<TResponse> {

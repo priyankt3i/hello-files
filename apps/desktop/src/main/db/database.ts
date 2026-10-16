@@ -147,6 +147,7 @@ export class AppDatabase {
     this.ensureColumn("channels", "last_index_stats_json", "TEXT");
     this.ensureColumn("channels", "last_error", "TEXT");
     this.ensureColumn("indexed_files", "content_hash", "TEXT");
+    this.ensureColumn("messages", "calculation_json", "TEXT");
 
     this.migrateLegacyProviderProfiles();
   }
@@ -685,8 +686,16 @@ export class AppDatabase {
 
   createMessage(message: Message) {
     this.db
-      .prepare("INSERT INTO messages (id, thread_id, role, content, citations_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(message.id, message.threadId, message.role, message.content, JSON.stringify(message.citations), message.createdAt);
+      .prepare("INSERT INTO messages (id, thread_id, role, content, citations_json, calculation_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(
+        message.id,
+        message.threadId,
+        message.role,
+        message.content,
+        JSON.stringify(message.citations),
+        message.calculation ? JSON.stringify(message.calculation) : null,
+        message.createdAt
+      );
   }
 
   replaceIndexedFiles(channelId: string, files: IndexedFileRecord[]) {
@@ -809,6 +818,7 @@ function mapMessage(row: any): Message {
     role: row.role,
     content: row.content,
     citations: JSON.parse(row.citations_json),
+    ...(row.calculation_json ? { calculation: JSON.parse(row.calculation_json) } : {}),
     createdAt: row.created_at
   };
 }

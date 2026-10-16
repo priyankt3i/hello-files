@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Code2, Copy, Download, Image as ImageIcon } from "lucide-react";
+import { Code2, Copy, Download, Image as ImageIcon, Maximize2 } from "lucide-react";
 import { describeMermaidError, mermaidTitle, renderMermaidSvg } from "../../lib/mermaid-render";
 import { copyText, exportFileName, savePng, saveSvg, serializeSvgElement } from "../../lib/rich-export";
 import { readToken, useNearViewport, useResolvedTheme } from "../../lib/rich-theme";
+import { DiagramViewer } from "./diagram-viewer";
 import { ActionButton, BlockToolbar, ToolbarButton } from "./toolbar";
 
 type State = { status: "pending" } | { status: "ok"; svg: string } | { status: "error"; error: string };
@@ -14,6 +15,7 @@ export function MermaidBlock({ source }: { source: string }) {
   const theme = useResolvedTheme();
   const [state, setState] = useState<State>({ status: "pending" });
   const [showSource, setShowSource] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const title = mermaidTitle(source);
 
   useEffect(() => {
@@ -36,6 +38,15 @@ export function MermaidBlock({ source }: { source: string }) {
     const svg = figureRef.current?.querySelector("svg");
     if (!svg) throw new Error("Diagram not rendered.");
     return serializeSvgElement(svg);
+  }
+
+  function saveCurrentSvg() {
+    return saveSvg(currentSvg().markup, exportFileName(title, "svg"));
+  }
+
+  async function saveCurrentPng() {
+    const { markup, width, height } = currentSvg();
+    await savePng(markup, width, height, readToken("--surface"), exportFileName(title, "png"));
   }
 
   if (state.status === "error") {
@@ -67,21 +78,9 @@ export function MermaidBlock({ source }: { source: string }) {
         <ActionButton icon={Copy} label="Copy source" doneLabel="Copied" action={() => copyText(source)} />
         {ready ? (
           <>
-            <ActionButton
-              icon={Download}
-              label="Save SVG"
-              doneLabel="Saved"
-              action={() => saveSvg(currentSvg().markup, exportFileName(title, "svg"))}
-            />
-            <ActionButton
-              icon={ImageIcon}
-              label="Save PNG"
-              doneLabel="Saved"
-              action={async () => {
-                const { markup, width, height } = currentSvg();
-                await savePng(markup, width, height, readToken("--surface"), exportFileName(title, "png"));
-              }}
-            />
+            <ToolbarButton icon={Maximize2} label="Expand" onClick={() => setExpanded(true)} />
+            <ActionButton icon={Download} label="Save SVG" doneLabel="Saved" action={saveCurrentSvg} />
+            <ActionButton icon={ImageIcon} label="Save PNG" doneLabel="Saved" action={saveCurrentPng} />
           </>
         ) : null}
       </BlockToolbar>
@@ -90,7 +89,9 @@ export function MermaidBlock({ source }: { source: string }) {
           ref={figureRef}
           className="rich-figure"
           role="img"
-          aria-label={title}
+          aria-label={`${title}. Double-click to enlarge.`}
+          title="Double-click to enlarge"
+          onDoubleClick={() => setExpanded(true)}
           // Safe: produced by mermaid (securityLevel "strict") and sanitised with DOMPurify's SVG profile.
           dangerouslySetInnerHTML={{ __html: state.svg }}
         />
@@ -99,6 +100,15 @@ export function MermaidBlock({ source }: { source: string }) {
           Rendering diagram…
         </div>
       )}
+      {expanded && ready ? (
+        <DiagramViewer
+          svgMarkup={state.svg}
+          title={title}
+          onClose={() => setExpanded(false)}
+          onSaveSvg={saveCurrentSvg}
+          onSavePng={saveCurrentPng}
+        />
+      ) : null}
       {showSource ? (
         <pre className="border-t border-border">
           <code>{source}</code>

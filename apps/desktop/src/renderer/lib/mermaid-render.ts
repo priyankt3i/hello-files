@@ -53,11 +53,12 @@ export function renderMermaidSvg(source: string, theme: ResolvedTheme): Promise<
     try {
       await mermaid.parse(source);
       const { svg } = await mermaid.render(id, source);
-      return purify.sanitize(svg, {
+      const clean = purify.sanitize(svg, {
         USE_PROFILES: { svg: true, svgFilters: true },
         FORBID_TAGS: ["a", "image", "foreignObject", "script"],
         FORBID_ATTR: ["href", "xlink:href"]
       });
+      return fitViewBoxToContent(clean);
     } finally {
       // Mermaid can leave its temporary container behind when a render fails.
       document.getElementById(id)?.remove();
@@ -67,6 +68,41 @@ export function renderMermaidSvg(source: string, theme: ResolvedTheme): Promise<
   const result = queue.then(task, task);
   queue = result.catch(() => undefined);
   return result;
+}
+
+const VIEWBOX_PADDING = 12;
+
+/**
+ * Mermaid sizes the SVG from its own text measurements, which can come out smaller than what is actually drawn
+ * (different fonts at measure time), clipping the right/bottom edge of larger diagrams and leaving blank margins on the
+ * other sides. This measures the real drawn bounds in an off-screen container and sets the viewBox to match.
+ * Falls back to the original markup if anything can't be measured.
+ */
+export function fitViewBoxToContent(markup: string): string {
+  const container = document.createElement("div");
+  container.setAttribute("aria-hidden", "true");
+  container.style.cssText = "position:absolute;left:-100000px;top:0;visibility:hidden;pointer-events:none";
+  try {
+    container.innerHTML = markup;
+    document.body.appendChild(container);
+    const svg = container.querySelector("svg");
+    if (!svg) return markup;
+    const box = svg.getBBox();
+    if (![box.x, box.y, box.width, box.height].every(Number.isFinite) || box.width <= 0 || box.height <= 0) return markup;
+    const x = box.x - VIEWBOX_PADDING;
+    const y = box.y - VIEWBOX_PADDING;
+    const width = box.width + VIEWBOX_PADDING * 2;
+    const height = box.height + VIEWBOX_PADDING * 2;
+    const round = (value: number) => Math.round(value * 100) / 100;
+    svg.setAttribute("viewBox", `${round(x)} ${round(y)} ${round(width)} ${round(height)}`);
+    // Mermaid also caps the responsive width with an inline max-width that must track the new width.
+    svg.style.maxWidth = `${round(width)}px`;
+    return svg.outerHTML;
+  } catch {
+    return markup;
+  } finally {
+    container.remove();
+  }
 }
 
 export function describeMermaidError(error: unknown): string {

@@ -89,7 +89,7 @@ export const ANSWER_FORMAT_GUIDE = [
   "For numeric comparisons or trends you may add a ```chart block containing only JSON of this exact shape:",
   '{"type":"bar|stacked-bar|line|area|pie|scatter","title":"...","x":{"label":"...","values":["A","B"]},"series":[{"name":"...","values":[1,2]}],"unit":"...","source":"file names"}',
   "Each series has one plain JSON number (or null) per x value: no quotes, commas or units inside numbers; pie uses one series; scatter needs numeric x values; at most 8 series.",
-  "Only chart numbers that appear in the indexed context or context notes; never invent, estimate or extrapolate data, and always fill \"source\" with the file names. If there are only a few numbers, use a table or a sentence instead of a chart.",
+  "Only chart numbers that appear in the indexed context or context notes (an exact calculation result in the notes is the preferred source); never invent, estimate or extrapolate data, and always fill \"source\" with the file names (plus sheet names for spreadsheets). If there are only a few numbers, use a table or a sentence instead of a chart.",
   "Diagrams and charts supplement the written answer; keep citing sources inline."
 ].join("\n");
 
@@ -179,6 +179,23 @@ export async function generateAssistantReply(args: {
   } catch {
     return callProviderText(request);
   }
+}
+
+/**
+ * One small chat call that turns a question plus a spreadsheet schema into a SQL query (see
+ * services/spreadsheet-sql.ts for the prompts). The prompt carries table/column names, the values
+ * of low-cardinality text columns and 3 sample rows per sheet. It uses the channel's own chat model,
+ * so it sits inside the same trust boundary (and the same local-only data policy) as the chat call itself.
+ */
+export async function requestSpreadsheetSql(args: {
+  connection: ProviderConnection;
+  model: ProviderModel;
+  secret: ProviderSecret;
+  systemPrompt: string;
+  prompt: string;
+}): Promise<string> {
+  const { connection, model, secret, systemPrompt, prompt } = args;
+  return callProviderText({ connection, model, secret, systemPrompt, history: [], prompt });
 }
 
 export async function selectRelevantDocuments(args: {
