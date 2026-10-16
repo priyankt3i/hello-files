@@ -2,7 +2,7 @@ import { useDeferredValue, useMemo, useState, type ReactNode } from "react";
 import { CircleAlert, CircleCheck, CircleMinus, FolderSearch, History, RefreshCw, Search } from "lucide-react";
 import type { Channel, IndexedFileRecord } from "@fschat/shared";
 import { cx, formatDateTime, formatNumber, formatRelativeTime } from "../../lib/format";
-import { useAppStore } from "../../state/store";
+import { isBackgroundSyncing, useAppStore } from "../../state/store";
 import { Button } from "../ui/button";
 import { EmptyState } from "../ui/feedback";
 import { SegmentedControl } from "../ui/form";
@@ -22,6 +22,7 @@ export function FilesView({ channel }: { channel: Channel }) {
   const failed = snapshot?.failedFiles ?? [];
   const skipped = snapshot?.skippedFiles ?? [];
   const indexing = channel.status === "indexing";
+  const syncing = isBackgroundSyncing(state, channel.id);
   const stats = channel.lastIndexStats;
 
   const files = useMemo(() => {
@@ -35,7 +36,7 @@ export function FilesView({ channel }: { channel: Channel }) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden px-6 py-5">
-      {indexing ? <IndexProgressPanel channel={channel} progress={state.progressByChannel[channel.id]} /> : null}
+      {indexing || syncing ? <IndexProgressPanel channel={channel} progress={state.progressByChannel[channel.id]} /> : null}
 
       <div className="grid shrink-0 grid-cols-2 gap-3 lg:grid-cols-4">
         <SummaryCard icon={CircleCheck} tone="text-success" label="Indexed" value={formatNumber(indexed.length)} onClick={() => setFilter("indexed")} />

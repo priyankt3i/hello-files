@@ -47,49 +47,55 @@ export function IndexProgressPanel({ channel, progress }: { channel: Channel; pr
         ) : null}
       </div>
 
-      {confirmCancel ? (
-        <Modal
-          title="Stop indexing?"
-          size="sm"
-          onClose={() => setConfirmCancel(false)}
-          footer={
-            <>
-              <Button onClick={() => setConfirmCancel(false)} data-autofocus>
-                Keep indexing
-              </Button>
-              <Button
-                variant="danger"
-                onClick={() => {
-                  setConfirmCancel(false);
-                  void actions.cancelIndex(channel.id, false);
-                }}
-              >
-                Discard this run
-              </Button>
-              <Button
-                variant="primary"
-                onClick={() => {
-                  setConfirmCancel(false);
-                  void actions.cancelIndex(channel.id, true);
-                }}
-              >
-                Keep what's done
-              </Button>
-            </>
-          }
-        >
-          <div className="space-y-2 text-sm leading-relaxed text-text-muted">
-            <p>
-              <span className="font-medium text-text">Keep what's done</span> makes the files indexed so far searchable now.
-              The rest will be picked up on the next sync.
-            </p>
-            <p>
-              <span className="font-medium text-text">Discard this run</span> throws away this run's progress and keeps the
-              previous index, if there was one.
-            </p>
-          </div>
-        </Modal>
-      ) : null}
+      {confirmCancel ? <StopIndexingDialog channelId={channel.id} onClose={() => setConfirmCancel(false)} /> : null}
     </div>
+  );
+}
+
+/** Confirm dialog for stopping a running index or sync (manual runs and background syncs). */
+export function StopIndexingDialog({ channelId, onClose }: { channelId: string; onClose: () => void }) {
+  const { actions } = useAppStore();
+  return (
+    <Modal
+      title="Stop indexing?"
+      size="sm"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose} data-autofocus>
+            Keep indexing
+          </Button>
+          <Button
+            variant="danger"
+            onClick={() => {
+              onClose();
+              void actions.cancelIndex(channelId, false);
+            }}
+          >
+            Discard this run
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => {
+              onClose();
+              void actions.cancelIndex(channelId, true);
+            }}
+          >
+            Keep what's done
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-2 text-sm leading-relaxed text-text-muted">
+        <p>
+          <span className="font-medium text-text">Keep what's done</span> makes the files indexed so far searchable now.
+          The rest will be picked up on the next sync.
+        </p>
+        <p>
+          <span className="font-medium text-text">Discard this run</span> throws away this run's progress and keeps the
+          previous index, if there was one.
+        </p>
+      </div>
+    </Modal>
   );
 }

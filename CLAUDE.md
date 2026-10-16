@@ -77,13 +77,17 @@ If `npm install` fails while rebuilding `better-sqlite3`, install with `--ignore
 - Also skips dot-files, files with the Windows hidden or system attribute, `~$*` lock files, `Thumbs.db` and `desktop.ini`.
 - Symlinked folders are never followed. Symlinked files are indexed only when their target is inside the root.
 - Per-channel `excludePatterns` are gitignore-style globs; a pattern without `/` matches at any depth.
+- `!pattern` entries are include filters (`!*.pdf` for a file type, `!*FR*` for a name). They form a union: with any present, a file is kept when it matches a chosen type **or** a chosen name; exclude rules still win. The Python worker and `folder-watcher.ts` (`shouldIgnore`) must agree on this.
 - Files over `maxFileSizeMb`, 50 by default (`DEFAULT_MAX_FILE_SIZE_MB`), get status `skipped`.
+- Files left out by the user's rules (exclude globs, `!` include filters, anything under an excluded folder) are also stored as `skipped`, with `errorReason` such as "Excluded by rule: *.log", so the Files tab lists them (capped at `MAX_RULE_SKIPPED_FILES`, 10,000). The built-in skips above are never listed. The header shows `indexed / (indexed + failed + skipped) files`.
 
 **Builds.**
 - `build_index` (the "Sync now" button and auto-sync) always rescans. Per-file updates run in one SQLite transaction, so a sync costs time proportional to what changed.
   - It reuses files whose size and mtime, or else sha256, are unchanged, together with their chunks and their vectors. Vectors are reused only when `embeddingModelKey` matches.
   - It returns `stats {added, updated, removed, unchanged, failed, skipped}`.
   - If nothing changed, nothing is written.
+  - Progress (`totalFiles`/`processedFiles`/done/failed) counts only files that need extraction, not unchanged or skipped ones. Changing filters excludes files by deleting their chunks (no re-reading); only newly included files are extracted.
+  - Any running build can be stopped from the header's Stop button or the Files tab, including background syncs (`StopIndexingDialog`).
 - `rebuild_index` is a full rebuild from scratch into `.tmp`, then a directory swap.
 - Extraction runs in a spawn-based process pool (`min(4, cpus-1)`, override with `maxWorkers`), used only when the estimated work is large enough. Workers' stdin/stdout are redirected before spawning, because on Windows they otherwise inherit the protocol pipe; a regression test covers this. The frozen app uses a higher threshold than dev because workers take about 5 s to spawn there.
 - Cancelling with retain-partial keeps the files already processed plus previous entries for the unprocessed files that are unchanged on disk.

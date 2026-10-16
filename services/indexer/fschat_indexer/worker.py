@@ -30,7 +30,7 @@ from uuid import uuid4
 import numpy as np
 
 from embeddings import EmbeddingError, batched, embed_query, embed_texts
-from extractors import dedupe_preserve_order, extract_document, load_fitz, normalize_text
+from extractors import dedupe_preserve_order, extract_document, fs_path, load_fitz, normalize_text
 from index_store import (
     CHUNK_COLUMNS,
     INDEX_DIR_NAME,
@@ -127,6 +127,9 @@ def default_max_workers() -> int:
 @dataclass
 class BuildOptions:
     exclude_patterns: list[re.Pattern[str]] = field(default_factory=list)
+    exclude_labels: list[str] = field(default_factory=list)  # the user's rule text, parallel to exclude_patterns
+    include_ext_patterns: list[re.Pattern[str]] = field(default_factory=list)
+    include_name_patterns: list[re.Pattern[str]] = field(default_factory=list)
     max_file_size_mb: float = 50
     include_hidden: bool = False
     max_workers: int = field(default_factory=default_max_workers)
@@ -141,6 +144,7 @@ class DiscoveredFile:
     path: Path
     relative_path: str
     stat: Any = None  # stat result captured during discovery (None: stat on demand)
+    skip_reason: str | None = None  # set when the user's rules leave this file out of the index
 
 
 @dataclass
@@ -148,7 +152,7 @@ class FilePlan:
     """What the build has to do for one discovered file, decided from a cheap stat."""
 
     item: DiscoveredFile
-    kind: str  # "unchanged" | "work" | "too_large" | "stat_error" | "vanished"
+    kind: str  # "unchanged" | "work" | "too_large" | "excluded" | "stat_error" | "vanished"
     previous: dict[str, Any] | None
     size: int = 0
     mtime: float = 0.0
@@ -171,6 +175,8 @@ class BuildState:
         self.seen_paths.add(record.relative_path)
         self.stats[category] += 1
         self.record_count += 1
+        if category in {"unchanged", "skipped"}:
+            return  # progress counts only files that were actually (re)processed
         if record.status == STATUS_INDEXED:
             self.success_count += 1
         elif record.status == STATUS_FAILED:
@@ -224,7 +230,7 @@ MAX_WORKERS_LIMIT = 32
 PARALLEL_MIN_ESTIMATED_SECONDS = 10.0 if getattr(sys, "frozen", False) else 3.0
 HEAVY_EXTRACTION_SECONDS = 0.5
 HEAVY_EXTENSIONS = {
-    ".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".xls",
+    ".pdf", ".docx", ".docm", ".doc", ".rtf", ".xlsx", ".xlsm", ".xls",
     ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
 }
 PREFETCH_PER_WORKER = 2
@@ -232,8 +238,10 @@ BATCH_MAX_FILES = 32
 BATCH_MAX_SECONDS = 0.25
 MAX_POOL_RESTARTS = 3
 POOL_START_TIMEOUT_SECONDS = 30.0
+BATCH_TIMEOUT_SECONDS = 90.0
 FUTURE_POLL_SECONDS = 0.2
 UNCHANGED_PROGRESS_INTERVAL = 0.1
+MAX_RULE_SKIPPED_FILES = 10_000  # cap on files listed as skipped by the user's rules
 IGNORED_DIR_NAMES = {
     name.lower()
     for name in {
@@ -596,16 +604,24 @@ def build_index(
         if in_place:
             prepare_in_place_vectors(ctx, previous_meta)
         progress(ctx, "discovering", 0, message="Scanning folder for supported files.")
+        rule_skipped: list[DiscoveredFile] = []
         discovered = discover_files(
             root_path,
             build_options,
             index_path=index_dir,
             on_progress=lambda count: progress(ctx, "discovering", count, message=f"Scanning folder... discovered {count} files so far."),
+            skipped=rule_skipped,
         )
+        if rule_skipped:
+            # Files the user's rules leave out are still listed (as skipped, with the reason).
+            discovered = sorted(discovered + rule_skipped, key=lambda item: item.relative_path.lower())
         ctx.total_files = len(discovered)
         progress(ctx, "discovering", ctx.total_files, message=f"Discovered {ctx.total_files} files.")
 
         plans = plan_files(ctx, discovered)
+        # Progress covers only the files that need work, so a sync after a settings change that
+        # leaves most files untouched reads "3 of 3", not "1,800 of 1,800".
+        ctx.total_files = sum(1 for plan in plans if plan.kind == "work")
         pipeline = ExtractionPipeline(plans, build_options.max_workers, lambda relative_path: check_cancel(ctx, relative_path))
         last_quiet_progress = 0.0
         for position, plan in enumerate(plans):
@@ -613,7 +629,7 @@ def build_index(
             ensure_not_cancelled(
                 channel_id, ctx.total_files, state.processed_files, state.success_count, state.failure_count, relative_path
             )
-            quiet = plan.kind == "unchanged"
+            quiet = plan.kind in {"unchanged", "excluded", "too_large"}
             now = time.monotonic()
             if not quiet or now - last_quiet_progress >= UNCHANGED_PROGRESS_INTERVAL:
                 progress(ctx, "extracting", ctx.total_files, currentFile=relative_path)
@@ -623,7 +639,8 @@ def build_index(
                 record, category = outcome
                 state.add(record, category)
                 emit_file_update({"channelId": channel_id, "file": record.to_dict()})
-            state.processed_files += 1
+            if plan.kind == "work":
+                state.processed_files += 1
             if not quiet or now - last_quiet_progress >= UNCHANGED_PROGRESS_INTERVAL:
                 progress(ctx, "extracting", ctx.total_files, currentFile=relative_path)
                 last_quiet_progress = now
@@ -776,6 +793,9 @@ def plan_files(ctx: BuildContext, discovered: list[DiscoveredFile]) -> list[File
             plans.append(FilePlan(item, "stat_error", previous_file, error=f"Could not read file: {exc.strerror or exc}"))
             continue
         size, mtime = stat_result.st_size, stat_result.st_mtime
+        if item.skip_reason:
+            plans.append(FilePlan(item, "excluded", previous_file, size, mtime, error=item.skip_reason))
+            continue
         if size > max_bytes:
             plans.append(FilePlan(item, "too_large", previous_file, size, mtime))
             continue
@@ -805,7 +825,11 @@ def apply_plan(ctx: BuildContext, plan: FilePlan, result: dict[str, Any] | None)
         record = failed_record(relative_path, None, None, plan.error or "Could not read file.")
         writer.replace_file(record.to_dict(), None, [], existed=ctx.in_place and previous_file is not None)
         return record, "failed"
-    if plan.kind == "too_large":
+    if plan.kind in {"too_large", "excluded"}:
+        if plan.kind == "excluded":
+            reason = plan.error
+        else:
+            reason = f"Larger than {format_megabytes(ctx.build_options.max_file_size_mb)} MB limit"
         record = FileRecord(
             relative_path=relative_path,
             status=STATUS_SKIPPED,
@@ -813,7 +837,7 @@ def apply_plan(ctx: BuildContext, plan: FilePlan, result: dict[str, Any] | None)
             mtime=plan.mtime,
             parser="skipped",
             chunks=0,
-            error_reason=f"Larger than {format_megabytes(ctx.build_options.max_file_size_mb)} MB limit",
+            error_reason=reason,
         )
         if not ctx.in_place or previous_file != record.to_dict():
             writer.replace_file(record.to_dict(), None, [], existed=ctx.in_place and previous_file is not None)
@@ -913,13 +937,18 @@ def embed_chunk_entries(ctx: BuildContext, entries: list[dict[str, Any]], relati
     """Set `quantized` on every entry: reuse a stored vector with the same chunk hash
     (same model; old rows of a changed file are still readable at this point), else embed."""
     pending: list[dict[str, Any]] = []
+    duplicates_by_hash: dict[str, list[dict[str, Any]]] = {}
     for entry in entries:
         if entry.get("quantized") is not None:
             continue
-        cached = ctx.writer.vector_for_hash(entry["chunkHash"])
+        chunk_hash = entry["chunkHash"]
+        cached = ctx.writer.vector_for_hash(chunk_hash)
         if cached is not None:
             entry["quantized"] = cached
+        elif chunk_hash in duplicates_by_hash:
+            duplicates_by_hash[chunk_hash].append(entry)
         else:
+            duplicates_by_hash[chunk_hash] = [entry]
             pending.append(entry)
     if not pending:
         return
@@ -952,7 +981,8 @@ def embed_chunk_entries(ctx: BuildContext, entries: list[dict[str, Any]], relati
                     f"{ctx.embedding_dimension}; rebuild required."
                 )
             ctx.embedding_dimension = quantized[0]
-            item["quantized"] = quantized
+            for target in duplicates_by_hash.get(item["chunkHash"], (item,)):
+                target["quantized"] = quantized
         done += len(batch)
 
 
@@ -961,7 +991,7 @@ def carry_over_unprocessed(ctx: BuildContext, remaining: list[DiscoveredFile]) -
     are unchanged on disk. Everything else from the previous index is removed afterwards."""
     state = ctx.state
     for item in remaining:
-        if item.relative_path in state.seen_paths:
+        if item.relative_path in state.seen_paths or item.skip_reason:
             continue
         previous_file = ctx.previous_files.get(item.relative_path)
         if not previous_file or previous_file.get("status") not in {STATUS_INDEXED, STATUS_FAILED, STATUS_SKIPPED}:
@@ -1080,7 +1110,7 @@ def extract_file_task(path_str: str, relative_path: str, previous_hash: str | No
         )
         return {"kind": "extracted", "hash": file_hash, "parser": parser_name, "chunks": chunk_payloads, "document": document}
     except FileNotFoundError:
-        if not path.exists():
+        if not fs_path(path).exists():
             return {"kind": "vanished"}
         return {"kind": "failed", "hash": file_hash, "reason": "File could not be opened."}
     except Exception as exc:
@@ -1235,6 +1265,8 @@ class ExtractionPipeline:
                 return extract_file_task(*self._task_args(index))
             number = self.batch_of[index]
             future = self.futures.pop(number)
+            batch_started = time.monotonic()
+            timed_out = False
             try:
                 while True:
                     try:
@@ -1244,16 +1276,21 @@ class ExtractionPipeline:
                         self.check_cancel(self.plans[index].item.relative_path)
                         if self._failed_to_start():
                             raise BrokenProcessPool("No extraction worker process started.")
+                        if time.monotonic() - batch_started >= BATCH_TIMEOUT_SECONDS:
+                            timed_out = True
+                            raise BrokenProcessPool("Extraction batch timed out.")
             except BrokenProcessPool:
-                # A worker died (for example a native crash in a parser). Restart the pool and
-                # retry: a batch is split into single files, and a single file that takes the
-                # pool down twice is marked failed.
+                # A worker died or hung. Restart the pool and retry: a batch is split into
+                # single files, and a single file that times out or takes the pool down twice
+                # is marked failed.
                 self._restart()
                 batch = self.batches[number]
                 if len(batch) > 1:
                     singles = [self._add_batch([item]) for item in batch]
                     self.pending.extendleft(reversed(singles))
                     continue
+                if timed_out:
+                    return {"kind": "failed", "hash": None, "reason": "Timed out while extracting file."}
                 self.crashes[number] = self.crashes.get(number, 0) + 1
                 if self.crashes[number] >= 2:
                     return {"kind": "failed", "hash": None, "reason": "The extraction process crashed on this file."}
@@ -1305,8 +1342,30 @@ class ExtractionPipeline:
 # ---------------------------------------------------------------------------
 
 
+INCLUDE_EXT_GLOB_RE = re.compile(r"^(?:\*\*/)?\*\.([A-Za-z0-9_-]+)$")
+
+
 def resolve_build_options(options: dict[str, Any]) -> BuildOptions:
-    patterns = [str(item).strip() for item in options.get("excludePatterns") or [] if str(item).strip()]
+    raw_patterns = [str(item).strip() for item in options.get("excludePatterns") or [] if str(item).strip()]
+    exclude_patterns: list[re.Pattern[str]] = []
+    exclude_labels: list[str] = []
+    include_ext_patterns: list[re.Pattern[str]] = []
+    include_name_patterns: list[re.Pattern[str]] = []
+    for raw in raw_patterns:
+        if raw.startswith("#"):
+            continue
+        if raw.startswith("!"):
+            inner = raw[1:].strip()
+            if not inner:
+                continue
+            compiled = compile_glob(inner)
+            if INCLUDE_EXT_GLOB_RE.match(inner.replace("\\", "/").lstrip("/")):
+                include_ext_patterns.append(compiled)
+            else:
+                include_name_patterns.append(compiled)
+        else:
+            exclude_patterns.append(compile_glob(raw))
+            exclude_labels.append(raw)
     max_size = options.get("maxFileSizeMb")
     try:
         max_size_mb = float(max_size) if max_size is not None else DEFAULT_MAX_FILE_SIZE_MB
@@ -1319,7 +1378,10 @@ def resolve_build_options(options: dict[str, Any]) -> BuildOptions:
     except (TypeError, ValueError):
         max_workers = default_max_workers()
     return BuildOptions(
-        exclude_patterns=[compile_glob(pattern) for pattern in patterns],
+        exclude_patterns=exclude_patterns,
+        exclude_labels=exclude_labels,
+        include_ext_patterns=include_ext_patterns,
+        include_name_patterns=include_name_patterns,
         max_file_size_mb=max_size_mb,
         include_hidden=bool(options.get("includeHidden", False)),
         max_workers=min(max(max_workers, 1), MAX_WORKERS_LIMIT),
@@ -1372,6 +1434,38 @@ def matches_exclude(relative_posix: str, patterns: list[re.Pattern[str]]) -> boo
     return any(pattern.match(relative_posix) for pattern in patterns)
 
 
+def first_matching_label(relative_posix: str, patterns: list[re.Pattern[str]], labels: list[str]) -> str | None:
+    for pattern, label in zip(patterns, labels):
+        if pattern.match(relative_posix):
+            return label
+    return None
+
+
+def directory_exclusion_reason(relative_posix: str, options: BuildOptions) -> str | None:
+    for candidate in (relative_posix, relative_posix + "/"):
+        label = first_matching_label(candidate, options.exclude_patterns, options.exclude_labels)
+        if label:
+            return f"Excluded by rule: {label}"
+    return None
+
+
+def file_exclusion_reason(relative_posix: str, options: BuildOptions) -> str | None:
+    label = first_matching_label(relative_posix, options.exclude_patterns, options.exclude_labels)
+    if label:
+        return f"Excluded by rule: {label}"
+    # Include filters are a union: a file is kept when it matches a chosen type OR a chosen name.
+    if options.include_ext_patterns or options.include_name_patterns:
+        if not matches_exclude(relative_posix, options.include_ext_patterns) and not matches_exclude(
+            relative_posix, options.include_name_patterns
+        ):
+            if options.include_ext_patterns and options.include_name_patterns:
+                return "Not one of the file types or names to include"
+            if options.include_ext_patterns:
+                return "Not one of the file types to include"
+            return "Name doesn't match the include filters"
+    return None
+
+
 def path_key(path: Path | str) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
 
@@ -1386,10 +1480,15 @@ def discover_files(
     build_options: BuildOptions | None = None,
     index_path: Path | None = None,
     on_progress: Callable[[int], Any] | None = None,
+    skipped: list[DiscoveredFile] | None = None,
 ) -> list[DiscoveredFile]:
     """Walk the root with os.scandir. On Windows the directory listing already carries
     size/mtime/attributes, so a no-change sync needs no per-file system calls; the stat is
-    kept on each DiscoveredFile and reused by the build planner."""
+    kept on each DiscoveredFile and reused by the build planner.
+
+    Files the user's exclude/include rules leave out (including everything under an excluded
+    folder) are not returned; when `skipped` is given they are appended to it with a
+    `skip_reason`. Built-in ignores (.git, hidden files, ...) are never listed."""
     options = build_options or BuildOptions(max_file_size_mb=DEFAULT_MAX_FILE_SIZE_MB)
     root = Path(os.path.abspath(root_path))
     try:
@@ -1406,15 +1505,15 @@ def discover_files(
                 pass
 
     files: list[DiscoveredFile] = []
-    stack: list[tuple[str, str]] = [(str(root), "")]
+    stack: list[tuple[str, str, str | None]] = [(str(root), "", None)]
     while stack:
-        directory, relative_dir = stack.pop()
+        directory, relative_dir, dir_reason = stack.pop()
         try:
             with os.scandir(directory) as iterator:
                 entries = list(iterator)
         except OSError:
             continue
-        subdirectories: list[tuple[str, str]] = []
+        subdirectories: list[tuple[str, str, str | None]] = []
         for entry in entries:
             name = entry.name
             relative = os.path.join(relative_dir, name) if relative_dir else name
@@ -1424,11 +1523,19 @@ def discover_files(
             except OSError:
                 continue
             if is_dir:
-                if not should_skip_directory_entry(entry, name, relative_posix, options, excluded_dirs):
-                    subdirectories.append((entry.path, relative))
+                if not should_skip_directory_entry(entry, name, options, excluded_dirs):
+                    reason = dir_reason or directory_exclusion_reason(relative_posix, options)
+                    # An excluded folder is walked only to list its files as skipped.
+                    if reason is None or skipped is not None:
+                        subdirectories.append((entry.path, relative, reason))
                 continue
-            stat_result = file_entry_stat(entry, name, relative_posix, options, resolved_root)
+            stat_result = file_entry_stat(entry, name, options, resolved_root)
             if stat_result is None:
+                continue
+            reason = dir_reason or file_exclusion_reason(relative_posix, options)
+            if reason is not None:
+                if skipped is not None and len(skipped) < MAX_RULE_SKIPPED_FILES:
+                    skipped.append(DiscoveredFile(path=Path(entry.path), relative_path=relative, stat=stat_result, skip_reason=reason))
                 continue
             files.append(DiscoveredFile(path=Path(entry.path), relative_path=relative, stat=stat_result))
             if on_progress and (len(files) == 1 or len(files) % 25 == 0):
@@ -1450,7 +1557,6 @@ def entry_is_link_or_junction(entry: os.DirEntry, lstat_result) -> bool:
 def should_skip_directory_entry(
     entry: os.DirEntry,
     name: str,
-    relative_posix: str,
     options: BuildOptions,
     excluded_dirs: set[str],
 ) -> bool:
@@ -1459,8 +1565,6 @@ def should_skip_directory_entry(
     if not options.include_hidden and name.startswith("."):
         return True
     if excluded_dirs and path_key(entry.path) in excluded_dirs:
-        return True
-    if matches_exclude(relative_posix, options.exclude_patterns) or matches_exclude(relative_posix + "/", options.exclude_patterns):
         return True
     try:
         lstat_result = entry.stat(follow_symlinks=False)
@@ -1474,14 +1578,14 @@ def should_skip_directory_entry(
     return False
 
 
-def file_entry_stat(entry: os.DirEntry, name: str, relative_posix: str, options: BuildOptions, resolved_root: Path):
-    """The file's stat result if it should be indexed, else None."""
+def file_entry_stat(entry: os.DirEntry, name: str, options: BuildOptions, resolved_root: Path):
+    """The file's stat result, or None for files that are never listed (built-in ignores,
+    hidden files, unreadable entries, links leaving the root). The user's rules are applied
+    by the caller."""
     lowered = name.lower()
     if lowered in IGNORED_FILE_NAMES or name.startswith("~$"):
         return None
     if not options.include_hidden and name.startswith("."):
-        return None
-    if matches_exclude(relative_posix, options.exclude_patterns):
         return None
     try:
         lstat_result = entry.stat(follow_symlinks=False)
@@ -1992,7 +2096,7 @@ def visual_asset_key(asset: dict[str, Any]) -> tuple[Any, ...]:
 
 def hash_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with fs_path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -2046,7 +2150,9 @@ def embedding_batch_size(embedding_provider: dict[str, Any]) -> int:
     provider = str(embedding_provider.get("provider") or "").lower()
     if provider == "ollama":
         return 1
-    return 24
+    if provider == "google":
+        return 100
+    return 96
 
 
 def resolve_retrieval_options(options: dict[str, Any]) -> dict[str, Any]:

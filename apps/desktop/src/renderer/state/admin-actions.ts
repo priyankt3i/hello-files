@@ -98,7 +98,7 @@ export function createAdminActions({ get, patch, toast }: ActionDeps, core: Core
     patch({ newKbOpen: false });
     await core.refreshBootstrap({ selectChannelId: snapshot.channel.id });
     patch({ tab: "files" });
-    if (snapshot.channel.status !== "ready") {
+    if (snapshot.channel.status !== "ready" || (input.excludePatterns?.length ?? 0) > 0) {
       runIndexJob(snapshot.channel.id, false);
     }
   }

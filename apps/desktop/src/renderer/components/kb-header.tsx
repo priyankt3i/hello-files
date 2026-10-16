@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, Square } from "lucide-react";
 import type { Channel } from "@fschat/shared";
 import { PHASE_LABEL, cx, formatDateTime, formatNumber, formatRelativeTime, isTerminalPhase } from "../lib/format";
 import { describeChannelDestination } from "../lib/providers";
@@ -7,6 +7,7 @@ import { isBackgroundSyncing, useAppStore } from "../state/store";
 import type { KbTab } from "../state/types";
 import { DataDestinationBadge, StatusBadge } from "./badges";
 import { Button } from "./ui/button";
+import { StopIndexingDialog } from "./files/index-progress";
 import { Callout } from "./ui/feedback";
 
 /** Re-renders periodically so relative times ("3 min ago") stay fresh. */
@@ -33,7 +34,13 @@ export function KnowledgeBaseHeader({ channel }: { channel: Channel }) {
   const progress = state.progressByChannel[channel.id];
   const indexing = channel.status === "indexing";
   const syncing = isBackgroundSyncing(state, channel.id);
-  const fileCount = snapshot?.indexedFiles.length ?? null;
+  const [confirmStop, setConfirmStop] = useState(false);
+  const cancelling = Boolean(state.cancellingByChannel[channel.id]);
+  const running = (indexing && Boolean(progress) && !isTerminalPhase(progress.phase)) || syncing || (indexing && !progress);
+  const indexedCount = snapshot?.indexedFiles.length ?? null;
+  const failedCount = snapshot?.failedFiles.length ?? 0;
+  const skippedCount = snapshot?.skippedFiles.length ?? 0;
+  const discoveredCount = indexedCount === null ? null : indexedCount + failedCount + skippedCount;
 
   return (
     <header className="shrink-0 border-b border-border bg-surface">
@@ -43,7 +50,15 @@ export function KnowledgeBaseHeader({ channel }: { channel: Channel }) {
         </h1>
         <StatusBadge status={channel.status} />
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-text-muted">
-          {fileCount !== null ? <span>{formatNumber(fileCount)} files</span> : null}
+          {indexedCount !== null && discoveredCount !== null ? (
+            discoveredCount > indexedCount ? (
+              <span title={`${formatNumber(indexedCount)} indexed · ${formatNumber(failedCount)} failed · ${formatNumber(skippedCount)} skipped`}>
+                {formatNumber(indexedCount)} / {formatNumber(discoveredCount)} files
+              </span>
+            ) : (
+              <span>{formatNumber(indexedCount)} files</span>
+            )
+          ) : null}
           {channel.lastIndexedAt ? (
             <span title={formatDateTime(channel.lastIndexedAt)}>Synced {formatRelativeTime(channel.lastIndexedAt, now)}</span>
           ) : null}
@@ -59,6 +74,17 @@ export function KnowledgeBaseHeader({ channel }: { channel: Channel }) {
               <RefreshCw className="h-3 w-3 animate-spin" aria-hidden />
               Syncing…
             </span>
+          ) : null}
+          {running ? (
+            <button
+              type="button"
+              onClick={() => setConfirmStop(true)}
+              disabled={cancelling}
+              className="inline-flex items-center gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-text hover:bg-surface-2 disabled:opacity-60"
+            >
+              <Square className="h-3 w-3" aria-hidden />
+              {cancelling ? "Stopping…" : indexing ? "Stop" : "Stop sync"}
+            </button>
           ) : null}
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -92,6 +118,7 @@ export function KnowledgeBaseHeader({ channel }: { channel: Channel }) {
           );
         })}
       </div>
+      {confirmStop ? <StopIndexingDialog channelId={channel.id} onClose={() => setConfirmStop(false)} /> : null}
     </header>
   );
 }

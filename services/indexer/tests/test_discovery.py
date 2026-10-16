@@ -92,3 +92,85 @@ def test_glob_basename_pattern_matches_any_depth():
     assert pattern.match("a.log")
     assert pattern.match("x/y/a.LOG")
     assert not pattern.match("x/a.log.txt")
+
+
+def test_include_and_exclude_file_filters(tree):
+    root = tree(
+        {
+            "FR_01_Order.docx": "x",
+            "sub/FR_02_Invoice.pdf": "x",
+            "sub/FR_03_Test Result_Summary.docx": "x",
+            "sub/FR_04_Notes.md": "x",
+            "sub/General_Spec.docx": "x",
+            "sub/Data.xlsx": "x",
+        }
+    )
+    # 1. Exclude *Test Result* and *.md
+    assert discovered(root, excludePatterns=["*Test Result*", "*.md"]) == [
+        "FR_01_Order.docx",
+        "sub/Data.xlsx",
+        "sub/FR_02_Invoice.pdf",
+        "sub/General_Spec.docx",
+    ]
+    # 2. Include file types docx, pdf, xlsx OR filenames containing FR (a union), while excluding *Test Result* and *.md
+    assert discovered(
+        root,
+        excludePatterns=[
+            "!*.doc",
+            "!*.docx",
+            "!*.pdf",
+            "!*.xlsx",
+            "!*FR*",
+            "*Test Result*",
+            "*.md",
+        ],
+    ) == [
+        "FR_01_Order.docx",
+        "sub/Data.xlsx",
+        "sub/FR_02_Invoice.pdf",
+        "sub/General_Spec.docx",
+    ]
+
+
+def test_include_types_and_names_combine(tree):
+    root = tree({"A.java": "x", "b.docx": "x", "c.txt": "x", "FR_notes.txt": "x", "sub/D.java": "x"})
+    assert discovered(root, excludePatterns=["!*.docx", "!*.java"]) == ["A.java", "b.docx", "sub/D.java"]
+    assert discovered(root, excludePatterns=["!*.docx", "!*FR*"]) == ["FR_notes.txt", "b.docx"]
+    assert discovered(root, excludePatterns=["!*.docx", "!*.java", "!*FR*"]) == [
+        "A.java",
+        "FR_notes.txt",
+        "b.docx",
+        "sub/D.java",
+    ]
+
+
+def test_rule_excluded_files_are_reported_with_reason(tree):
+    root = tree(
+        {
+            "keep.txt": "x",
+            "a.tmp": "x",
+            "archive/old/c.txt": "x",
+            "archive/.git/config": "x",
+            "node_modules/pkg/index.js": "x",
+            "notes.md": "x",
+        }
+    )
+    skipped: list = []
+    options = worker.resolve_build_options({"excludePatterns": ["*.tmp", "archive/**", "*.md"]})
+    kept = worker.discover_files(root, options, skipped=skipped)
+    assert [item.relative_path for item in kept] == ["keep.txt"]
+    reasons = {item.relative_path.replace("\\", "/"): item.skip_reason for item in skipped}
+    assert reasons == {
+        "a.tmp": "Excluded by rule: *.tmp",
+        "archive/old/c.txt": "Excluded by rule: archive/**",
+        "notes.md": "Excluded by rule: *.md",
+    }
+
+
+def test_include_filter_misses_are_reported(tree):
+    root = tree({"a.pdf": "x", "b.txt": "x"})
+    skipped: list = []
+    options = worker.resolve_build_options({"excludePatterns": ["!*.pdf"]})
+    kept = worker.discover_files(root, options, skipped=skipped)
+    assert [item.relative_path for item in kept] == ["a.pdf"]
+    assert [(item.relative_path, item.skip_reason) for item in skipped] == [("b.txt", "Not one of the file types to include")]

@@ -18,11 +18,40 @@ const IGNORED_SEGMENTS = new Set([
 const IGNORED_FILE_NAMES = new Set(["thumbs.db", "desktop.ini"]);
 const DEFAULT_DEBOUNCE_MS = 4000;
 
+const INCLUDE_EXT_GLOB_RE = /^(?:\*\*\/)?\*\.([A-Za-z0-9_-]+)$/;
+
 type WatchedFolder = {
   watcher: FSWatcher;
   timer: NodeJS.Timeout | null;
   excludeMatchers: RegExp[];
+  includeExtMatchers: RegExp[];
+  includeNameMatchers: RegExp[];
 };
+
+export function compileFilterPatterns(patterns: string[]) {
+  const excludeMatchers: RegExp[] = [];
+  const includeExtMatchers: RegExp[] = [];
+  const includeNameMatchers: RegExp[] = [];
+  for (const raw of patterns) {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    if (trimmed.startsWith("!")) {
+      const inner = trimmed.slice(1).trim();
+      if (!inner) continue;
+      const compiled = globToRegExp(inner);
+      if (INCLUDE_EXT_GLOB_RE.test(inner.replace(/\\/g, "/").replace(/^\/+/, ""))) {
+        includeExtMatchers.push(compiled);
+      } else {
+        includeNameMatchers.push(compiled);
+      }
+    } else {
+      excludeMatchers.push(globToRegExp(trimmed));
+    }
+  }
+  return { excludeMatchers, includeExtMatchers, includeNameMatchers };
+}
 
 /**
  * Watches channel folders and reports (debounced) that a channel needs an incremental sync.
@@ -51,15 +80,21 @@ export class FolderWatcher {
       return;
     }
 
+    const { excludeMatchers, includeExtMatchers, includeNameMatchers } = compileFilterPatterns(excludePatterns);
     const entry: WatchedFolder = {
       watcher,
       timer: null,
-      excludeMatchers: excludePatterns.map(globToRegExp)
+      excludeMatchers,
+      includeExtMatchers,
+      includeNameMatchers
     };
 
     watcher.on("change", (_eventType, filename) => {
       const relativePath = typeof filename === "string" ? filename : filename?.toString("utf8");
-      if (relativePath && shouldIgnore(relativePath, entry.excludeMatchers)) {
+      if (
+        relativePath &&
+        shouldIgnore(relativePath, entry.excludeMatchers, entry.includeExtMatchers, entry.includeNameMatchers)
+      ) {
         return;
       }
       if (entry.timer) {
@@ -98,7 +133,12 @@ export class FolderWatcher {
   }
 }
 
-export function shouldIgnore(relativePath: string, excludeMatchers: RegExp[] = []): boolean {
+export function shouldIgnore(
+  relativePath: string,
+  excludeMatchers: RegExp[] = [],
+  includeExtMatchers: RegExp[] = [],
+  includeNameMatchers: RegExp[] = []
+): boolean {
   const normalized = relativePath.replace(/\\/g, "/");
   const segments = normalized.split("/").filter(Boolean);
   for (const segment of segments) {
@@ -111,7 +151,22 @@ export function shouldIgnore(relativePath: string, excludeMatchers: RegExp[] = [
   if (fileName.startsWith("~$") || IGNORED_FILE_NAMES.has(fileName)) {
     return true;
   }
-  return excludeMatchers.some((matcher) => matcher.test(normalized));
+  if (excludeMatchers.some((matcher) => matcher.test(normalized))) {
+    return true;
+  }
+  // Only apply file-level include filters when the changed path has a file extension.
+  if (fileName.includes(".")) {
+    // Include filters are a union: keep a path that matches a chosen type or a chosen name.
+    const hasInclude = includeExtMatchers.length > 0 || includeNameMatchers.length > 0;
+    if (
+      hasInclude &&
+      !includeExtMatchers.some((matcher) => matcher.test(normalized)) &&
+      !includeNameMatchers.some((matcher) => matcher.test(normalized))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Converts a gitignore-style glob ("**", "*", "?") into an anchored, case-insensitive RegExp. */

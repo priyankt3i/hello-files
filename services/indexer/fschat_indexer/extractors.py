@@ -5,9 +5,11 @@ import hashlib
 import io
 import json
 import mimetypes
+import os
 import re
 import tempfile
 import warnings
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from typing import Any, Tuple
@@ -15,6 +17,17 @@ from typing import Any, Tuple
 # Heavy parser libraries (python-docx, openpyxl, PyMuPDF, xlrd, olefile, pywin32) are
 # imported on first use: extraction worker processes then start quickly when a sync only
 # touches plain-text files. The import statements stay literal so PyInstaller finds them.
+
+
+def fs_path(path: Path) -> Path:
+    """Add the Windows extended-length prefix when a path approaches or exceeds MAX_PATH (260)."""
+    raw = str(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\") or len(raw) < 248:
+        return path
+    abspath = os.path.abspath(raw)
+    if abspath.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + abspath[2:])
+    return Path("\\\\?\\" + abspath)
 
 
 def load_fitz():
@@ -106,6 +119,8 @@ TEXT_EXTENSIONS = {
     ".svg",
 }
 
+WORD_EXTENSIONS = {".docx", ".docm"}
+RTF_EXTENSIONS = {".rtf"}
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xlsm"}
 LEGACY_SPREADSHEET_EXTENSIONS = {".xls"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
@@ -116,18 +131,24 @@ OCR_MAX_IMAGE_EDGE = 1800
 OCR_MAX_IMAGE_PIXELS = 3_000_000
 HEADER_SCAN_LIMIT = 12
 MAX_PROFILE_HEADERS = 12
+SPREADSHEET_GROUP_ROW_THRESHOLD = 100
+SPREADSHEET_GROUP_TARGET_CHARS = 1200
+MAX_ROW_CHUNKS_PER_SHEET = 250
 
 _OCR_ENGINE = None
 
 
 def extract_document(path: Path) -> dict[str, Any]:
+    path = fs_path(path)
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         return extract_pdf_document(path)
-    if suffix == ".docx":
+    if suffix in WORD_EXTENSIONS:
         return extract_docx_document(path)
+    if suffix in RTF_EXTENSIONS:
+        return {"text": extract_rtf(path), "parser": "rtf"}
     if suffix == ".doc":
-        return {"text": extract_doc(path), "parser": "doc"}
+        return extract_doc_document(path)
     if suffix in SPREADSHEET_EXTENSIONS:
         return extract_workbook_document(path)
     if suffix in LEGACY_SPREADSHEET_EXTENSIONS:
@@ -190,6 +211,7 @@ def extract_pdf_document(path: Path) -> dict[str, Any]:
                 embedded_text = extract_image_bytes(
                     image_bytes,
                     source_name,
+                    include_ocr=should_ocr_page,
                 )
                 if embedded_text:
                     parts.append(embedded_text)
@@ -226,24 +248,69 @@ def extract_docx(path: Path) -> str:
 def extract_docx_document(path: Path) -> dict[str, Any]:
     from docx import Document
 
-    document = Document(path)
     parts: list[str] = []
     visual_assets: list[dict[str, Any]] = []
 
-    paragraph_text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
-    if paragraph_text:
-        parts.append(paragraph_text)
+    try:
+        document = Document(path)
+        paragraph_text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
+        if paragraph_text:
+            parts.append(paragraph_text)
+        table_text = extract_docx_tables(document)
+        if table_text:
+            parts.append(table_text)
+    except ValueError:
+        xml_paragraphs, xml_tables = extract_docx_xml_parts(path)
+        if xml_paragraphs:
+            parts.append(xml_paragraphs)
+        if xml_tables:
+            parts.append(xml_tables)
 
-    table_text = extract_docx_tables(document)
-    if table_text:
-        parts.append(table_text)
-
-    embedded_images, embedded_assets = extract_docx_embedded_images(path)
+    native_text = "\n\n".join(parts)
+    should_ocr_images = should_attempt_visual_ocr(native_text, MIN_TEXT_CHARS_FOR_VISUAL_OCR)
+    embedded_images, embedded_assets = extract_docx_embedded_images(path, include_ocr=should_ocr_images)
     if embedded_images:
         parts.append(embedded_images)
         visual_assets.extend(embedded_assets)
 
     return {"text": "\n\n".join(part for part in parts if part.strip()), "parser": "docx", "visualAssets": visual_assets}
+
+
+def extract_docx_xml_parts(path: Path) -> tuple[str, str]:
+    """Fallback OpenXML reader for .docm and non-standard .docx content types."""
+    w_ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs: list[str] = []
+    tables: list[str] = []
+    table_index = 0
+    with zipfile.ZipFile(path) as archive:
+        if "word/document.xml" not in archive.namelist():
+            raise ValueError("Not a valid Word OpenXML archive.")
+        xml_bytes = archive.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    body = root.find(f"{w_ns}body")
+    container = body if body is not None else root
+    for child in container:
+        if child.tag == f"{w_ns}p":
+            text = "".join(node.text for node in child.iter(f"{w_ns}t") if node.text).strip()
+            if text:
+                paragraphs.append(text)
+        elif child.tag == f"{w_ns}tbl":
+            table_index += 1
+            rows: list[str] = [f"# Table {table_index}"]
+            for row in child.findall(f".//{w_ns}tr"):
+                cells: list[str] = []
+                for cell in row.findall(f"./{w_ns}tc"):
+                    cell_text = " ".join(
+                        "".join(node.text for node in p.iter(f"{w_ns}t") if node.text).strip()
+                        for p in cell.findall(f".//{w_ns}p")
+                    ).strip()
+                    if cell_text:
+                        cells.append(cell_text)
+                if cells:
+                    rows.append(" | ".join(cells))
+            if len(rows) > 1:
+                tables.append("\n".join(rows))
+    return "\n".join(paragraphs), "\n".join(tables)
 
 
 def extract_docx_tables(document: Any) -> str:
@@ -257,9 +324,10 @@ def extract_docx_tables(document: Any) -> str:
     return "\n".join(rows)
 
 
-def extract_docx_embedded_images(path: Path) -> tuple[str, list[dict[str, Any]]]:
+def extract_docx_embedded_images(path: Path, include_ocr: bool = True) -> tuple[str, list[dict[str, Any]]]:
     parts: list[str] = []
     visual_assets: list[dict[str, Any]] = []
+    seen_digests: set[str] = set()
     with zipfile.ZipFile(path) as archive:
         for name in archive.namelist():
             if not name.startswith("word/media/"):
@@ -267,7 +335,11 @@ def extract_docx_embedded_images(path: Path) -> tuple[str, list[dict[str, Any]]]
             if len(parts) >= MAX_EMBEDDED_IMAGES_PER_DOCX:
                 break
             image_bytes = archive.read(name)
-            image_text = extract_image_bytes(image_bytes, name)
+            digest = hashlib.sha1(image_bytes).hexdigest()
+            if digest in seen_digests:
+                continue
+            seen_digests.add(digest)
+            image_text = extract_image_bytes(image_bytes, name, include_ocr=include_ocr)
             if image_text:
                 parts.append(image_text)
                 visual_assets.append(
@@ -284,16 +356,164 @@ def extract_docx_embedded_images(path: Path) -> tuple[str, list[dict[str, Any]]]
     return "\n\n".join(parts), visual_assets
 
 
+def extract_doc_document(path: Path) -> dict[str, Any]:
+    with path.open("rb") as handle:
+        header = handle.read(16)
+    if header.lstrip().startswith(b"{\\rtf"):
+        return {"text": extract_rtf(path), "parser": "rtf"}
+    if header.startswith(b"PK\x03\x04"):
+        return extract_docx_document(path)
+    return {"text": extract_doc(path), "parser": "doc"}
+
+
 def extract_doc(path: Path) -> str:
-    converted_text = extract_doc_via_word(path)
-    if converted_text:
-        return converted_text
+    path = fs_path(path)
+    with path.open("rb") as handle:
+        header = handle.read(16)
+    if header.lstrip().startswith(b"{\\rtf"):
+        return extract_rtf(path)
+    if header.startswith(b"PK\x03\x04"):
+        return extract_docx(path)
 
     fallback_text = extract_doc_ole_text(path)
     if fallback_text:
         return fallback_text
 
-    raise ValueError("Legacy .doc extraction requires Microsoft Word or readable OLE text streams.")
+    if os.environ.get("FSCHAT_ENABLE_WORD_COM") == "1":
+        converted_text = extract_doc_via_word(path)
+        if converted_text:
+            return converted_text
+
+    raise ValueError("Legacy .doc extraction requires readable OLE text streams.")
+
+
+_RTF_SKIP_DESTINATIONS = {
+    "fonttbl",
+    "colortbl",
+    "stylesheet",
+    "info",
+    "pict",
+    "shppict",
+    "nonshppict",
+    "object",
+    "objdata",
+    "themedata",
+    "datastore",
+    "colorschememapping",
+    "latentstyles",
+    "rsidtbl",
+    "generator",
+    "xmlnstbl",
+    "listtable",
+    "listoverridetable",
+    "revtbl",
+    "pgdsctbl",
+    "mmathPr",
+    "defchp",
+    "defpap",
+}
+
+
+def extract_rtf(path: Path) -> str:
+    raw = fs_path(path).read_bytes()
+    embedded_pngs = len(re.findall(rb"89504e470d0a1a0a", raw[:8_000_000], re.IGNORECASE))
+    embedded_jpegs = len(re.findall(rb"ffd8ffe0", raw[:8_000_000], re.IGNORECASE))
+    compact = re.sub(rb"[0-9a-fA-F\r\n]{256,}", b"", raw).decode("latin-1", errors="ignore")
+    text = parse_rtf_text(compact)
+    if text:
+        return text
+    total_images = embedded_pngs + embedded_jpegs
+    if total_images > 0:
+        return f"# Rich Text Document: {path.name}\nContains {total_images} embedded image(s) with no body text."
+    return ""
+
+
+def parse_rtf_text(rtf: str) -> str:
+    out: list[str] = []
+    stack: list[bool] = []
+    skip = False
+    i = 0
+    n = len(rtf)
+    while i < n:
+        ch = rtf[i]
+        if ch == "{":
+            stack.append(skip)
+            i += 1
+            if i < n and rtf[i : i + 2] == "\\*":
+                skip = True
+                i += 2
+            continue
+        if ch == "}":
+            if stack:
+                skip = stack.pop()
+            i += 1
+            continue
+        if ch == "\\":
+            i += 1
+            if i >= n:
+                break
+            nxt = rtf[i]
+            if nxt in "\\{}":
+                if not skip:
+                    out.append(nxt)
+                i += 1
+                continue
+            if nxt in "\r\n":
+                if not skip:
+                    out.append("\n")
+                i += 1
+                continue
+            if nxt == "'":
+                hex_code = rtf[i + 1 : i + 3]
+                if not skip and len(hex_code) == 2:
+                    try:
+                        out.append(bytes.fromhex(hex_code).decode("cp1252", errors="ignore"))
+                    except ValueError:
+                        pass
+                i += 3
+                continue
+            if nxt in "~_-":
+                if not skip and nxt == "~":
+                    out.append(" ")
+                elif not skip and nxt in "_-":
+                    out.append("-")
+                i += 1
+                continue
+            start = i
+            while i < n and rtf[i].isalpha():
+                i += 1
+            word = rtf[start:i]
+            arg_start = i
+            if i < n and rtf[i] in "-+":
+                i += 1
+            while i < n and rtf[i].isdigit():
+                i += 1
+            arg = rtf[arg_start:i]
+            if i < n and rtf[i] == " ":
+                i += 1
+            if word in _RTF_SKIP_DESTINATIONS:
+                skip = True
+            elif not skip:
+                if word in {"par", "line", "sect", "page", "row"}:
+                    out.append("\n")
+                elif word in {"tab", "cell"}:
+                    out.append("\t")
+                elif word == "u" and arg:
+                    try:
+                        code = int(arg)
+                        if code < 0:
+                            code += 65536
+                        out.append(chr(code))
+                    except ValueError:
+                        pass
+                    if i < n and rtf[i] == "?":
+                        i += 1
+            continue
+        if ch not in "\r\n" and not skip:
+            out.append(ch)
+        i += 1
+    lines = [" ".join(line.split()) for line in "".join(out).splitlines()]
+    return "\n".join(line for line in lines if line)
 
 
 def extract_doc_via_word(path: Path) -> str:
@@ -308,7 +528,7 @@ def extract_doc_via_word(path: Path) -> str:
         word = win32com.client.Dispatch("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0
-        document = word.Documents.Open(str(path), ReadOnly=True)
+        document = word.Documents.Open(str(path), ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False)
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as handle:
             temp_docx = Path(handle.name)
         document.SaveAs(str(temp_docx), FileFormat=16)
@@ -330,19 +550,29 @@ def extract_doc_via_word(path: Path) -> str:
             temp_docx.unlink(missing_ok=True)
 
 
+_OLE_BINARY_STREAMS = {"data", "objectpool", "\x01compobj", "\x05summaryinformation", "\x05documentsummaryinformation"}
+_OLE_STREAM_READ_LIMIT = 4 * 1024 * 1024
+
+
 def extract_doc_ole_text(path: Path) -> str:
     olefile = load_olefile()
     if olefile is None:
         return ""
 
-    if not olefile.isOleFile(str(path)):
+    path_str = str(fs_path(path))
+    if not olefile.isOleFile(path_str):
         return ""
 
     parts: list[str] = []
-    with olefile.OleFileIO(str(path)) as ole:
-        for stream_name in ole.listdir():
+    with olefile.OleFileIO(path_str) as ole:
+        streams = ole.listdir()
+        has_word_stream = any(len(s) == 1 and s[0].lower() == "worddocument" for s in streams)
+        for stream_name in streams:
+            leaf = stream_name[-1].lower() if stream_name else ""
+            if leaf in _OLE_BINARY_STREAMS or (has_word_stream and stream_name[0].lower() == "objectpool"):
+                continue
             try:
-                raw = ole.openstream(stream_name).read()
+                raw = ole.openstream(stream_name).read(_OLE_STREAM_READ_LIMIT)
             except Exception:
                 continue
             extracted = extract_printable_text(raw)
@@ -356,7 +586,7 @@ def extract_legacy_workbook_document(path: Path) -> dict[str, Any]:
     if xlrd is None:
         raise ValueError("Legacy .xls support requires xlrd.")
 
-    workbook = xlrd.open_workbook(path)
+    workbook = xlrd.open_workbook(str(fs_path(path)))
     sheets = []
     for sheet in workbook.sheets():
         rows: list[tuple[int, list[str]]] = []
@@ -379,7 +609,19 @@ def extract_workbook_document(path: Path) -> dict[str, Any]:
             category=UserWarning,
             module=r"openpyxl\.worksheet\._reader",
         )
-        workbook = load_workbook(path, read_only=True, data_only=True)
+        warnings.filterwarnings(
+            "ignore",
+            message="Data Validation extension is not supported and will be removed",
+            category=UserWarning,
+            module=r"openpyxl\.worksheet\._reader",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message="Print area cannot be set",
+            category=UserWarning,
+            module=r"openpyxl\.reader\.workbook",
+        )
+        workbook = load_workbook(fs_path(path), read_only=True, data_only=True)
     sheets = []
     try:
         for sheet in workbook.worksheets:
@@ -418,6 +660,7 @@ def build_spreadsheet_document(sheets: list[dict[str, Any]], parser_name: str) -
 
         data_row_count = 0
         max_column_count = 0
+        sheet_row_entries: list[tuple[int, str]] = []
         for entry_index, (row_number, values) in enumerate(rows):
             max_column_count = max(max_column_count, len(values))
             if header_index is not None and entry_index == header_index:
@@ -428,16 +671,23 @@ def build_spreadsheet_document(sheets: list[dict[str, Any]], parser_name: str) -
             else:
                 row_text = build_generic_row_text(title, row_number, values)
 
-            row_chunks.append(
-                {
-                    "text": row_text,
-                    "chunkType": "spreadsheet-row",
-                    "sheetName": title,
-                    "rowNumber": row_number,
-                }
-            )
-            parts.append(row_text)
+            sheet_row_entries.append((row_number, row_text))
+            if data_row_count < MAX_ROW_CHUNKS_PER_SHEET:
+                parts.append(row_text)
             data_row_count += 1
+
+        if len(sheet_row_entries) <= SPREADSHEET_GROUP_ROW_THRESHOLD:
+            for row_number, row_text in sheet_row_entries:
+                row_chunks.append(
+                    {
+                        "text": row_text,
+                        "chunkType": "spreadsheet-row",
+                        "sheetName": title,
+                        "rowNumber": row_number,
+                    }
+                )
+        else:
+            row_chunks.extend(pack_spreadsheet_row_chunks(title, sheet_row_entries))
 
         sheet_profiles.append(
             {
@@ -465,6 +715,47 @@ def build_spreadsheet_document(sheets: list[dict[str, Any]], parser_name: str) -
         "chunks": row_chunks,
         "structure": structure,
     }
+
+
+def pack_spreadsheet_row_chunks(title: str, row_entries: list[tuple[int, str]]) -> list[dict[str, Any]]:
+    """Group consecutive rows on large sheets into ~1.2 KB chunks capped at MAX_ROW_CHUNKS_PER_SHEET."""
+    prefix = f"# Sheet: {title}\n"
+    total = len(row_entries)
+    min_rows_per_chunk = max(1, (total + MAX_ROW_CHUNKS_PER_SHEET - 1) // MAX_ROW_CHUNKS_PER_SHEET)
+    chunks: list[dict[str, Any]] = []
+    group_texts: list[str] = []
+    group_chars = 0
+    first_row = 0
+
+    for row_number, row_text in row_entries:
+        body = row_text[len(prefix) :] if row_text.startswith(prefix) else row_text
+        if group_texts and len(group_texts) >= min_rows_per_chunk and group_chars + len(body) > SPREADSHEET_GROUP_TARGET_CHARS and len(chunks) + 1 < MAX_ROW_CHUNKS_PER_SHEET:
+            chunks.append(
+                {
+                    "text": f"# Sheet: {title}\n\n" + "\n\n".join(group_texts),
+                    "chunkType": "spreadsheet-row",
+                    "sheetName": title,
+                    "rowNumber": first_row,
+                }
+            )
+            group_texts = []
+            group_chars = 0
+        if not group_texts:
+            first_row = row_number
+        if group_chars < SPREADSHEET_GROUP_TARGET_CHARS * 2:
+            group_texts.append(body)
+            group_chars += len(body)
+
+    if group_texts:
+        chunks.append(
+            {
+                "text": f"# Sheet: {title}\n\n" + "\n\n".join(group_texts),
+                "chunkType": "spreadsheet-row",
+                "sheetName": title,
+                "rowNumber": first_row,
+            }
+        )
+    return chunks
 
 
 def normalize_spreadsheet_cell(value: Any) -> str:
@@ -562,7 +853,7 @@ def build_generic_row_text(sheet_name: str, row_number: int, values: list[str]) 
 
 def extract_csv(path: Path) -> str:
     rows: list[str] = []
-    with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+    with fs_path(path).open("r", encoding="utf-8", errors="ignore", newline="") as handle:
         reader = csv.reader(handle)
         for row in reader:
             values = [cell.strip() for cell in row if cell and cell.strip()]
@@ -572,23 +863,24 @@ def extract_csv(path: Path) -> str:
 
 
 def extract_plain_text(path: Path) -> str:
+    target = fs_path(path)
     try:
-        return path.read_text(encoding="utf-8")
+        return target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        return path.read_text(encoding="latin-1", errors="ignore")
+        return target.read_text(encoding="latin-1", errors="ignore")
 
 
 def extract_image_document(path: Path) -> str:
     if Image is None:
         raise ValueError("Image support requires Pillow.")
-    with Image.open(path) as image:
+    with Image.open(fs_path(path)) as image:
         return describe_image(image, source_name=path.name)
 
 
 def extract_image_file_document(path: Path) -> dict[str, Any]:
     if Image is None:
         raise ValueError("Image support requires Pillow.")
-    image_bytes = path.read_bytes()
+    image_bytes = fs_path(path).read_bytes()
     with Image.open(io.BytesIO(image_bytes)) as image:
         text = describe_image(image, source_name=path.name)
     return {
@@ -605,17 +897,17 @@ def extract_image_file_document(path: Path) -> dict[str, Any]:
     }
 
 
-def extract_image_bytes(image_bytes: bytes, source_name: str) -> str:
+def extract_image_bytes(image_bytes: bytes, source_name: str, include_ocr: bool = True) -> str:
     if Image is None:
         return ""
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
-            return describe_image(image, source_name=source_name)
+            return describe_image(image, source_name=source_name, include_ocr=include_ocr)
     except UnidentifiedImageError:
         return ""
 
 
-def describe_image(image, source_name: str) -> str:
+def describe_image(image, source_name: str, include_ocr: bool = True) -> str:
     metadata = [f"# Visual asset: {source_name}"]
     metadata.append(f"Format: {getattr(image, 'format', None) or 'unknown'}")
     metadata.append(f"Size: {image.width}x{image.height}")
@@ -629,14 +921,15 @@ def describe_image(image, source_name: str) -> str:
     if frame_count > 1:
         metadata.append(f"Frames: {frame_count}")
 
-    ocr_text = ocr_image(image)
-    if ocr_text:
-        metadata.append("")
-        metadata.append("# OCR text")
-        metadata.append(ocr_text)
-    else:
-        metadata.append("")
-        metadata.append("No OCR text detected.")
+    if include_ocr:
+        ocr_text = ocr_image(image)
+        if ocr_text:
+            metadata.append("")
+            metadata.append("# OCR text")
+            metadata.append(ocr_text)
+        else:
+            metadata.append("")
+            metadata.append("No OCR text detected.")
 
     return "\n".join(metadata).strip()
 
@@ -709,7 +1002,10 @@ def get_ocr_engine():
         except ImportError:
             _OCR_UNAVAILABLE = True
             return None
-        _OCR_ENGINE = RapidOCR()
+        try:
+            _OCR_ENGINE = RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1)
+        except TypeError:
+            _OCR_ENGINE = RapidOCR()
     return _OCR_ENGINE
 
 
@@ -722,7 +1018,7 @@ def extract_unknown(path: Path) -> Tuple[str, str]:
     if path.suffix.lower() in IMAGE_EXTENSIONS:
         return extract_image_document(path), "image-ocr"
 
-    raw = path.read_bytes()
+    raw = fs_path(path).read_bytes()
     if looks_like_text(raw):
         return raw.decode("utf-8", errors="ignore"), "sniffed-text"
 
@@ -730,23 +1026,22 @@ def extract_unknown(path: Path) -> Tuple[str, str]:
 
 
 def extract_printable_text(raw: bytes) -> str:
-    parts: list[str] = []
+    cleaned: list[str] = []
+    seen: set[str] = set()
 
-    try:
-        utf16 = raw.decode("utf-16-le", errors="ignore")
-        parts.extend(re.findall(r"[\w][\w\s,\.\-:/\\]{6,}", utf16))
-    except Exception:
-        pass
-
-    latin = raw.decode("latin-1", errors="ignore")
-    parts.extend(re.findall(r"[\w][\w\s,\.\-:/\\]{6,}", latin))
-
-    cleaned = []
-    for part in parts:
-        normalized = " ".join(part.split())
-        if normalized and normalized not in cleaned:
-            cleaned.append(normalized)
-    return "\n".join(cleaned[:500])
+    for encoding in ("utf-16-le", "latin-1"):
+        try:
+            decoded = raw.decode(encoding, errors="ignore")
+        except Exception:
+            continue
+        for match in re.finditer(r"[\w][\w\s,\.\-:/\\]{6,}", decoded):
+            normalized = " ".join(match.group(0).split())
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                cleaned.append(normalized)
+                if len(cleaned) >= 500:
+                    return "\n".join(cleaned)
+    return "\n".join(cleaned)
 
 
 def looks_like_text(raw: bytes) -> bool:
@@ -764,12 +1059,13 @@ def normalize_text(text: str) -> str:
     stripped = text.replace("\u0000", "").strip()
     if not stripped:
         return ""
-    try:
-        parsed = json.loads(stripped)
-        if isinstance(parsed, (dict, list)):
-            return json.dumps(parsed, indent=2, ensure_ascii=True)
-    except Exception:
-        pass
+    if stripped[0] in "{[":
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, indent=2, ensure_ascii=True)
+        except Exception:
+            pass
     return stripped
 
 

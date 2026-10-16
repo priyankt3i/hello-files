@@ -44,6 +44,25 @@ def test_size_cap_marks_file_skipped(tree, tmp_path):
     assert result["stats"]["skipped"] == 1
 
 
+def test_rule_excluded_files_listed_as_skipped(tree, tmp_path):
+    index = tmp_path / "idx"
+    root = tree({"keep.txt": "keep me", "drop.log": "log text", "old/a.txt": "old text"})
+    first = build(root, index, excludePatterns=["*.log", "old/**"])
+    assert statuses(first) == {"keep.txt": "indexed", "drop.log": "skipped", "old/a.txt": "skipped"}
+    dropped = next(item for item in first["files"] if item["relativePath"] == "drop.log")
+    assert dropped["errorReason"] == "Excluded by rule: *.log"
+    assert first["stats"]["skipped"] == 2
+
+    # A rule change turns an indexed file into a skipped one (its chunks go away) and back again.
+    second = build(root, index, excludePatterns=["keep.txt"])
+    assert statuses(second)["keep.txt"] == "skipped"
+    assert statuses(second)["drop.log"] == "indexed"
+    with open_index_db(index) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chunks WHERE relative_path = 'keep.txt'").fetchone()[0] == 0
+    third = build(root, index)
+    assert set(statuses(third).values()) == {"indexed"}
+
+
 def test_default_size_limit():
     assert worker.resolve_build_options({}).max_file_size_mb == 50
     assert worker.format_megabytes(50.0) == "50"

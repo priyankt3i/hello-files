@@ -4,6 +4,7 @@ import { cx, toErrorMessage } from "../lib/format";
 import { describeDataDestination, isLocalConnection, pickInitialModels } from "../lib/providers";
 import { useAppStore } from "../state/store";
 import type { RootFolderInspection } from "../types/global";
+import { describeFileFilters, FileFilterFields } from "./kb-settings/file-filter-fields";
 import { ChatModelField, DataFlowNote, SearchTypeFields, validateSelection, withChatModel, type ModelSelection } from "./kb-settings/model-fields";
 import { Button } from "./ui/button";
 import { Callout, EmptyState } from "./ui/feedback";
@@ -18,6 +19,7 @@ export function NewKnowledgeBaseDialog() {
   const [step, setStep] = useState(0);
   const [inspection, setInspection] = useState<RootFolderInspection | null>(null);
   const [name, setName] = useState("");
+  const [excludePatterns, setExcludePatterns] = useState<string[]>([]);
   const [selection, setSelection] = useState<ModelSelection>(() => {
     const initial = pickInitialModels(state.connections, state.providerDefaults, state.models, state.settings);
     // Privacy-first default: semantic search only when embeddings run on this computer. Keyword search sends nothing
@@ -56,7 +58,8 @@ export function NewKnowledgeBaseDialog() {
         preferredConnectionId: chatModel?.connectionId ?? null,
         chatModelId: selection.chatModelId,
         embeddingModelId: selection.retrievalMode === "vector" ? selection.embeddingModelId : null,
-        retrievalMode: selection.retrievalMode
+        retrievalMode: selection.retrievalMode,
+        excludePatterns
       });
     } catch (caught) {
       setError(toErrorMessage(caught));
@@ -172,10 +175,15 @@ export function NewKnowledgeBaseDialog() {
               >
                 Open the existing one instead, or choose a different folder.
               </Callout>
-            ) : inspection?.hasExistingIndex ? (
-              <Callout tone="success" title="Existing index found">
-                A previous index for this folder will be reused, so only new or changed files need to be read.
-              </Callout>
+            ) : inspection ? (
+              <>
+                {inspection.hasExistingIndex ? (
+                  <Callout tone="success" title="Existing index found">
+                    A previous index for this folder will be reused, so only new or changed files need to be read.
+                  </Callout>
+                ) : null}
+                <FileFilterFields patterns={excludePatterns} onChange={setExcludePatterns} compact />
+              </>
             ) : null}
           </>
         ) : null}
@@ -200,6 +208,7 @@ export function NewKnowledgeBaseDialog() {
           <>
             <dl className="divide-y divide-border rounded-md border border-border text-sm">
               <ReviewRow label="Folder" value={inspection?.rootPath ?? ""} />
+              <ReviewRow label="File filters" value={describeFileFilters(excludePatterns)} />
               <ReviewRow label="Name" value={name} />
               <ReviewRow label="Chat model" value={destination.chatModel?.displayName ?? "—"} />
               <ReviewRow
