@@ -27,7 +27,8 @@ const DEFAULT_BASE_URLS = {
   "azure-openai": "",
   anthropic: "https://api.anthropic.com",
   google: "https://generativelanguage.googleapis.com",
-  ollama: "http://127.0.0.1:11434"
+  ollama: "http://127.0.0.1:11434",
+  openrouter: "https://openrouter.ai/api"
 } as const;
 
 const CODEX_DISCOVERED_MODELS: Array<{
@@ -275,6 +276,8 @@ export async function discoverProviderModels(input: ConnectProviderInput): Promi
       return discoverGoogleModels(input.apiKey || "");
     case "ollama":
       return discoverOllamaModels(input.baseUrl || DEFAULT_BASE_URLS.ollama);
+    case "openrouter":
+      return discoverOpenRouterModels(input.apiKey || "");
     case "azure-openai":
       return discoverAzureDeployments(input);
     default:
@@ -286,18 +289,31 @@ export function defaultBaseUrl(provider: ProviderKind) {
   return DEFAULT_BASE_URLS[provider] || undefined;
 }
 
+// OpenRouter lists hundreds of models. Default to inexpensive, capable ones rather than the first (cheapest, often tiny) entry.
+const OPENROUTER_CHAT_PREFERENCES = [
+  "google/gemini-2.5-flash-lite",
+  "openai/gpt-5-nano",
+  "openai/gpt-4o-mini",
+  "qwen/qwen3.7-flash",
+  "google/gemini-2.5-flash",
+  "deepseek/deepseek-chat"
+];
+const OPENROUTER_EMBEDDING_PREFERENCES = ["openai/text-embedding-3-small", "baai/bge-m3", "qwen/qwen3-embedding-8b", "qwen/qwen3-embedding-4b"];
+
 export function pickDefaultChatModel(models: DiscoveredModel[]) {
-  return pickPreferredModel(
-    models.filter((model) => model.supportsChat),
-    ["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "gemini-2.5-flash", "claude-sonnet", "llama", "qwen", "mistral", "gemma"]
-  );
+  const chatModels = models.filter((model) => model.supportsChat);
+  const preferences = chatModels.some((model) => model.provider === "openrouter")
+    ? OPENROUTER_CHAT_PREFERENCES
+    : ["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "gemini-2.5-flash", "claude-sonnet", "llama", "qwen", "mistral", "gemma"];
+  return pickPreferredModel(chatModels, preferences);
 }
 
 export function pickDefaultEmbeddingModel(models: DiscoveredModel[]) {
-  return pickPreferredModel(
-    models.filter((model) => model.supportsEmbedding),
-    ["text-embedding-3-large", "text-embedding-3-small", "gemini-embedding-001", "text-embedding-004", "nomic-embed-text", "embeddinggemma", "qwen3-embedding", "bge"]
-  );
+  const embeddingModels = models.filter((model) => model.supportsEmbedding);
+  const preferences = embeddingModels.some((model) => model.provider === "openrouter")
+    ? OPENROUTER_EMBEDDING_PREFERENCES
+    : ["text-embedding-3-large", "text-embedding-3-small", "gemini-embedding-001", "text-embedding-004", "nomic-embed-text", "embeddinggemma", "qwen3-embedding", "bge"];
+  return pickPreferredModel(embeddingModels, preferences);
 }
 
 async function discoverOpenAIModels(apiKey: string): Promise<ProviderDiscovery> {
@@ -318,6 +334,81 @@ async function discoverOpenAIModels(apiKey: string): Promise<ProviderDiscovery> 
       supportsVision: /vision|gpt-4o|gpt-4\.1|gpt-5/i.test(id)
     })),
     warnings: []
+  };
+}
+
+interface OpenRouterModelEntry {
+  id: string;
+  name?: string;
+  pricing?: { prompt?: string; completion?: string };
+  architecture?: { input_modalities?: string[]; output_modalities?: string[] };
+}
+
+/** "$0.05 in / $0.40 out per 1M tokens" (embedding models only have an input price). */
+function formatOpenRouterPrice(entry: OpenRouterModelEntry, embedding: boolean) {
+  const perMillion = (value: string | undefined) => {
+    const price = Number(value) * 1_000_000;
+    if (!Number.isFinite(price) || price < 0) return null; // negative = variable pricing (router models)
+    if (price === 0) return "free";
+    return `$${price >= 0.01 ? price.toFixed(2) : Number(price.toPrecision(2))}`;
+  };
+  const input = perMillion(entry.pricing?.prompt);
+  if (input === null) return "price varies";
+  if (embedding) return input === "free" ? "free" : `${input} per 1M tokens`;
+  const output = perMillion(entry.pricing?.completion);
+  if (input === "free" && output === "free") return "free";
+  return output === null ? `${input} in` : `${input} in / ${output} out per 1M tokens`;
+}
+
+function openRouterSortPrice(entry: OpenRouterModelEntry) {
+  const price = Number(entry.pricing?.prompt);
+  return Number.isFinite(price) && price >= 0 ? price : Number.MAX_SAFE_INTEGER;
+}
+
+// Chat models come from /v1/models, embedding models from /v1/embeddings/models. Both are listed cheapest first
+// and carry their price in the display name so the model pickers double as a price list.
+async function discoverOpenRouterModels(apiKey: string): Promise<ProviderDiscovery> {
+  const headers = { Authorization: `Bearer ${apiKey}` };
+  const chatResponse = await fetch(joinUrl(DEFAULT_BASE_URLS.openrouter, "/v1/models"), { headers });
+  const chatData = await expectJson(chatResponse);
+  const warnings: string[] = [];
+  let embeddingEntries: OpenRouterModelEntry[] = [];
+  try {
+    const embeddingResponse = await fetch(joinUrl(DEFAULT_BASE_URLS.openrouter, "/v1/embeddings/models"), { headers });
+    embeddingEntries = ((await expectJson(embeddingResponse)).data ?? []) as OpenRouterModelEntry[];
+  } catch {
+    warnings.push("Couldn't load OpenRouter's embedding models. Chat models are available; try refreshing models later.");
+  }
+
+  const chatEntries = ((chatData.data ?? []) as OpenRouterModelEntry[])
+    .filter((entry) => (entry.architecture?.output_modalities ?? ["text"]).includes("text"))
+    .sort((a, b) => openRouterSortPrice(a) - openRouterSortPrice(b) || a.id.localeCompare(b.id));
+  embeddingEntries = [...embeddingEntries].sort((a, b) => openRouterSortPrice(a) - openRouterSortPrice(b) || a.id.localeCompare(b.id));
+
+  const withPrice = (entry: OpenRouterModelEntry, embedding: boolean) => {
+    const price = formatOpenRouterPrice(entry, embedding);
+    return price ? `${entry.id} · ${price}` : entry.id;
+  };
+  return {
+    models: [
+      ...chatEntries.map((entry) => ({
+        provider: "openrouter" as const,
+        modelId: entry.id,
+        displayName: withPrice(entry, false),
+        supportsChat: true,
+        supportsEmbedding: false,
+        supportsVision: (entry.architecture?.input_modalities ?? []).includes("image")
+      })),
+      ...embeddingEntries.map((entry) => ({
+        provider: "openrouter" as const,
+        modelId: entry.id,
+        displayName: withPrice(entry, true),
+        supportsChat: false,
+        supportsEmbedding: true,
+        supportsVision: false
+      }))
+    ],
+    warnings
   };
 }
 
@@ -536,6 +627,7 @@ async function callOpenAI(args: {
   baseUrl?: string;
   model?: string;
   apiKey?: string;
+  extraHeaders?: Record<string, string>;
   systemPrompt: string;
   history: Array<{ role: "assistant" | "user"; content: string }>;
   prompt: string;
@@ -546,7 +638,8 @@ async function callOpenAI(args: {
     method: "POST",
     headers: {
       Authorization: `Bearer ${args.apiKey}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      ...args.extraHeaders
     },
     body: JSON.stringify({
       model: args.model,
@@ -576,6 +669,18 @@ async function callProviderText(args: {
         baseUrl,
         model: model.modelId,
         apiKey: secret.apiKey,
+        systemPrompt,
+        history,
+        prompt,
+        images
+      });
+    case "openrouter":
+      // OpenRouter is OpenAI-compatible; the title header just labels the app in the user's OpenRouter activity.
+      return callOpenAI({
+        baseUrl,
+        model: model.modelId,
+        apiKey: secret.apiKey,
+        extraHeaders: { "X-Title": "Hello Files" },
         systemPrompt,
         history,
         prompt,

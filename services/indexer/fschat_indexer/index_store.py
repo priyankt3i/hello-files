@@ -513,7 +513,8 @@ def manifest_from_conn(conn: sqlite3.Connection, include_files: bool = True) -> 
     manifest["documentCount"] = conn.execute("SELECT count(*) FROM documents").fetchone()[0]
     manifest["retrievalMode"] = meta.get("retrievalMode") or "vector"
     manifest["indexEngine"] = meta.get("indexEngine") or "numpy-cosine"
-    if manifest["retrievalMode"] == "vector":
+    # Stored vectors outlive a switch to keyword search, so report them in either mode.
+    if manifest["retrievalMode"] == "vector" or meta.get("embeddingModelKey") is not None:
         manifest["embeddingDimension"] = int(meta.get("embeddingDimension") or 0)
         if meta.get("embeddingModelKey") is not None:
             manifest["embeddingModelKey"] = meta.get("embeddingModelKey")

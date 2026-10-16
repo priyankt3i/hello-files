@@ -37,8 +37,10 @@ export function IndexProgressPanel({ channel, progress }: { channel: Channel; pr
         <ProgressBar value={processed} max={total} label="Indexing progress" />
       </div>
       <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-text-muted">
-        <span className="min-w-0 flex-1 truncate" title={progress?.currentFile}>
-          {progress?.currentFile ?? progress?.message ?? "Preparing…"}
+        <span className="min-w-0 flex-1 truncate" title={[progress?.currentFile, progress?.message].filter(Boolean).join(" — ")}>
+          {progress?.message && progress.currentFile
+            ? `${progress.message}  ·  ${progress.currentFile}`
+            : (progress?.message ?? progress?.currentFile ?? "Preparing…")}
         </span>
         {progress ? (
           <span className="shrink-0 tabular-nums">

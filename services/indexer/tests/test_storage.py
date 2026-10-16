@@ -184,11 +184,43 @@ def test_vector_rows_follow_chunks(tree, tmp_path, monkeypatch):
     with open_index_db(index) as conn:
         assert conn.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM vectors v LEFT JOIN chunks c ON c.id = v.chunk_id WHERE c.id IS NULL").fetchone()[0] == 0
-    # Switching to keyword search drops the vectors and the embedding metadata.
+    # Switching to keyword search keeps the vectors and the embedding metadata.
     manifest = build(root, index)["manifest"]
-    assert "embeddingModelKey" not in manifest and "embeddingDimension" not in manifest
+    assert manifest["retrievalMode"] == "vectorless"
+    assert manifest["embeddingModelKey"] and manifest["embeddingDimension"]
     with open_index_db(index) as conn:
-        assert conn.execute("SELECT count(*) FROM vectors").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1
+
+
+def test_switching_between_keyword_and_semantic_search_does_not_re_embed(tree, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(worker, "embed_texts", lambda p, t, **k: calls.append(len(t)) or fake_embed(p, t))
+    monkeypatch.setattr(worker, "embed_query", lambda p, t, **k: fake_embed(p, [t])[0])
+    index = tmp_path / "idx"
+    root = tree({"a.txt": "solar panels", "b.txt": "wind turbines"})
+    build(root, index, vector_options("m1"))
+    assert sum(calls) == 2
+
+    calls.clear()
+    keyword = build(root, index)
+    assert keyword["manifest"]["retrievalMode"] == "vectorless" and not calls
+    # A file changed while using keyword search: its old vector goes with its old chunks.
+    (root / "b.txt").write_text("hydro dams", encoding="utf-8")
+    stat_result = (root / "b.txt").stat()
+    os.utime(root / "b.txt", (stat_result.st_atime, stat_result.st_mtime + 10))
+    build(root, index)
+    assert not calls
+
+    # Back to semantic search: only the changed file is embedded; the unchanged one is reused.
+    back = build(root, index, vector_options("m1"))
+    assert sum(calls) == 1 and back["manifest"]["retrievalMode"] == "vector"
+    assert worker.search_index(root, "solar", 1, vector_options("m1"), index_path=index)[0]["relativePath"] == "a.txt"
+
+    # A different embedding model does invalidate the stored vectors.
+    calls.clear()
+    build(root, index)
+    build(root, index, vector_options("m2"))
+    assert sum(calls) == 2
 
 
 def test_meta_and_manifest_shape(tree, tmp_path):

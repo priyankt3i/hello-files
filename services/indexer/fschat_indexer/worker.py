@@ -29,6 +29,7 @@ from uuid import uuid4
 
 import numpy as np
 
+import embeddings
 from embeddings import EmbeddingError, batched, embed_query, embed_texts
 from extractors import dedupe_preserve_order, extract_document, fs_path, load_fitz, normalize_text
 from index_store import (
@@ -200,6 +201,9 @@ class BuildContext:
     missing_vectors: set[str] = field(default_factory=set)
     missing_documents: set[str] = field(default_factory=set)
     embedding_dimension: int = 0
+    # Set when the embedding provider failed during this build. The build then finishes as a
+    # keyword (full-text) index instead of failing, and later syncs embed what is missing.
+    embedding_error: str | None = None
 
     @property
     def vector_mode(self) -> bool:
@@ -238,7 +242,10 @@ BATCH_MAX_FILES = 32
 BATCH_MAX_SECONDS = 0.25
 MAX_POOL_RESTARTS = 3
 POOL_START_TIMEOUT_SECONDS = 30.0
-BATCH_TIMEOUT_SECONDS = 90.0
+BATCH_TIMEOUT_SECONDS = 90.0  # a batch of several cheap files that takes this long is stuck
+# One file alone gets longer: documents that are mostly screenshots are read by OCR, which takes
+# 30-90 s on a busy laptop for a document that is only 1-2 MB.
+SINGLE_FILE_TIMEOUT_SECONDS = 300.0
 FUTURE_POLL_SECONDS = 0.2
 UNCHANGED_PROGRESS_INTERVAL = 0.1
 MAX_RULE_SKIPPED_FILES = 10_000  # cap on files listed as skipped by the user's rules
@@ -669,6 +676,7 @@ def build_index(
             "cancelled": True,
             "retainedPartial": True,
             "stats": state.stats,
+            "embeddingError": ctx.embedding_error,
         }
     except BaseException:
         if pipeline is not None:
@@ -686,7 +694,14 @@ def build_index(
         discard()
         raise
     progress(ctx, "completed", ctx.total_files, message="Index complete." if changed else "Index is up to date.")
-    return {"manifest": manifest, "files": manifest["files"], "cancelled": False, "retainedPartial": False, "stats": state.stats}
+    return {
+        "manifest": manifest,
+        "files": manifest["files"],
+        "cancelled": False,
+        "retainedPartial": False,
+        "stats": state.stats,
+        "embeddingError": ctx.embedding_error,
+    }
 
 
 def progress(ctx: BuildContext, phase: str, total: int, **extra: Any) -> None:
@@ -756,18 +771,17 @@ def load_previous_file_map(index_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 def prepare_in_place_vectors(ctx: BuildContext, previous_meta: dict[str, Any] | None) -> None:
-    """Drop vectors that can't be reused (mode or model changed) and note which files
-    still need embeddings and which indexed files lack a document record."""
+    """Drop vectors that belong to a different embedding model and note which files still
+    need embeddings and which indexed files lack a document record. Stored vectors are kept
+    while the knowledge base uses keyword search, so switching back doesn't re-embed."""
     writer = ctx.writer
     previous_meta = previous_meta or {}
-    vectors_usable = previous_meta.get("retrievalMode") == "vector" and previous_meta.get("embeddingModelKey") == ctx.model_key
     if ctx.vector_mode:
+        vectors_usable = previous_meta.get("embeddingModelKey") == ctx.model_key
         if not vectors_usable and writer.has_vectors():
             writer.delete_all_vectors()
         ctx.missing_vectors = writer.paths_missing_vectors()
         ctx.embedding_dimension = writer.embedding_dimension()
-    elif writer.has_vectors():
-        writer.delete_all_vectors()
     ctx.missing_documents = {
         row[0]
         for row in writer.conn.execute(
@@ -886,8 +900,9 @@ def finish_reused_file(ctx: BuildContext, record: FileRecord, stat_result) -> No
         if rows:
             entries = [{"rowId": row[0], "text": row[1], "chunkHash": row[2]} for row in rows]
             embed_chunk_entries(ctx, entries, relative_path)
-            ctx.writer.insert_vectors([(entry["rowId"], *entry["quantized"]) for entry in entries])
-        ctx.missing_vectors.discard(relative_path)
+            ctx.writer.insert_vectors([(entry["rowId"], *entry["quantized"]) for entry in entries if entry.get("quantized") is not None])
+        if not ctx.embedding_error:
+            ctx.missing_vectors.discard(relative_path)
     if relative_path in ctx.missing_documents and record.status == STATUS_INDEXED:
         chunks = ctx.writer.chunks_for_path(relative_path)
         document = build_document_record(
@@ -934,6 +949,33 @@ def new_chunk_entry(relative_path: str, chunk_index: int, chunk_payload: dict[st
 
 
 def embed_chunk_entries(ctx: BuildContext, entries: list[dict[str, Any]], relative_path: str) -> None:
+    """Embed `entries`. If the provider fails (no credits, offline, rate limited, ...) the
+    build carries on without vectors: chunks are still stored and keyword-searchable, and
+    the error is reported to the caller. Cancelling still propagates."""
+    if ctx.embedding_error:
+        return
+    embeddings.retry_notifier = lambda note: progress(
+        ctx, "embedding", ctx.total_files, currentFile=relative_path, message=note
+    )
+    try:
+        set_chunk_vectors(ctx, entries, relative_path)
+    except EmbeddingError as exc:
+        ctx.embedding_error = str(exc)
+        log_warning(f"Embedding failed; finishing this sync with keyword search only: {exc}")
+        # Tell the user now, not only when the sync ends.
+        progress(
+            ctx,
+            "embedding",
+            ctx.total_files,
+            currentFile=relative_path,
+            message="Embedding failed. Continuing with keyword search only.",
+            warning=str(exc),
+        )
+    finally:
+        embeddings.retry_notifier = None
+
+
+def set_chunk_vectors(ctx: BuildContext, entries: list[dict[str, Any]], relative_path: str) -> None:
     """Set `quantized` on every entry: reuse a stored vector with the same chunk hash
     (same model; old rows of a changed file are still readable at this point), else embed."""
     pending: list[dict[str, Any]] = []
@@ -1024,18 +1066,25 @@ def commit_build(ctx: BuildContext, created_at: str, settings_dirty: bool) -> di
         writer.close()
         return read_manifest(ctx.index_dir)
 
+    # "vector" in the meta means every chunk has a vector. A build whose embeddings failed is
+    # recorded as keyword-only so semantic search is not served from a partial index.
+    semantic = ctx.vector_mode and not ctx.embedding_error
     meta: dict[str, Any] = {
         "version": INDEX_VERSION,
         "rootPath": str(ctx.root_path),
         "createdAt": created_at,
         "updatedAt": utc_now(),
-        "retrievalMode": ctx.retrieval["mode"],
-        "indexEngine": ctx.retrieval["engine"],
+        "retrievalMode": "vector" if semantic else "vectorless",
+        "indexEngine": ctx.retrieval["engine"] if semantic or not ctx.vector_mode else "manifest-first-lexical",
     }
     drop_keys: list[str] = []
-    if ctx.vector_mode:
+    if writer.has_vectors():
+        # Keep what was embedded (also while using keyword search) so switching back is free.
         meta["embeddingDimension"] = writer.embedding_dimension()
-        meta["embeddingModelKey"] = ctx.model_key
+        previous_key = read_meta(writer.conn).get("embeddingModelKey") if ctx.in_place else None
+        meta["embeddingModelKey"] = ctx.model_key if ctx.vector_mode else previous_key
+        if not meta["embeddingModelKey"]:
+            del meta["embeddingModelKey"]
     else:
         drop_keys = ["embeddingDimension", "embeddingModelKey"]
     writer.finish(meta, drop_keys)
@@ -1229,13 +1278,15 @@ class ExtractionPipeline:
         plan = self.plans[index]
         return (str(plan.item.path), plan.item.relative_path, plan.previous_hash, plan.size, plan.mtime)
 
-    def _restart(self) -> None:
-        """Drop a broken pool and requeue every batch that was in flight."""
+    def _restart(self, count_failure: bool = True) -> None:
+        """Drop a broken pool and requeue every batch that was in flight. A timeout is a slow
+        file, not a broken pool, so it doesn't count toward giving up on the pool."""
         in_flight = sorted(self.futures)
         self.futures.clear()
         self._shutdown(terminate=True)
         self.pending.extendleft(reversed(in_flight))
-        self.restarts += 1
+        if count_failure:
+            self.restarts += 1
         if self.restarts > MAX_POOL_RESTARTS:
             log_warning("Extraction worker processes keep failing; continuing in the main process.")
             self.parallel = False
@@ -1266,6 +1317,7 @@ class ExtractionPipeline:
             number = self.batch_of[index]
             future = self.futures.pop(number)
             batch_started = time.monotonic()
+            time_limit = SINGLE_FILE_TIMEOUT_SECONDS if len(self.batches[number]) == 1 else BATCH_TIMEOUT_SECONDS
             timed_out = False
             try:
                 while True:
@@ -1276,21 +1328,25 @@ class ExtractionPipeline:
                         self.check_cancel(self.plans[index].item.relative_path)
                         if self._failed_to_start():
                             raise BrokenProcessPool("No extraction worker process started.")
-                        if time.monotonic() - batch_started >= BATCH_TIMEOUT_SECONDS:
+                        if time.monotonic() - batch_started >= time_limit:
                             timed_out = True
                             raise BrokenProcessPool("Extraction batch timed out.")
             except BrokenProcessPool:
                 # A worker died or hung. Restart the pool and retry: a batch is split into
                 # single files, and a single file that times out or takes the pool down twice
                 # is marked failed.
-                self._restart()
+                self._restart(count_failure=not timed_out)
                 batch = self.batches[number]
                 if len(batch) > 1:
                     singles = [self._add_batch([item]) for item in batch]
                     self.pending.extendleft(reversed(singles))
                     continue
                 if timed_out:
-                    return {"kind": "failed", "hash": None, "reason": "Timed out while extracting file."}
+                    return {
+                        "kind": "failed",
+                        "hash": None,
+                        "reason": f"Timed out after {int(time_limit)} s while extracting file.",
+                    }
                 self.crashes[number] = self.crashes.get(number, 0) + 1
                 if self.crashes[number] >= 2:
                     return {"kind": "failed", "hash": None, "reason": "The extraction process crashed on this file."}
@@ -1628,8 +1684,9 @@ def search_index(
         meta = read_meta(conn)
         if meta.get("version") not in SUPPORTED_INDEX_VERSIONS:
             raise ValueError("Unsupported index version.")
-        if (meta.get("retrievalMode") or "vector") != retrieval["mode"]:
-            raise ValueError("Index retrieval mode does not match the requested retrieval mode.")
+        if retrieval["mode"] == "vector" and (meta.get("retrievalMode") or "vector") != "vector":
+            # Keyword search can be served from any index; semantic search needs every chunk embedded.
+            raise ValueError("Semantic search is not available for this index yet; sync to finish embedding.")
         if top_k <= 0 or not conn.execute("SELECT EXISTS(SELECT 1 FROM chunks)").fetchone()[0]:
             return []
         if retrieval["mode"] == "vectorless":

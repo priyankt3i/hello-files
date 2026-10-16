@@ -13,7 +13,7 @@ Hello Files ("fschat" internally) is a Windows-first Electron desktop app. You p
   - `services/folder-watcher.ts`: debounced recursive `fs.watch` that triggers incremental syncs.
   - `services/python-worker.ts`: child-process bridge. Every call takes an `IndexTarget {rootPath, indexPath}`.
   - `services/spreadsheet-sql.ts`: intent detection, SQL-generation prompts, reply parsing and result formatting (pure functions).
-  - `providers/client.ts`: OpenAI, Azure, Anthropic, Gemini, Ollama, and `ANSWER_FORMAT_GUIDE` (the table/Mermaid/chart formatting instructions appended to every answer's system prompt).
+  - `providers/client.ts`: OpenAI, Azure, Anthropic, Gemini, OpenRouter, Ollama, and `ANSWER_FORMAT_GUIDE` (the table/Mermaid/chart formatting instructions appended to every answer's system prompt).
   - `providers/codex-client.ts`: Codex OAuth.
   - `db/database.ts`: SQLite.
 - `apps/desktop/src/preload/index.ts`: the `window.fsChat` API. Its renderer typing in `renderer/types/global.d.ts` is hand-written, so keep the two in sync.
@@ -91,7 +91,7 @@ If `npm install` fails while rebuilding `better-sqlite3`, install with `--ignore
 - `rebuild_index` is a full rebuild from scratch into `.tmp`, then a directory swap.
 - Extraction runs in a spawn-based process pool (`min(4, cpus-1)`, override with `maxWorkers`), used only when the estimated work is large enough. Workers' stdin/stdout are redirected before spawning, because on Windows they otherwise inherit the protocol pipe; a regression test covers this. The frozen app uses a higher threshold than dev because workers take about 5 s to spawn there.
 - Cancelling with retain-partial keeps the files already processed plus previous entries for the unprocessed files that are unchanged on disk.
-- An embedding failure aborts the build and keeps the previous index. Embedding HTTP calls time out after 60s (30s for queries) and retry twice on network errors, 408, 429 and 5xx.
+- An embedding failure does **not** abort the build: the sync finishes, new and changed files are stored (keyword-searchable), `ctx.embedding_error` is set, the meta is written as `retrievalMode: "vectorless"` (meaning "not every chunk has a vector") and the response carries `embeddingError`. The app shows it as a `lastError` warning; the next sync in semantic mode embeds only the chunks that lack a vector. While embedding, each retry is announced as a progress `message` (`embeddings.retry_notifier`), a failure is announced once as a progress `warning` (the renderer toasts it), and a 429 that names a daily quota is not retried. Embedding HTTP calls time out after 60s (30s for queries) and retry twice on network errors, 408, 429 and 5xx.
 - Benchmark on this laptop (3,000 files, 17k chunks): first build 3.8 s, no-change sync 0.17 s, keyword query about 32 ms.
 
 **Auto-sync.** `FolderWatcher` debounces events for 4s and then calls `syncChannel()`.
@@ -114,7 +114,9 @@ If `npm install` fails while rebuilding `better-sqlite3`, install with `--ignore
 - **Spreadsheet questions:** the SQL-generation call (and at most one repair call) sends the table and column names and types, 3 sample rows per sheet, up to 12 distinct values for low-cardinality text columns, and up to 2 earlier user questions to the chat provider. The exact result table (up to 50 rows) then goes to the answer call.
 
 **Retrieval.**
-- Vector: brute-force numpy cosine over int8 vectors cached per index and data version (top-10 overlap with float32 is at least 0.9). A mismatched embedding model raises "rebuild required".
+- Vector: brute-force numpy cosine over int8 vectors cached per index and data version (top-10 overlap with float32 is at least 0.9). A mismatched embedding model raises "rebuild required"; an index whose meta is not `vector` raises "Semantic search is not available for this index yet".
+- **Keyword search works on any index** (chunks, FTS and documents exist in both modes). In `sendMessage`, if the semantic path throws for any reason (provider down or out of credits, no embedding model, index not fully embedded) the question is answered with keyword search and `SendMessageResult.notice` makes the renderer show a toast. Only the "index outdated or missing" error is not swallowed.
+- **Switching modes never deletes vectors.** `retrievalMode` in the meta/manifest is "vector" only while every chunk has a vector. Keyword-mode builds keep the `vectors` table and `embeddingModelKey` (the manifest reports them in either mode); chunks of changed files lose their vectors via the delete trigger. `updateChannelModels` no longer clears the index: moving to semantic search or choosing another embedding model starts a forced sync that embeds only what lacks a vector for that model; changing the model drops the old model's vectors at the start of that sync.
 - Keyword: FTS5 BM25 (inverted so higher is better) plus a path bonus and a visual bonus. User input is turned into quoted words joined by OR, so FTS syntax can't be injected. The TS side lexically pre-ranks the manifest and asks the model to choose documents first.
 
 **Exact spreadsheet calculation.** For analytical spreadsheet questions (count, sum, average, min/max, top N, group by/breakdown, per/each, trend, chart, compare, percent; detected by `detectAnalyticalIntent`), `tryExactSpreadsheetCalculation` in `app-service.ts` runs this flow. It never throws; on any failure it falls back to the row-chunk behaviour.
@@ -138,6 +140,7 @@ If `npm install` fails while rebuilding `better-sqlite3`, install with `--ignore
 
 **Providers.**
 - Chat and embedding models may come from different connections.
+- OpenRouter is OpenAI-compatible (`https://openrouter.ai/api`): chat via `/v1/chat/completions`, embeddings via `/v1/embeddings`. Discovery reads `/v1/models` and `/v1/embeddings/models`, lists models cheapest first with the price in the display name, and defaults to inexpensive models (`pickDefault*` have OpenRouter preference lists). It counts as an external destination for the data policy.
 - Azure OpenAI has no model discovery; the user enters an https endpoint, an API key, chat and/or embedding deployment names, and an API version (default `2024-10-21`).
 - Ollama accepts a custom server address; a non-local address is flagged in the UI and blocked in local-only mode.
 - Connections can be removed one at a time (`deleteProviderConnection`). Removing one clears the channels' model references and deletes the stored keytar secret.

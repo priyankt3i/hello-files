@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Channel } from "@fschat/shared";
 import { toErrorMessage } from "../../lib/format";
+import type { ModelLookup } from "../../lib/providers";
 import { useAppStore } from "../../state/store";
 import { Button } from "../ui/button";
 import { Callout } from "../ui/feedback";
@@ -9,6 +10,11 @@ import { ChatModelField, DataFlowNote, SearchTypeFields, validateSelection, with
 
 function fromChannel(channel: Channel): ModelSelection {
   return { chatModelId: channel.chatModelId, embeddingModelId: channel.embeddingModelId, retrievalMode: channel.retrievalMode };
+}
+
+function isFreeOpenRouterModel(modelId: string | null | undefined, lookup: ModelLookup) {
+  const model = modelId ? lookup.modelById[modelId] : undefined;
+  return Boolean(model && model.provider === "openrouter" && model.modelId.endsWith(":free"));
 }
 
 export function AiModelsSection({ channel }: { channel: Channel }) {
@@ -73,11 +79,25 @@ export function AiModelsSection({ channel }: { channel: Channel }) {
             <SearchTypeFields selection={draft} onChange={setDraft} />
           </div>
           <DataFlowNote selection={draft} />
-          {needsReindex ? (
-            <Callout tone="warning" title="This will require re-indexing">
-              Changing the search type or embedding model clears the current index. Run “Sync now” afterwards; chat is unavailable
-              until it finishes.
+          {draft.retrievalMode === "vector" && isFreeOpenRouterModel(draft.embeddingModelId, lookup) ? (
+            <Callout tone="warning" title="Free embedding models are heavily rate limited">
+              OpenRouter allows free models 20 requests a minute, even with credits, and 50 a day (1,000 once you've bought $10
+              of credits). Indexing is slowed to stay under that, so a large knowledge base takes a long time. A paid embedding
+              model such as openai/text-embedding-3-small costs about $0.02 per million tokens and has no such limit.
             </Callout>
+          ) : null}
+          {needsReindex ? (
+            draft.retrievalMode === "vector" ? (
+              <Callout tone="info" title="Embeddings will be updated in the background">
+                Saving starts a sync that embeds only the content that has no vectors for this embedding model yet. Chat keeps
+                working with keyword search until it finishes. If embedding fails, keyword search stays in use.
+              </Callout>
+            ) : (
+              <Callout tone="info" title="Takes effect right away">
+                Your index and stored embeddings are kept, so you can switch back to semantic search later without embedding
+                everything again.
+              </Callout>
+            )
           ) : null}
           {indexing ? <Callout tone="info">Model settings can't be changed while indexing is running.</Callout> : null}
           {error ? <Callout tone="danger">{error}</Callout> : null}

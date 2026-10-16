@@ -172,6 +172,9 @@ export function createCoreActions({ get, patch, toast }: ActionDeps) {
           ? { selectedThreadId: result.thread.id, messages: [...current.messages, result.userMessage, result.assistantMessage] }
           : {})
       }));
+      if (result.notice) {
+        toast.warning("Answered with keyword search", result.notice);
+      }
       if (get().selectedChannelId === channelId) {
         await refreshChannel(channelId, { preferredThreadId: get().selectedThreadId });
       }

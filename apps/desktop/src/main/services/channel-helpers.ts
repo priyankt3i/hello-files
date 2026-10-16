@@ -21,6 +21,8 @@ export function labelForProvider(provider: string): string {
       return "Google Gemini";
     case "ollama":
       return "Ollama";
+    case "openrouter":
+      return "OpenRouter";
     default:
       return provider;
   }
@@ -79,5 +81,5 @@ export function deriveCancelledChannelStatus(files: IndexedFileRecord[]): Exclud
 }
 
 export function providerSupportsMultimodalInput(provider: ProviderConnection["provider"]): boolean {
-  return ["openai", "openai-codex", "azure-openai", "anthropic", "google", "ollama"].includes(provider);
+  return ["openai", "openai-codex", "azure-openai", "anthropic", "google", "ollama", "openrouter"].includes(provider);
 }

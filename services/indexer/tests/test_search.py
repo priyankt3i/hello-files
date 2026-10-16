@@ -115,17 +115,63 @@ def test_vector_reuse_and_model_mismatch(tree, tmp_path, monkeypatch):
     assert worker.search_index(root, "wind", 1, vector_options("m2"), index_path=index)[0]["relativePath"] == "b.txt"
 
 
-def test_embedding_failure_aborts_build_and_keeps_previous_index(tree, tmp_path, monkeypatch):
-    monkeypatch.setattr(worker, "embed_texts", lambda p, t, **k: fake_embed(p, t))
+def test_embedding_failure_falls_back_to_keyword_index(tree, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(worker, "embed_texts", lambda p, t, **k: calls.append(len(t)) or fake_embed(p, t))
+    monkeypatch.setattr(worker, "embed_query", lambda p, t, **k: fake_embed(p, [t])[0])
     root = tree({"a.txt": "solar panels"})
     index = tmp_path / "idx"
     first = worker.build_index("c", root, vector_options("m1"), index_path=index)
+    assert first["embeddingError"] is None and first["manifest"]["retrievalMode"] == "vector"
 
     def down(*args, **kwargs):
         raise worker.EmbeddingError("Could not reach embedding provider.")
 
     monkeypatch.setattr(worker, "embed_texts", down)
-    (root / "b.txt").write_text("new file", encoding="utf-8")
-    with pytest.raises(worker.EmbeddingError):
-        worker.build_index("c", root, vector_options("m1"), index_path=index)
-    assert worker.read_manifest(index)["updatedAt"] == first["manifest"]["updatedAt"]
+    (root / "b.txt").write_text("wind turbines", encoding="utf-8")
+    result = worker.build_index("c", root, vector_options("m1"), index_path=index)
+    # The sync still finishes: the new file is indexed and keyword-searchable.
+    assert result["stats"]["added"] == 1 and result["stats"]["failed"] == 0
+    assert result["embeddingError"] == "Could not reach embedding provider."
+    assert result["manifest"]["retrievalMode"] == "vectorless"
+    assert [hit["relativePath"] for hit in worker.search_index(root, "turbines", 5, VECTORLESS, index_path=index)] == ["b.txt"]
+    # Semantic search is refused until the missing vectors exist (no silent partial results).
+    with pytest.raises(ValueError, match="Semantic search is not available"):
+        worker.search_index(root, "solar", 1, vector_options("m1"), index_path=index)
+
+    # Once the provider works again, only the missing chunks are embedded.
+    calls.clear()
+    monkeypatch.setattr(worker, "embed_texts", lambda p, t, **k: calls.append(len(t)) or fake_embed(p, t))
+    recovered = worker.build_index("c", root, vector_options("m1"), index_path=index)
+    assert sum(calls) == 1 and recovered["embeddingError"] is None
+    assert recovered["manifest"]["retrievalMode"] == "vector"
+    assert worker.search_index(root, "wind turbines", 1, vector_options("m1"), index_path=index)[0]["relativePath"] == "b.txt"
+
+
+def test_first_build_with_failing_embeddings_is_a_keyword_index(tree, tmp_path, monkeypatch):
+    def down(*args, **kwargs):
+        raise worker.EmbeddingError("out of credits")
+
+    monkeypatch.setattr(worker, "embed_texts", down)
+    root = tree({"a.txt": "solar panels", "b.txt": "wind turbines"})
+    index = tmp_path / "idx"
+    result = worker.build_index("c", root, vector_options("m1"), index_path=index)
+    assert result["stats"]["added"] == 2 and result["embeddingError"] == "out of credits"
+    assert result["manifest"]["retrievalMode"] == "vectorless"
+    assert "embeddingModelKey" not in result["manifest"]
+    assert [hit["relativePath"] for hit in worker.search_index(root, "solar", 5, VECTORLESS, index_path=index)] == ["a.txt"]
+
+
+def test_embedding_failure_is_reported_while_the_sync_runs(tree, tmp_path, monkeypatch):
+    def down(*args, **kwargs):
+        raise worker.EmbeddingError("Rate limit exceeded: free-models-per-day")
+
+    events = []
+    monkeypatch.setattr(worker, "embed_texts", down)
+    monkeypatch.setattr(worker, "emit_progress", events.append)
+    root = tree({"a.txt": "solar panels", "b.txt": "wind turbines"})
+    worker.build_index("c", root, vector_options("m1"), index_path=tmp_path / "idx")
+    warnings = [event for event in events if event.get("warning")]
+    assert len(warnings) == 1  # said once, at the moment it happened
+    assert "free-models-per-day" in warnings[0]["warning"]
+    assert warnings[0]["phase"] == "embedding" and "keyword search" in warnings[0]["message"]

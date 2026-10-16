@@ -116,6 +116,8 @@ const IGNORED_STDERR_PATTERNS = [
   "openpyxl\\worksheet\\_reader.py:329: UserWarning"
 ];
 
+const INDEX_OUTDATED_MESSAGE = "This channel's index is outdated or missing. Regenerate the index before chatting.";
+
 export class DesktopAppService {
   private db: AppDatabase;
   private worker: PythonWorkerBridge;
@@ -595,30 +597,13 @@ export class DesktopAppService {
     );
     this.assertValidChannelModelSelection(nextModels.chatModelId, nextModels.embeddingModelId);
 
-    if (nextModels.retrievalMode !== channel.retrievalMode) {
-      this.db.replaceIndexedFiles(channel.id, []);
-      nextStatus = "idle";
-      nextLastIndexedAt = null;
-    } else if (
+    // The index (chunks, keyword index and any stored vectors) is never thrown away by a switch between
+    // keyword and semantic search or by choosing another embedding model. Chat keeps working through keyword
+    // search; moving to semantic search starts a sync that only embeds what has no vector for this model yet.
+    const needsSemanticSync =
       nextModels.retrievalMode === "vector" &&
-      nextModels.embeddingModelId &&
-      nextModels.embeddingModelId !== channel.embeddingModelId
-    ) {
-      const embeddingSelection = await this.resolveModelSelection(nextModels.embeddingModelId, { enforcePolicy: false });
-      const status = await this.worker.getIndexStatus(channelIndexTarget(channel));
-      const expectedKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
-      const matchesExistingIndex = status.exists && status.manifest?.embeddingModelKey === expectedKey;
-
-      if (!matchesExistingIndex) {
-        this.db.replaceIndexedFiles(channel.id, []);
-        nextStatus = "idle";
-        nextLastIndexedAt = null;
-      } else {
-        this.db.replaceIndexedFiles(channel.id, status.manifest?.files ?? []);
-        nextStatus = deriveChannelStatusFromFiles(status.manifest?.files ?? []);
-        nextLastIndexedAt = status.manifest?.updatedAt ?? channel.lastIndexedAt;
-      }
-    }
+      Boolean(channel.lastIndexedAt) &&
+      (channel.retrievalMode !== "vector" || nextModels.embeddingModelId !== channel.embeddingModelId);
 
     this.db.updateChannel(channel.id, {
       preferredConnectionId: nextModels.preferredConnectionId,
@@ -630,6 +615,9 @@ export class DesktopAppService {
       updatedAt: new Date().toISOString()
     });
     this.refreshWatchers();
+    if (needsSemanticSync && !this.worker.hasActiveBuild(channel.id)) {
+      void this.syncChannel(channel.id, { force: true });
+    }
 
     return this.loadChannel(channel.id);
   }
@@ -818,7 +806,7 @@ export class DesktopAppService {
     if (!chatSelection.model.supportsChat) {
       throw new Error("Selected chat model does not support chat.");
     }
-    let searchResponse;
+    let searchResponse: { results: SearchResult[] } = { results: [] };
     let contextNotes: string[] = [];
     let deterministicAssistantText: string | null = null;
     let exactCalculation: ExactCalculation | null = null;
@@ -828,52 +816,69 @@ export class DesktopAppService {
     const existingThread = input.threadId ? this.db.listThreads(channel.id).find((candidate) => candidate.id === input.threadId) : null;
     const history = existingThread ? this.db.listMessages(existingThread.id) : [];
 
-    if (channel.retrievalMode === "vector") {
-      if (!channel.embeddingModelId) {
-        throw new Error("An embedding model is required for vector channels.");
-      }
-      const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
-      if (!embeddingSelection.model.supportsEmbedding) {
-        throw new Error("Selected embedding model does not support embeddings.");
-      }
-      const queryOptions = this.toWorkerBuildOptions({
-        retrievalMode: "vector",
-        connection: embeddingSelection.connection,
-        model: embeddingSelection.model,
-        secret: embeddingSelection.secret
-      });
+    // Semantic search needs the embedding provider. If anything on that path fails (no credits, offline,
+    // rate limited, index not embedded yet, ...) the question is answered with keyword search instead.
+    let useKeywordRetrieval = channel.retrievalMode !== "vector";
+    let semanticFallbackReason: string | null = null;
+    if (!useKeywordRetrieval) {
       try {
-        searchResponse = await this.worker.search(channelIndexTarget(channel), input.message, 6, queryOptions);
-      } catch (error) {
-        if (isInvalidIndexError(error)) {
-          await this.invalidateChannelIndex(channel, "This channel's index is outdated or missing. Regenerate the index before chatting.");
+        if (!channel.embeddingModelId) {
+          throw new Error("An embedding model is required for vector channels.");
         }
-        throw error;
-      }
-      if (queryProfile.analytical) {
-        // Semantic retrieval returns excerpts, not documents: pick the spreadsheets to calculate over.
-        try {
-          documentManifestDocuments = (await this.worker.listDocuments(channelIndexTarget(channel))).documents;
-        } catch {
-          documentManifestDocuments = [];
+        const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
+        if (!embeddingSelection.model.supportsEmbedding) {
+          throw new Error("Selected embedding model does not support embeddings.");
         }
-        const retrievedPaths = new Set(searchResponse.results.map((item) => item.relativePath));
-        const spreadsheets = documentManifestDocuments.filter(isTabularDocument);
-        const retrieved = spreadsheets.filter((document) => retrievedPaths.has(document.relativePath));
-        const others = preselectManifestDocuments(
-          spreadsheets.filter((document) => !retrievedPaths.has(document.relativePath)),
-          input.message,
-          MAX_CALCULATION_DOCUMENTS
-        );
-        exactCalculation = await this.tryExactSpreadsheetCalculation({
-          channel,
-          chatSelection,
-          documents: [...retrieved, ...others].slice(0, MAX_CALCULATION_DOCUMENTS),
-          question: input.message,
-          history
+        const queryOptions = this.toWorkerBuildOptions({
+          retrievalMode: "vector",
+          connection: embeddingSelection.connection,
+          model: embeddingSelection.model,
+          secret: embeddingSelection.secret
         });
+        try {
+          searchResponse = await this.worker.search(channelIndexTarget(channel), input.message, 6, queryOptions);
+        } catch (error) {
+          if (isInvalidIndexError(error)) {
+            await this.invalidateChannelIndex(channel, INDEX_OUTDATED_MESSAGE);
+          }
+          throw error;
+        }
+        if (queryProfile.analytical) {
+          // Semantic retrieval returns excerpts, not documents: pick the spreadsheets to calculate over.
+          try {
+            documentManifestDocuments = (await this.worker.listDocuments(channelIndexTarget(channel))).documents;
+          } catch {
+            documentManifestDocuments = [];
+          }
+          const retrievedPaths = new Set(searchResponse.results.map((item) => item.relativePath));
+          const spreadsheets = documentManifestDocuments.filter(isTabularDocument);
+          const retrieved = spreadsheets.filter((document) => retrievedPaths.has(document.relativePath));
+          const others = preselectManifestDocuments(
+            spreadsheets.filter((document) => !retrievedPaths.has(document.relativePath)),
+            input.message,
+            MAX_CALCULATION_DOCUMENTS
+          );
+          exactCalculation = await this.tryExactSpreadsheetCalculation({
+            channel,
+            chatSelection,
+            documents: [...retrieved, ...others].slice(0, MAX_CALCULATION_DOCUMENTS),
+            question: input.message,
+            history
+          });
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message === INDEX_OUTDATED_MESSAGE) {
+          throw error;
+        }
+        semanticFallbackReason = error instanceof Error ? error.message : "semantic search failed";
+        console.warn(`[hello-files] Semantic search failed for ${channel.displayName}; using keyword search:`, error);
+        useKeywordRetrieval = true;
+        searchResponse = { results: [] };
+        exactCalculation = null;
+        documentManifestDocuments = [];
       }
-    } else {
+    }
+    if (useKeywordRetrieval) {
       const documentManifest = await this.worker.listDocuments(channelIndexTarget(channel));
       documentManifestDocuments = documentManifest.documents;
       const candidateDocuments = preselectManifestDocuments(documentManifest.documents, input.message, 24);
@@ -964,7 +969,7 @@ export class DesktopAppService {
         }
       } catch (error) {
         if (isInvalidIndexError(error)) {
-          await this.invalidateChannelIndex(channel, "This channel's index is outdated or missing. Regenerate the index before chatting.");
+          await this.invalidateChannelIndex(channel, INDEX_OUTDATED_MESSAGE);
         }
         throw error;
       }
@@ -1058,7 +1063,10 @@ export class DesktopAppService {
         updatedAt: assistantMessage.createdAt
       },
       userMessage,
-      assistantMessage
+      assistantMessage,
+      ...(semanticFallbackReason
+        ? { notice: `Semantic search wasn't available (${summarizeSearchFailure(semanticFallbackReason)}), so this answer used keyword search.` }
+        : {})
     };
   }
 
@@ -1255,7 +1263,10 @@ export class DesktopAppService {
     this.db.updateChannel(channel.id, {
       lastIndexedAt: response.manifest.updatedAt,
       lastIndexStats: response.stats ?? null,
-      lastError: null,
+      // The sync itself worked (files are indexed and keyword-searchable); only the embeddings failed.
+      lastError: response.embeddingError
+        ? `Semantic search is paused: ${summarizeSearchFailure(response.embeddingError)} Chat uses keyword search until a sync can embed the new content.`
+        : null,
       status: deriveChannelStatusFromFiles(response.files),
       updatedAt: new Date().toISOString()
     });
@@ -1406,7 +1417,7 @@ export class DesktopAppService {
     }
 
     const status = await this.worker.getIndexStatus(channelIndexTarget(channel));
-    if (!status.exists || !status.manifest || status.manifest.retrievalMode !== channel.retrievalMode) {
+    if (!status.exists || !status.manifest) {
       if (channel.lastIndexedAt || channel.status === "ready" || channel.status === "stale") {
         this.db.replaceIndexedFiles(channel.id, []);
         this.db.updateChannel(channel.id, {
@@ -1418,42 +1429,17 @@ export class DesktopAppService {
       return this.db.getChannel(channel.id);
     }
 
-    if (channel.retrievalMode === "vector") {
-      if (!channel.embeddingModelId) {
-        return channel;
-      }
-
-      const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId, { enforcePolicy: false });
-      const expectedEmbeddingKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
-      if (status.manifest.embeddingModelKey !== expectedEmbeddingKey) {
-        if (channel.lastIndexedAt || channel.status === "ready" || channel.status === "stale") {
-          this.db.replaceIndexedFiles(channel.id, []);
-          this.db.updateChannel(channel.id, {
-            lastIndexedAt: null,
-            status: "idle",
-            updatedAt: new Date().toISOString()
-          });
-        }
-        return this.db.getChannel(channel.id);
-      }
+    // Every index can serve keyword search. A semantic-search channel whose index has no vectors for its
+    // embedding model yet (switched modes, changed model, or embedding failed) stays usable: chat falls back to
+    // keyword search until a sync has embedded the rest.
+    this.db.replaceIndexedFiles(channel.id, status.manifest.files);
+    if (channel.lastIndexedAt !== status.manifest.updatedAt || channel.status === "idle" || channel.status === "error") {
+      this.db.updateChannel(channel.id, {
+        lastIndexedAt: status.manifest.updatedAt,
+        status: deriveChannelStatusFromFiles(status.manifest.files),
+        updatedAt: new Date().toISOString()
+      });
     }
-
-    if (
-      status.exists &&
-      status.manifest &&
-      status.manifest.retrievalMode === channel.retrievalMode
-    ) {
-      this.db.replaceIndexedFiles(channel.id, status.manifest.files);
-      if (channel.lastIndexedAt !== status.manifest.updatedAt || channel.status === "idle" || channel.status === "error") {
-        this.db.updateChannel(channel.id, {
-          lastIndexedAt: status.manifest.updatedAt,
-          status: deriveChannelStatusFromFiles(status.manifest.files),
-          updatedAt: new Date().toISOString()
-        });
-      }
-      return this.db.getChannel(channel.id);
-    }
-
     return this.db.getChannel(channel.id);
   }
 
@@ -1863,3 +1849,8 @@ function resolveDatabasePath() {
   return dbPath;
 }
 
+/** One short line for the toast: the provider's message without stack-like noise. */
+function summarizeSearchFailure(message: string) {
+  const oneLine = message.replace(/\s+/g, " ").trim();
+  return oneLine.length > 160 ? `${oneLine.slice(0, 157)}...` : oneLine;
+}

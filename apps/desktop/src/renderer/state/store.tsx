@@ -60,6 +60,15 @@ function useStoreController() {
         const name = stateRef.current.channels.find((channel) => channel.id === event.channelId)?.displayName ?? "A knowledge base";
         toast.error(`Indexing failed for ${name}`, event.message, `index-error-${event.channelId}`);
       }
+      if (event.warning) {
+        const name = stateRef.current.channels.find((channel) => channel.id === event.channelId)?.displayName ?? "A knowledge base";
+        toast.show({
+          tone: "warning",
+          title: `Semantic search paused for ${name}`,
+          description: `${event.warning} Files are still being indexed for keyword search.`,
+          id: `embed-warning-${event.channelId}`
+        });
+      }
       if ((event.phase === "completed" || event.phase === "cancelled") && stateRef.current.selectedChannelId === event.channelId) {
         void actions.reloadChannel(event.channelId);
       }

@@ -198,3 +198,23 @@ def test_pool_that_never_starts_falls_back_to_in_process(tree, tmp_path, monkeyp
     assert result["stats"]["added"] == 8
     assert any("did not start" in message for message in warnings)
     assert not wait_for_no_children()
+
+
+def test_single_file_timeout_marks_failed_without_giving_up_on_the_pool(tree, monkeypatch):
+    monkeypatch.setattr(worker, "PARALLEL_MIN_ESTIMATED_SECONDS", 0.0)
+    monkeypatch.setattr(worker, "BATCH_MAX_FILES", 1)  # every file is its own batch
+    monkeypatch.setattr(worker, "SINGLE_FILE_TIMEOUT_SECONDS", 1.0)
+    root = tree({f"f{index}.txt": "x" for index in range(2)})
+    discovered = worker.discover_files(root)
+    plans = [worker.FilePlan(item, "work", None, 1, item.stat.st_mtime) for item in discovered]
+    pipeline = worker.ExtractionPipeline(plans, 2, lambda _relative_path: None)
+    pipeline.batch_task = slow_batch
+    assert pipeline.parallel
+    try:
+        result = pipeline.result_for(0)
+        assert result["kind"] == "failed"
+        assert result["reason"] == "Timed out after 1 s while extracting file."
+        assert pipeline.restarts == 0 and pipeline.parallel  # a slow file is not a broken pool
+    finally:
+        pipeline.close(cancel=True)
+    assert not wait_for_no_children()

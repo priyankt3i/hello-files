@@ -17,6 +17,8 @@ const PROVIDER_NOTES: Record<ProviderKind, string> = {
     "Claude chat models. Anthropic doesn't provide embeddings, so use keyword search or pair it with another provider for semantic search.",
   google: "Gemini chat and embedding models are found automatically. Content you ask about is sent to Google.",
   ollama: "Runs models on this computer, so nothing leaves your machine. Ollama must be installed and running (http://localhost:11434).",
+  openrouter:
+    "One API key for hundreds of chat models and low-cost embedding models. Models are listed cheapest first with their price per million tokens. Content you ask about is sent to OpenRouter and the model's host.",
   "openai-codex": "Signs in with a ChatGPT account in your browser. Chat only; knowledge bases using it must use keyword search."
 };
 
@@ -35,7 +37,7 @@ function isLocalAddress(address: string) {
 export function ProviderForm({ onDone }: { onDone: () => void }) {
   const { state, actions } = useAppStore();
   const localOnly = state.settings.dataPolicy === "local-only";
-  const kinds: ProviderKind[] = ["openai", "azure-openai", "anthropic", "google", "ollama", ...(state.features.codexEnabled ? (["openai-codex"] as const) : [])];
+  const kinds: ProviderKind[] = ["openai", "azure-openai", "anthropic", "google", "openrouter", "ollama", ...(state.features.codexEnabled ? (["openai-codex"] as const) : [])];
   const [provider, setProvider] = useState<ProviderKind>(localOnly ? "ollama" : "openai");
   const [name, setName] = useState("");
   const [apiKey, setApiKey] = useState("");

@@ -3,7 +3,7 @@ export const INDEX_VERSION = 3;
 
 export type ChannelStatus = "ready" | "indexing" | "stale" | "error" | "idle";
 export type FileIndexStatus = "indexed" | "failed" | "skipped";
-export type ProviderKind = "openai" | "openai-codex" | "azure-openai" | "anthropic" | "google" | "ollama";
+export type ProviderKind = "openai" | "openai-codex" | "azure-openai" | "anthropic" | "google" | "ollama" | "openrouter";
 export type ModelCapability = "chat" | "embedding" | "vision";
 export type RetrievalMode = "vector" | "vectorless";
 export type DataPolicy = "any" | "local-only";
@@ -219,6 +219,8 @@ export interface IndexProgressEvent {
   failureCount: number;
   currentFile?: string;
   message?: string;
+  /** Something went wrong that doesn't stop the sync, e.g. embeddings failed and keyword search is used instead. */
+  warning?: string;
 }
 
 export interface IndexFileUpdateEvent {
@@ -405,6 +407,8 @@ export interface SendMessageResult {
   thread: Thread;
   userMessage: Message;
   assistantMessage: Message;
+  /** Set when the answer was produced differently than configured, e.g. semantic search failed and keyword search was used. */
+  notice?: string;
 }
 
 export interface WorkerBuildOptions {
@@ -432,6 +436,8 @@ export interface WorkerBuildResponse {
   cancelled?: boolean;
   retainedPartial?: boolean;
   stats?: IndexBuildStats;
+  /** Set when embedding failed during the build: the index was still updated and is keyword-searchable. */
+  embeddingError?: string | null;
 }
 
 export interface WorkerEnvelope<TPayload = unknown> {

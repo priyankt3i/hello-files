@@ -112,7 +112,7 @@ export function SearchTypeFields({
         <Field
           label="Embedding model"
           htmlFor={`${id}-embedding`}
-          hint="Can come from a different provider than the chat model. Changing it later requires re-indexing."
+          hint="Can come from a different provider than the chat model. Changing it later re-embeds the knowledge base with the new model; chat keeps working with keyword search meanwhile."
         >
           <ModelSelect
             id={`${id}-embedding`}

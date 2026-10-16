@@ -14,7 +14,8 @@ export const PROVIDER_LABEL: Record<ProviderKind, string> = {
   "azure-openai": "Azure OpenAI",
   anthropic: "Anthropic",
   google: "Google Gemini",
-  ollama: "Ollama"
+  ollama: "Ollama",
+  openrouter: "OpenRouter"
 };
 
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api"
 DEFAULT_TIMEOUT_SECONDS = 60
 QUERY_TIMEOUT_SECONDS = 30
 MAX_RETRIES = 2
@@ -17,16 +19,44 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # Indirection so tests can avoid real sleeps.
 _sleep = time.sleep
+_monotonic = time.monotonic
+
+# OpenRouter's free (":free") models allow 20 requests a minute, with or without credits. Space
+# requests out instead of hitting the limit and having to wait for the window to reset.
+FREE_MODEL_MIN_INTERVAL_SECONDS = 3.2
+_last_free_model_request = 0.0
+MAX_RATE_LIMIT_WAIT_SECONDS = 65.0
+
+# Called with a short human-readable line before each retry, so the UI can say "rate limited,
+# retrying in 20 s" instead of looking frozen. Set by the build while it embeds.
+retry_notifier: Callable[[str], None] | None = None
+
+# A daily quota doesn't clear in seconds, so retrying only makes the wait longer.
+_DAILY_LIMIT = re.compile(r"per[- ]day|daily", re.IGNORECASE)
 
 
 class EmbeddingError(RuntimeError):
     """Raised when the embedding provider cannot be reached or rejects the request."""
 
 
+def pace_free_model(provider: dict) -> None:
+    global _last_free_model_request
+    if provider.get("provider") != "openrouter" or not str(provider.get("model") or "").endswith(":free"):
+        return
+    wait = _last_free_model_request + FREE_MODEL_MIN_INTERVAL_SECONDS - _monotonic()
+    if wait > 0:
+        _sleep(wait)
+    _last_free_model_request = _monotonic()
+
+
 def embed_texts(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
+    pace_free_model(provider)
     kind = provider.get("provider")
     if kind == "openai":
         return openai_embeddings(provider, texts, timeout_seconds=timeout_seconds)
+    if kind == "openrouter":
+        # OpenRouter speaks the OpenAI embeddings protocol at /api/v1/embeddings.
+        return openai_embeddings(provider, texts, timeout_seconds=timeout_seconds, default_base_url=OPENROUTER_BASE_URL)
     if kind == "azure-openai":
         return azure_openai_embeddings(provider, texts, timeout_seconds=timeout_seconds)
     if kind == "google":
@@ -40,12 +70,20 @@ def embed_query(provider: dict, text: str, timeout_seconds: float = QUERY_TIMEOU
     return embed_texts(provider, [text], timeout_seconds=timeout_seconds)[0]
 
 
-def openai_embeddings(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
-    url = join_url(provider.get("baseUrl") or "https://api.openai.com", "/v1/embeddings")
+def openai_embeddings(
+    provider: dict,
+    texts: list[str],
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    default_base_url: str = "https://api.openai.com",
+) -> list[list[float]]:
+    url = join_url(provider.get("baseUrl") or default_base_url, "/v1/embeddings")
     payload = {"model": provider.get("model"), "input": texts}
     headers = {"Authorization": f"Bearer {provider.get('apiKey', '')}", "Content-Type": "application/json"}
     data = post_json(url, headers, payload, timeout_seconds=timeout_seconds)
-    return [item["embedding"] for item in data["data"]]
+    items = data["data"]
+    if all(isinstance(item.get("index"), int) for item in items):
+        items = sorted(items, key=lambda item: item["index"])
+    return [item["embedding"] for item in items]
 
 
 def azure_openai_embeddings(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
@@ -126,18 +164,28 @@ def post_json(
             message = f"Embedding request to {host} failed with HTTP {exc.code}{f': {detail}' if detail else ''}."
             if exc.code not in RETRYABLE_STATUS_CODES or attempt >= max_retries:
                 raise EmbeddingError(message) from None
-            retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+            if exc.code == 429 and _DAILY_LIMIT.search(detail):
+                raise EmbeddingError(message) from None
+            problem = "is rate limiting requests" if exc.code == 429 else f"returned HTTP {exc.code}"
+            headers = exc.headers or {}
+            retry_after = parse_retry_after(headers.get("Retry-After"))
+            if retry_after is None:
+                retry_after = parse_rate_limit_reset(headers.get("X-RateLimit-Reset"))
         except (urllib_error.URLError, socket.timeout, TimeoutError, ConnectionError) as exc:
             reason = getattr(exc, "reason", None) or exc
             if isinstance(reason, (socket.timeout, TimeoutError)):
                 message = f"Embedding request to {host} timed out after {timeout_seconds:g}s."
+                problem = f"timed out after {timeout_seconds:g}s"
             else:
                 message = f"Could not reach embedding provider at {host}: {reason}."
+                problem = "could not be reached"
             if attempt >= max_retries:
                 raise EmbeddingError(message) from None
         delay = RETRY_BASE_DELAY_SECONDS * (2**attempt)
         if retry_after is not None:
-            delay = max(delay, min(retry_after, 30.0))
+            delay = max(delay, min(retry_after, MAX_RATE_LIMIT_WAIT_SECONDS))
+        if retry_notifier is not None:
+            retry_notifier(f"{host} {problem}. Retrying in {delay:g}s (attempt {attempt + 2} of {max_retries + 1})...")
         _sleep(delay)
         attempt += 1
 
@@ -164,6 +212,16 @@ def read_error_detail(exc: urllib_error.HTTPError, limit: int = 300) -> str:
         pass
     body = " ".join(body.split())
     return body[:limit]
+
+
+def parse_rate_limit_reset(value: str | None) -> float | None:
+    """Seconds until a rate-limit window resets, from an X-RateLimit-Reset header (epoch milliseconds)."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value) / 1000.0 - time.time())
+    except ValueError:
+        return None
 
 
 def parse_retry_after(value: str | None) -> float | None:
