@@ -30,7 +30,7 @@ from uuid import uuid4
 import numpy as np
 
 from embeddings import EmbeddingError, batched, embed_query, embed_texts
-from extractors import dedupe_preserve_order, extract_document, normalize_text
+from extractors import dedupe_preserve_order, extract_document, load_fitz, normalize_text
 from index_store import (
     CHUNK_COLUMNS,
     INDEX_DIR_NAME,
@@ -46,6 +46,7 @@ from index_store import (
     create_database,
     db_path,
     ensure_sqlite_index,
+    finalize_bulk_database,
     import_index,
     index_exists,
     index_key,
@@ -67,11 +68,6 @@ from index_store import (
     write_marker,
 )
 from vector_store import clear_index_cache, cosine_scores, load_vector_matrix, quantize_vector
-
-try:
-    import fitz  # type: ignore
-except ImportError:
-    fitz = None
 
 try:
     from PIL import Image
@@ -220,16 +216,21 @@ MAX_VISUAL_SUMMARY_LABELS = 12
 
 DEFAULT_MAX_FILE_SIZE_MB = 50
 MAX_WORKERS_LIMIT = 32
-# Spawning extraction processes costs ~1-3 s on Windows (each re-imports the parsers), so
+# Spawning extraction processes costs ~1-3 s on Windows (each re-imports the worker), so
 # the pool is only used when the estimated extraction work is larger than that.
-PARALLEL_MIN_ESTIMATED_SECONDS = 3.0
+# A PyInstaller-frozen child re-launches the bundled executable, which costs several more
+# seconds than a plain interpreter (measured ~5 s vs ~1.5 s).
+PARALLEL_MIN_ESTIMATED_SECONDS = 10.0 if getattr(sys, "frozen", False) else 3.0
 HEAVY_EXTRACTION_SECONDS = 0.5
 HEAVY_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".xls",
     ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
 }
-PREFETCH_PER_WORKER = 4
+PREFETCH_PER_WORKER = 2
+BATCH_MAX_FILES = 32
+BATCH_MAX_SECONDS = 0.25
 MAX_POOL_RESTARTS = 3
+POOL_START_TIMEOUT_SECONDS = 30.0
 FUTURE_POLL_SECONDS = 0.2
 UNCHANGED_PROGRESS_INTERVAL = 0.1
 IGNORED_DIR_NAMES = {
@@ -522,7 +523,7 @@ def build_index(
         previous_files = writer.file_map()
     else:
         previous_files = load_previous_file_map(index_dir) if previous_meta is not None else {}
-        writer = IndexWriter(create_database(db_path(prepare_temp_store(index_dir))))
+        writer = IndexWriter(create_database(db_path(prepare_temp_store(index_dir)), bulk=True))
     created_at = (previous_meta.get("createdAt") if previous_meta else None) or utc_now()
     settings_dirty = not in_place or index_settings_changed(previous_meta or {}, retrieval, model_key)
     ctx = BuildContext(
@@ -758,7 +759,7 @@ def apply_plan(ctx: BuildContext, plan: FilePlan, result: dict[str, Any] | None)
         return None
     if plan.kind == "stat_error":
         record = failed_record(relative_path, None, None, plan.error or "Could not read file.")
-        writer.replace_file(record.to_dict(), None, [])
+        writer.replace_file(record.to_dict(), None, [], existed=ctx.in_place and previous_file is not None)
         return record, "failed"
     if plan.kind == "too_large":
         record = FileRecord(
@@ -771,7 +772,7 @@ def apply_plan(ctx: BuildContext, plan: FilePlan, result: dict[str, Any] | None)
             error_reason=f"Larger than {format_megabytes(ctx.build_options.max_file_size_mb)} MB limit",
         )
         if not ctx.in_place or previous_file != record.to_dict():
-            writer.replace_file(record.to_dict(), None, [])
+            writer.replace_file(record.to_dict(), None, [], existed=ctx.in_place and previous_file is not None)
         return record, "skipped"
     if plan.kind == "unchanged":
         record = reused_file_record(previous_file, stat_result)
@@ -789,7 +790,7 @@ def apply_plan(ctx: BuildContext, plan: FilePlan, result: dict[str, Any] | None)
         return record, "unchanged"
     if kind == "failed":
         record = failed_record(relative_path, stat_result, result.get("hash"), result.get("reason") or "Extraction failed.")
-        writer.replace_file(record.to_dict(), None, [])
+        writer.replace_file(record.to_dict(), None, [], existed=ctx.in_place and previous_file is not None)
         return record, "failed"
 
     file_hash = result["hash"]
@@ -805,7 +806,7 @@ def apply_plan(ctx: BuildContext, plan: FilePlan, result: dict[str, Any] | None)
         chunks=len(chunks),
         content_hash=file_hash,
     )
-    writer.replace_file(record.to_dict(), result["document"], chunks)
+    writer.replace_file(record.to_dict(), result["document"], chunks, existed=ctx.in_place and previous_file is not None)
     return record, ("updated" if previous_file else "added")
 
 
@@ -964,6 +965,8 @@ def commit_build(ctx: BuildContext, created_at: str, settings_dirty: bool) -> di
     else:
         drop_keys = ["embeddingDimension", "embeddingModelKey"]
     writer.finish(meta, drop_keys)
+    if not ctx.in_place:
+        finalize_bulk_database(writer.conn)
     writer.close()
     if not ctx.in_place:
         temp_store = temp_index_path(ctx.index_dir)
@@ -1040,22 +1043,57 @@ def extract_file_task(path_str: str, relative_path: str, previous_hash: str | No
         return {"kind": "failed", "hash": file_hash, "reason": describe_error(exc)}
 
 
-def _init_extraction_process() -> None:
+def _init_extraction_process(started=None) -> None:
     """Worker-process initializer: stdout belongs to the JSON protocol, so anything a
-    parser prints (from Python or native code) is redirected to stderr."""
+    parser prints (from Python or native code) is redirected to stderr. Signals `started`
+    so the parent can tell a pool that never comes up from one that is merely busy."""
     try:
-        sys.stdout.flush()
-        os.dup2(sys.stderr.fileno(), 1)
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        if sys.stderr is not None:
+            os.dup2(sys.stderr.fileno(), 1)
     except (OSError, AttributeError, ValueError):
         pass
-    sys.stdout = sys.stderr
+    if sys.stderr is not None:
+        sys.stdout = sys.stderr
+    if started is not None:
+        started.set()
 
 
-def create_extraction_pool(max_workers: int) -> ProcessPoolExecutor:
+_CHILD_STD_HANDLES_READY = False
+
+
+def prepare_child_std_handles() -> None:
+    """Windows: spawned processes inherit the process-level standard handles. Our stdin is
+    the protocol pipe, and the main thread sits in a blocking read on it; a child that
+    inherits that pipe blocks during interpreter start-up until the next request arrives,
+    so the pool would never start. Point the process-level stdin at nothing and stdout at
+    stderr before spawning. The worker's own sys.stdin/sys.stdout use C runtime file
+    descriptors that were bound at start-up, so the protocol is unaffected."""
+    global _CHILD_STD_HANDLES_READY
+    if _CHILD_STD_HANDLES_READY or os.name != "nt":
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetStdHandle.argtypes = [ctypes.c_uint32]
+    kernel32.GetStdHandle.restype = ctypes.c_void_p
+    kernel32.SetStdHandle.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    kernel32.SetStdHandle.restype = ctypes.c_int
+    std_input, std_output, std_error = (-10 & 0xFFFFFFFF, -11 & 0xFFFFFFFF, -12 & 0xFFFFFFFF)
+    kernel32.SetStdHandle(std_input, None)
+    error_handle = kernel32.GetStdHandle(std_error)
+    kernel32.SetStdHandle(std_output, error_handle)
+    _CHILD_STD_HANDLES_READY = True
+
+
+def create_extraction_pool(max_workers: int, started=None) -> ProcessPoolExecutor:
+    prepare_child_std_handles()
     return ProcessPoolExecutor(
         max_workers=max_workers,
         mp_context=multiprocessing.get_context("spawn"),
         initializer=_init_extraction_process,
+        initargs=(started,),
     )
 
 
@@ -1065,30 +1103,60 @@ def estimate_extraction_seconds(plan: FilePlan) -> float:
     return 0.002 + plan.size / 40_000_000
 
 
+def extract_batch_task(items: list[tuple]) -> list[dict[str, Any]]:
+    return [extract_file_task(*args) for args in items]
+
+
 class ExtractionPipeline:
-    """Runs `extract_file_task` for the "work" plans with a bounded look-ahead window and
-    hands results back strictly in plan order, so events stay ordered and at most
-    `max_workers * PREFETCH_PER_WORKER` extracted files are held in memory."""
+    """Runs `extract_file_task` for the "work" plans in worker processes and hands results
+    back strictly in plan order, so events stay ordered. Consecutive cheap files are sent
+    as one batch (fewer IPC round trips); heavy files go alone. At most
+    `max_workers * PREFETCH_PER_WORKER` batches are in flight, which bounds memory."""
 
     def __init__(self, plans: list[FilePlan], max_workers: int, check_cancel: Callable[[str | None], None]):
         self.plans = plans
-        self.pending: deque[int] = deque(index for index, plan in enumerate(plans) if plan.kind == "work")
+        work = [index for index, plan in enumerate(plans) if plan.kind == "work"]
         self.max_workers = max(1, int(max_workers))
-        estimated = sum(estimate_extraction_seconds(plans[index]) for index in self.pending)
-        self.parallel = self.max_workers > 1 and len(self.pending) >= 2 and estimated >= PARALLEL_MIN_ESTIMATED_SECONDS
+        estimates = {index: estimate_extraction_seconds(plans[index]) for index in work}
+        self.parallel = self.max_workers > 1 and len(work) >= 2 and sum(estimates.values()) >= PARALLEL_MIN_ESTIMATED_SECONDS
         self.window = self.max_workers * PREFETCH_PER_WORKER
         self.check_cancel = check_cancel
+        self.batches: list[list[int]] = []
+        self.batch_of: dict[int, int] = {}
+        current: list[int] = []
+        current_cost = 0.0
+        for index in work:
+            cost = estimates[index]
+            if current and (len(current) >= BATCH_MAX_FILES or current_cost + cost > BATCH_MAX_SECONDS):
+                self._add_batch(current)
+                current, current_cost = [], 0.0
+            current.append(index)
+            current_cost += cost
+        if current:
+            self._add_batch(current)
+        self.pending: deque[int] = deque(range(len(self.batches)))
         self.futures: dict[int, Future] = {}
+        self.ready: dict[int, dict[str, Any]] = {}
         self.crashes: dict[int, int] = {}
         self.executor: ProcessPoolExecutor | None = None
         self.restarts = 0
+        self.batch_task: Callable[[list[tuple]], list[dict[str, Any]]] = extract_batch_task
+        self.started: Any = None
+        self.started_at = 0.0
+
+    def _add_batch(self, indices: list[int]) -> int:
+        number = len(self.batches)
+        self.batches.append(list(indices))
+        for index in indices:
+            self.batch_of[index] = number
+        return number
 
     def _task_args(self, index: int) -> tuple:
         plan = self.plans[index]
         return (str(plan.item.path), plan.item.relative_path, plan.previous_hash, plan.size, plan.mtime)
 
     def _restart(self) -> None:
-        """Drop a broken pool and requeue everything that was in flight."""
+        """Drop a broken pool and requeue every batch that was in flight."""
         in_flight = sorted(self.futures)
         self.futures.clear()
         self._shutdown(terminate=True)
@@ -1100,42 +1168,65 @@ class ExtractionPipeline:
 
     def _fill(self) -> None:
         while self.parallel and self.pending and len(self.futures) < self.window:
-            index = self.pending[0]
+            number = self.pending[0]
             try:
                 if self.executor is None:
-                    self.executor = create_extraction_pool(self.max_workers)
-                future = self.executor.submit(extract_file_task, *self._task_args(index))
+                    self.started = multiprocessing.get_context("spawn").Event()
+                    self.started_at = time.monotonic()
+                    self.executor = create_extraction_pool(self.max_workers, started=self.started)
+                future = self.executor.submit(self.batch_task, [self._task_args(index) for index in self.batches[number]])
             except (BrokenProcessPool, OSError, RuntimeError) as exc:
                 log_warning(f"Extraction worker pool failed: {describe_error(exc)}")
                 self._restart()
                 continue
             self.pending.popleft()
-            self.futures[index] = future
+            self.futures[number] = future
 
     def result_for(self, index: int) -> dict[str, Any]:
         while True:
+            if index in self.ready:
+                return self.ready.pop(index)
             self._fill()
             if not self.parallel:
                 return extract_file_task(*self._task_args(index))
-            future = self.futures.pop(index)
+            number = self.batch_of[index]
+            future = self.futures.pop(number)
             try:
                 while True:
                     try:
-                        result = future.result(timeout=FUTURE_POLL_SECONDS)
+                        results = future.result(timeout=FUTURE_POLL_SECONDS)
                         break
                     except FuturesTimeoutError:
                         self.check_cancel(self.plans[index].item.relative_path)
+                        if self._failed_to_start():
+                            raise BrokenProcessPool("No extraction worker process started.")
             except BrokenProcessPool:
                 # A worker died (for example a native crash in a parser). Restart the pool and
-                # retry; a file that takes the pool down twice is marked failed.
-                self.crashes[index] = self.crashes.get(index, 0) + 1
+                # retry: a batch is split into single files, and a single file that takes the
+                # pool down twice is marked failed.
                 self._restart()
-                if self.crashes[index] >= 2:
+                batch = self.batches[number]
+                if len(batch) > 1:
+                    singles = [self._add_batch([item]) for item in batch]
+                    self.pending.extendleft(reversed(singles))
+                    continue
+                self.crashes[number] = self.crashes.get(number, 0) + 1
+                if self.crashes[number] >= 2:
                     return {"kind": "failed", "hash": None, "reason": "The extraction process crashed on this file."}
-                self.pending.appendleft(index)
+                self.pending.appendleft(number)
                 continue
+            for item, result in zip(self.batches[number], results):
+                self.ready[item] = result
             self._fill()
-            return result
+
+    def _failed_to_start(self) -> bool:
+        if self.started is None or self.started.is_set():
+            return False
+        if time.monotonic() - self.started_at < POOL_START_TIMEOUT_SECONDS:
+            return False
+        log_warning("Extraction worker processes did not start; continuing in the main process.")
+        self.restarts = MAX_POOL_RESTARTS
+        return True
 
     def _shutdown(self, terminate: bool) -> None:
         executor, self.executor = self.executor, None
@@ -1161,6 +1252,7 @@ class ExtractionPipeline:
         busy = bool(self.futures)
         self.futures.clear()
         self.pending.clear()
+        self.ready.clear()
         self._shutdown(terminate=cancel or busy)
 
 
@@ -1178,10 +1270,15 @@ def resolve_build_options(options: dict[str, Any]) -> BuildOptions:
         max_size_mb = DEFAULT_MAX_FILE_SIZE_MB
     if max_size_mb <= 0:
         max_size_mb = DEFAULT_MAX_FILE_SIZE_MB
+    try:
+        max_workers = int(options["maxWorkers"]) if options.get("maxWorkers") is not None else default_max_workers()
+    except (TypeError, ValueError):
+        max_workers = default_max_workers()
     return BuildOptions(
         exclude_patterns=[compile_glob(pattern) for pattern in patterns],
         max_file_size_mb=max_size_mb,
         include_hidden=bool(options.get("includeHidden", False)),
+        max_workers=min(max(max_workers, 1), MAX_WORKERS_LIMIT),
     )
 
 
@@ -1637,6 +1734,8 @@ def resolve_visual_asset_bytes(root_path: Path, asset: dict[str, Any]) -> bytes:
     source_path = safe_source_path(root_path, str(asset.get("relativePath") or ""))
     kind = str(asset.get("kind") or "")
 
+    if kind in {"pdf-page", "pdf-image"}:
+        fitz = load_fitz()
     if kind == "pdf-page":
         if fitz is None:
             return b""

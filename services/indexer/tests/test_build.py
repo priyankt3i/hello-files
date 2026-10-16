@@ -9,7 +9,16 @@ import pytest
 
 import worker
 from conftest import VECTORLESS
-from index_store import legacy_index_path, old_index_path, read_chunk_metadata, read_manifest, temp_index_path
+from index_store import (
+    db_path,
+    legacy_index_path,
+    old_index_path,
+    open_index_db,
+    read_chunk_metadata,
+    read_manifest,
+    read_meta,
+    temp_index_path,
+)
 
 
 def build(root, index_path=None, force=False, channel="c1", **options):
@@ -84,16 +93,22 @@ def test_touched_but_identical_file_is_reused_by_hash(tree, tmp_path, monkeypatc
     assert read_manifest(index)["files"][0]["mtime"] == (root / "a.txt").stat().st_mtime
 
 
+def data_version(index):
+    with open_index_db(index) as conn:
+        return read_meta(conn)["dataVersion"]
+
+
 def test_no_change_build_does_not_rewrite_index(tree, tmp_path):
     index = tmp_path / "idx"
     root = tree({"a.txt": "alpha", "b.txt": "bravo", "big.txt": "x" * 3000})
     first = build(root, index, maxFileSizeMb=0.001)
-    manifest_file = index / "manifest.json"
-    before = manifest_file.stat().st_mtime_ns
+    database = db_path(index)
+    before = (database.stat().st_mtime_ns, database.stat().st_size, data_version(index))
     time.sleep(0.05)
     second = build(root, index, maxFileSizeMb=0.001)
     assert second["manifest"]["updatedAt"] == first["manifest"]["updatedAt"]
-    assert manifest_file.stat().st_mtime_ns == before
+    assert (database.stat().st_mtime_ns, database.stat().st_size, data_version(index)) == before
+    assert not database.with_name(database.name + "-wal").exists()
     assert second["stats"] == {"added": 0, "updated": 0, "removed": 0, "unchanged": 2, "failed": 0, "skipped": 1}
     assert not temp_index_path(index).exists()
 
@@ -183,7 +198,8 @@ def test_index_path_outside_root(tree, tmp_path):
     root = tree({"a.txt": "alpha"})
     index = tmp_path / "appdata" / "indexes" / "chan"
     build(root, index)
-    assert (index / "manifest.json").exists()
+    assert db_path(index).exists()
+    assert (index / "manifest.json").exists()  # marker for tools that test for an index by this file
     assert not legacy_index_path(root).exists()
     assert [path.name for path in index.parent.iterdir()] == ["chan"]
     if sys.platform == "win32":
@@ -194,7 +210,7 @@ def test_index_path_outside_root(tree, tmp_path):
 def test_legacy_fallback_and_migration(tree, tmp_path, capsys):
     root = tree({"a.txt": "alpha"})
     build(root, None)
-    assert (legacy_index_path(root) / "manifest.json").exists()
+    assert db_path(legacy_index_path(root)).exists()
     worker.handle_request({"id": "s", "method": "get_index_status", "payload": {"rootPath": str(root)}})
     assert '"exists": true' in capsys.readouterr().out
     if sys.platform == "win32":
@@ -203,8 +219,9 @@ def test_legacy_fallback_and_migration(tree, tmp_path, capsys):
 
     index = tmp_path / "new-index"
     result = build(root, index)
-    assert (index / "manifest.json").exists()
+    assert db_path(index).exists()
     assert result["stats"]["unchanged"] == 1  # reused from the legacy in-folder index
+    assert not legacy_index_path(root).exists()  # imported once, then removed
 
 
 def test_commit_recovers_from_interrupted_swap(tree, tmp_path):

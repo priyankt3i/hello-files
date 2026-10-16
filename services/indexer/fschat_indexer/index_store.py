@@ -272,19 +272,37 @@ def write_marker(store_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path, read_only: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=30, isolation_level=None, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
+    if not read_only:
+        # WAL is persistent; readers don't need to (re)assert it.
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-32000")
     return conn
 
 
-def create_database(path: Path) -> sqlite3.Connection:
-    conn = connect(path)
+def create_database(path: Path, bulk: bool = False) -> sqlite3.Connection:
+    """Create the schema. `bulk` is for a fresh database in a temp directory that is swapped
+    in only when complete: no WAL and no fsyncs while writing (a crash just leaves a temp
+    directory that is deleted). Call `finalize_bulk_database` before swapping it in."""
+    if not bulk:
+        conn = connect(path)
+        conn.executescript(SCHEMA)
+        return conn
+    conn = sqlite3.connect(str(path), timeout=30, isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=MEMORY")
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-65536")
     conn.executescript(SCHEMA)
     return conn
+
+
+def finalize_bulk_database(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA journal_mode=WAL")
 
 
 @contextlib.contextmanager
@@ -296,7 +314,7 @@ def open_index_db(index_path: Path) -> Iterator[sqlite3.Connection]:
         path = db_path(index_path)
         if not path.is_file():
             raise FileNotFoundError("Index manifest not found.")
-        conn = connect(path)
+        conn = connect(path, read_only=True)
         try:
             yield conn
         finally:
@@ -545,6 +563,7 @@ class IndexWriter:
         self.conn = conn
         self.in_transaction = False
         self.dirty = False
+        self.next_chunk_id: int | None = None
 
     def begin(self) -> None:
         if not self.in_transaction:
@@ -607,32 +626,47 @@ class IndexWriter:
         conn.execute("DELETE FROM documents WHERE relative_path = ?", (relative_path,))
         conn.execute("DELETE FROM files WHERE relative_path = ?", (relative_path,))
 
+    def _allocate_chunk_ids(self, count: int) -> int:
+        if self.next_chunk_id is None:
+            self.next_chunk_id = int(self.conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM chunks").fetchone()[0])
+        first = self.next_chunk_id
+        self.next_chunk_id += count
+        return first
+
     def replace_file(
         self,
         record: dict[str, Any],
         document: dict[str, Any] | None,
         chunks: list[dict[str, Any]],
+        existed: bool = True,
     ) -> None:
-        """Replace every row for one file. Chunks may carry `quantized` = (dim, scale, bytes)."""
+        """Replace every row for one file (`existed=False` skips the deletes for a file that
+        has no rows yet). Chunks may carry `quantized` = (dim, scale, bytes). Chunks and
+        vectors go in with one executemany each: few statements per file keeps the main
+        thread from stalling on the GIL while extraction results stream in."""
         relative_path = record["relativePath"]
-        self.delete_file(relative_path)
-        conn = self.conn
+        if existed:
+            self.delete_file(relative_path)
+        conn = self._write()
         conn.execute(f"INSERT INTO files ({FILE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", file_row(record))
         if document is not None:
             conn.execute(
                 f"INSERT INTO documents ({DOCUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 document_row(document),
             )
-        vectors: list[tuple[int, int, float, bytes]] = []
-        for ordinal, chunk in enumerate(chunks):
-            cursor = conn.execute(
-                "INSERT INTO chunks (chunk_id, relative_path, ordinal, text, snippet, chunk_hash, file_hash, "
-                "chunk_type, sheet_name, row_num, visual_assets, has_visual) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                chunk_row(chunk, ordinal),
-            )
-            quantized = chunk.get("quantized")
-            if quantized is not None:
-                vectors.append((cursor.lastrowid, *quantized))
+        if not chunks:
+            return
+        first_id = self._allocate_chunk_ids(len(chunks))
+        conn.executemany(
+            "INSERT INTO chunks (id, chunk_id, relative_path, ordinal, text, snippet, chunk_hash, file_hash, "
+            "chunk_type, sheet_name, row_num, visual_assets, has_visual) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(first_id + ordinal, *chunk_row(chunk, ordinal)) for ordinal, chunk in enumerate(chunks)],
+        )
+        vectors = [
+            (first_id + ordinal, *chunk["quantized"])
+            for ordinal, chunk in enumerate(chunks)
+            if chunk.get("quantized") is not None
+        ]
         if vectors:
             conn.executemany("INSERT OR REPLACE INTO vectors (chunk_id, dim, scale, data) VALUES (?, ?, ?, ?)", vectors)
 
@@ -668,6 +702,7 @@ class IndexWriter:
         self.in_transaction = False
 
     def rollback(self) -> None:
+        self.next_chunk_id = None
         if self.in_transaction:
             try:
                 self.conn.execute("ROLLBACK")
@@ -709,7 +744,7 @@ def migrate_json_store(source: Path, target_store: Path) -> None:
         vectors = np.load(vector_file, mmap_mode="r")
         if vectors.ndim != 2:
             vectors = None
-    conn = create_database(db_path(target_store))
+    conn = create_database(db_path(target_store), bulk=True)
     try:
         conn.execute("BEGIN")
         conn.executemany(
@@ -764,6 +799,7 @@ def migrate_json_store(source: Path, target_store: Path) -> None:
                 meta["embeddingModelKey"] = manifest.get("embeddingModelKey")
         write_meta(conn, meta)
         conn.execute("COMMIT")
+        finalize_bulk_database(conn)
     finally:
         conn.close()
         if vectors is not None:
@@ -828,7 +864,7 @@ def read_store_root(index_path: Path) -> str | None:
     """The root path recorded in an index (SQLite or JSON), without migrating it."""
     if is_sqlite_index(index_path):
         with store_lock(index_path):
-            conn = connect(db_path(index_path))
+            conn = connect(db_path(index_path), read_only=True)
             try:
                 return read_meta(conn).get("rootPath")
             finally:

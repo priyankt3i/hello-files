@@ -12,13 +12,17 @@ import zipfile
 from pathlib import Path
 from typing import Any, Tuple
 
-from docx import Document
-from openpyxl import load_workbook
+# Heavy parser libraries (python-docx, openpyxl, PyMuPDF, xlrd, olefile, pywin32) are
+# imported on first use: extraction worker processes then start quickly when a sync only
+# touches plain-text files. The import statements stay literal so PyInstaller finds them.
 
-try:
-    import fitz  # type: ignore
-except ImportError:
-    fitz = None
+
+def load_fitz():
+    try:
+        import fitz  # type: ignore
+    except ImportError:
+        return None
+    return fitz
 
 try:
     from PIL import Image, ImageSequence, UnidentifiedImageError
@@ -36,20 +40,29 @@ except ImportError:
 # import here and most extraction worker processes never need it.
 _OCR_UNAVAILABLE = False
 
-try:
-    import xlrd  # type: ignore
-except ImportError:
-    xlrd = None
 
-try:
-    import olefile  # type: ignore
-except ImportError:
-    olefile = None
+def load_xlrd():
+    try:
+        import xlrd  # type: ignore
+    except ImportError:
+        return None
+    return xlrd
 
-try:
-    import win32com.client  # type: ignore
-except ImportError:
-    win32com = None
+
+def load_olefile():
+    try:
+        import olefile  # type: ignore
+    except ImportError:
+        return None
+    return olefile
+
+
+def load_win32com():
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
+        return None
+    return win32com
 
 
 TEXT_EXTENSIONS = {
@@ -130,6 +143,7 @@ def extract_document(path: Path) -> dict[str, Any]:
 
 
 def extract_pdf_document(path: Path) -> dict[str, Any]:
+    fitz = load_fitz()
     if fitz is None:
         raise ValueError("PDF support requires PyMuPDF.")
 
@@ -196,6 +210,7 @@ def extract_pdf_document(path: Path) -> dict[str, Any]:
 
 
 def extract_pdf_page_ocr(page) -> str:
+    fitz = load_fitz()
     if fitz is None:
         return ""
     pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -209,6 +224,8 @@ def extract_docx(path: Path) -> str:
 
 
 def extract_docx_document(path: Path) -> dict[str, Any]:
+    from docx import Document
+
     document = Document(path)
     parts: list[str] = []
     visual_assets: list[dict[str, Any]] = []
@@ -229,7 +246,7 @@ def extract_docx_document(path: Path) -> dict[str, Any]:
     return {"text": "\n\n".join(part for part in parts if part.strip()), "parser": "docx", "visualAssets": visual_assets}
 
 
-def extract_docx_tables(document: Document) -> str:
+def extract_docx_tables(document: Any) -> str:
     rows: list[str] = []
     for table_index, table in enumerate(document.tables, start=1):
         rows.append(f"# Table {table_index}")
@@ -280,6 +297,7 @@ def extract_doc(path: Path) -> str:
 
 
 def extract_doc_via_word(path: Path) -> str:
+    win32com = load_win32com()
     if win32com is None:
         return ""
 
@@ -313,6 +331,7 @@ def extract_doc_via_word(path: Path) -> str:
 
 
 def extract_doc_ole_text(path: Path) -> str:
+    olefile = load_olefile()
     if olefile is None:
         return ""
 
@@ -333,6 +352,7 @@ def extract_doc_ole_text(path: Path) -> str:
 
 
 def extract_legacy_workbook_document(path: Path) -> dict[str, Any]:
+    xlrd = load_xlrd()
     if xlrd is None:
         raise ValueError("Legacy .xls support requires xlrd.")
 
@@ -350,6 +370,8 @@ def extract_legacy_workbook_document(path: Path) -> dict[str, Any]:
 
 
 def extract_workbook_document(path: Path) -> dict[str, Any]:
+    from openpyxl import load_workbook
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
