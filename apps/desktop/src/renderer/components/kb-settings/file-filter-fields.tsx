@@ -57,6 +57,25 @@ export function parseFileFilterPatterns(patterns: string[]): ParsedFileFilters {
   return { includeExtensions, includeNamePatterns, excludePatterns };
 }
 
+const COMMON_EXTENSIONS: readonly string[] = COMMON_FILE_TYPES.map((type) => type.ext);
+
+/**
+ * The form shows the common types as chips and everything else (names, and extensions such as
+ * `*.java`) in the filename box. Only chip extensions are ever carried between edits, so
+ * half-typed text like `*.ja` can't turn into a saved file type.
+ */
+function splitForForm(patterns: string[]) {
+  const parsed = parseFileFilterPatterns(patterns);
+  return {
+    chipExtensions: parsed.includeExtensions.filter((ext) => COMMON_EXTENSIONS.includes(ext)),
+    nameEntries: [
+      ...parsed.includeNamePatterns,
+      ...parsed.includeExtensions.filter((ext) => !COMMON_EXTENSIONS.includes(ext)).map((ext) => `*.${ext}`)
+    ],
+    excludePatterns: parsed.excludePatterns
+  };
+}
+
 export function buildFileFilterPatterns({
   includeExtensions,
   includeNamePatterns,
@@ -122,9 +141,9 @@ export function FileFilterFields({
 }) {
   const includeNameId = useId();
   const excludeId = useId();
-  const parsed = parseFileFilterPatterns(patterns);
+  const parsed = splitForForm(patterns);
 
-  const [includeNameText, setIncludeNameText] = useState(() => parsed.includeNamePatterns.join(", "));
+  const [includeNameText, setIncludeNameText] = useState(() => parsed.nameEntries.join(", "));
   const [excludeText, setExcludeText] = useState(() => parsed.excludePatterns.join("\n"));
   const lastEmittedRef = useRef<string>(JSON.stringify(patterns));
 
@@ -132,8 +151,8 @@ export function FileFilterFields({
     const serialized = JSON.stringify(patterns);
     if (serialized !== lastEmittedRef.current) {
       lastEmittedRef.current = serialized;
-      const next = parseFileFilterPatterns(patterns);
-      setIncludeNameText(next.includeNamePatterns.join(", "));
+      const next = splitForForm(patterns);
+      setIncludeNameText(next.nameEntries.join(", "));
       setExcludeText(next.excludePatterns.join("\n"));
     }
   }, [patterns]);
@@ -146,17 +165,12 @@ export function FileFilterFields({
 
   function toggleExtension(ext: string) {
     const lower = ext.toLowerCase();
-    const removing = parsed.includeExtensions.includes(lower);
-    const nextExts = removing ? parsed.includeExtensions.filter((item) => item !== lower) : [...parsed.includeExtensions, lower];
-    let names = splitCommaOrNewline(includeNameText);
-    if (removing) {
-      // A name entry such as "*.java" is the same rule as the .java chip, so drop it too.
-      names = names.filter((item) => item.toLowerCase().replace(/^!+/, "").replace(/^\*\*\//, "") !== `*.${lower}`);
-      setIncludeNameText(names.join(", "));
-    }
+    const nextExts = parsed.chipExtensions.includes(lower)
+      ? parsed.chipExtensions.filter((item) => item !== lower)
+      : [...parsed.chipExtensions, lower];
     emit({
       includeExtensions: nextExts,
-      includeNamePatterns: names,
+      includeNamePatterns: splitCommaOrNewline(includeNameText),
       excludePatterns: splitCommaOrNewline(excludeText)
     });
   }
@@ -172,7 +186,7 @@ export function FileFilterFields({
   function handleIncludeNameChange(value: string) {
     setIncludeNameText(value);
     emit({
-      includeExtensions: parsed.includeExtensions,
+      includeExtensions: parsed.chipExtensions,
       includeNamePatterns: splitCommaOrNewline(value),
       excludePatterns: splitCommaOrNewline(excludeText)
     });
@@ -181,7 +195,7 @@ export function FileFilterFields({
   function handleExcludeChange(value: string) {
     setExcludeText(value);
     emit({
-      includeExtensions: parsed.includeExtensions,
+      includeExtensions: parsed.chipExtensions,
       includeNamePatterns: splitCommaOrNewline(includeNameText),
       excludePatterns: splitCommaOrNewline(value)
     });
@@ -196,7 +210,7 @@ export function FileFilterFields({
     const nextText = nextExcludes.join("\n");
     setExcludeText(nextText);
     emit({
-      includeExtensions: parsed.includeExtensions,
+      includeExtensions: parsed.chipExtensions,
       includeNamePatterns: splitCommaOrNewline(includeNameText),
       excludePatterns: nextExcludes
     });
@@ -215,7 +229,7 @@ export function FileFilterFields({
             >
               Docs, PDF & Excel
             </button>
-            {parsed.includeExtensions.length > 0 ? (
+            {parsed.chipExtensions.length > 0 ? (
               <>
                 <span className="text-text-muted">·</span>
                 <button
@@ -230,14 +244,8 @@ export function FileFilterFields({
           </div>
         </div>
         <div className="flex flex-wrap gap-1.5">
-          {[
-            ...COMMON_FILE_TYPES,
-            // Extensions typed as filename patterns (for example *.java) show up as chips too.
-            ...parsed.includeExtensions
-              .filter((ext) => !COMMON_FILE_TYPES.some((common) => common.ext === ext))
-              .map((ext) => ({ ext, label: `.${ext}` }))
-          ].map(({ ext, label }) => {
-            const active = parsed.includeExtensions.includes(ext);
+          {COMMON_FILE_TYPES.map(({ ext, label }) => {
+            const active = parsed.chipExtensions.includes(ext);
             return (
               <button
                 key={ext}
@@ -257,10 +265,10 @@ export function FileFilterFields({
           })}
         </div>
         <div className="mt-1 text-xs text-text-muted">
-          {parsed.includeExtensions.length === 0
+          {parsed.chipExtensions.length === 0 && !includeNameText.trim()
             ? "No file-type restriction — all supported document types will be indexed."
-            : `Indexing ${parsed.includeExtensions.map((ext) => `.${ext}`).join(", ")} files${
-                parsed.includeNamePatterns.length > 0 ? ", plus any file whose name matches the filename filter below" : ""
+            : `Indexing ${parsed.chipExtensions.map((ext) => `.${ext}`).join(", ") || "only the files matched below"}${
+                parsed.chipExtensions.length > 0 && includeNameText.trim() ? ", plus any file matching the filename box below" : ""
               }.`}
         </div>
       </div>
