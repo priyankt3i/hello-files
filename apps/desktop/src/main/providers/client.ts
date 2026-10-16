@@ -77,6 +77,22 @@ const CODEX_DISCOVERED_MODELS: Array<{
   }
 ];
 
+/**
+ * Answer-formatting guide appended to EVERY answer system prompt (default or user-customised
+ * "Assistant instructions"). The renderer (renderer/components/rich/) renders GFM Markdown, ```mermaid
+ * and ```chart blocks; the chart schema below must match renderer/lib/chart-spec.ts.
+ * Kept short because it is sent on every chat call.
+ */
+export const ANSWER_FORMAT_GUIDE = [
+  "Formatting: reply in GitHub Markdown. Use a Markdown table for structured comparisons.",
+  "For a process, flow, sequence or hierarchy you may add a small ```mermaid diagram (flowchart, sequenceDiagram, stateDiagram-v2, erDiagram, mindmap, timeline).",
+  "For numeric comparisons or trends you may add a ```chart block containing only JSON of this exact shape:",
+  '{"type":"bar|stacked-bar|line|area|pie|scatter","title":"...","x":{"label":"...","values":["A","B"]},"series":[{"name":"...","values":[1,2]}],"unit":"...","source":"file names"}',
+  "Each series has one plain JSON number (or null) per x value: no quotes, commas or units inside numbers; pie uses one series; scatter needs numeric x values; at most 8 series.",
+  "Only chart numbers that appear in the indexed context or context notes; never invent, estimate or extrapolate data, and always fill \"source\" with the file names. If there are only a few numbers, use a table or a sentence instead of a chart.",
+  "Diagrams and charts supplement the written answer; keep citing sources inline."
+].join("\n");
+
 export async function generateAssistantReply(args: {
   connection: ProviderConnection;
   model: ProviderModel;
@@ -110,7 +126,7 @@ export async function generateAssistantReply(args: {
           })
           .join("\n\n")}`.trim();
 
-  const effectiveSystemPrompt =
+  const basePrompt =
     systemPrompt?.trim() ||
     [
       "You are Hello Files.",
@@ -118,6 +134,8 @@ export async function generateAssistantReply(args: {
       "If the indexed context is insufficient, say what is missing.",
       "Mention the source file paths inline when making claims."
     ].join(" ");
+  // Appended here (not only in the default prompt) so customised instructions still get it.
+  const effectiveSystemPrompt = `${basePrompt}\n\n${ANSWER_FORMAT_GUIDE}`;
 
   const recentHistory: Array<{ role: "assistant" | "user"; content: string }> = history.slice(-6).map((message) => ({
     role: message.role === "assistant" ? "assistant" : "user",
@@ -239,12 +257,9 @@ export async function discoverProviderModels(input: ConnectProviderInput): Promi
     case "google":
       return discoverGoogleModels(input.apiKey || "");
     case "ollama":
-      return discoverOllamaModels();
+      return discoverOllamaModels(input.baseUrl || DEFAULT_BASE_URLS.ollama);
     case "azure-openai":
-      return {
-        models: [],
-        warnings: ["Azure OpenAI still needs deployment-specific configuration, so automatic model discovery is not available here yet."]
-      };
+      return discoverAzureDeployments(input);
     default:
       throw new Error(`Unsupported provider: ${input.provider as string}`);
   }
@@ -286,6 +301,39 @@ async function discoverOpenAIModels(apiKey: string): Promise<ProviderDiscovery> 
       supportsVision: /vision|gpt-4o|gpt-4\.1|gpt-5/i.test(id)
     })),
     warnings: []
+  };
+}
+
+// Azure OpenAI has no model listing for API-key callers, so the user names their deployments.
+function discoverAzureDeployments(input: ConnectProviderInput): ProviderDiscovery {
+  const models: DiscoveredModel[] = [];
+  const chatDeployment = input.azureChatDeployment?.trim();
+  const embeddingDeployment = input.azureEmbeddingDeployment?.trim();
+  if (chatDeployment) {
+    models.push({
+      provider: "azure-openai",
+      modelId: chatDeployment,
+      displayName: `${chatDeployment} (chat deployment)`,
+      supportsChat: true,
+      supportsEmbedding: false,
+      supportsVision: /vision|gpt-4o|gpt-4\.1|gpt-5/i.test(chatDeployment),
+      deployment: chatDeployment
+    });
+  }
+  if (embeddingDeployment && embeddingDeployment !== chatDeployment) {
+    models.push({
+      provider: "azure-openai",
+      modelId: embeddingDeployment,
+      displayName: `${embeddingDeployment} (embedding deployment)`,
+      supportsChat: false,
+      supportsEmbedding: true,
+      supportsVision: false,
+      deployment: embeddingDeployment
+    });
+  }
+  return {
+    models,
+    warnings: ["Azure deployments are not verified until first use. Image support is guessed from the deployment name."]
   };
 }
 
@@ -352,15 +400,15 @@ async function discoverGoogleModels(apiKey: string): Promise<ProviderDiscovery> 
   };
 }
 
-async function discoverOllamaModels(): Promise<ProviderDiscovery> {
-  const response = await fetch(joinUrl(DEFAULT_BASE_URLS.ollama, "/api/tags"));
+async function discoverOllamaModels(baseUrl: string): Promise<ProviderDiscovery> {
+  const response = await fetch(joinUrl(baseUrl, "/api/tags"));
   const data = await expectJson(response);
   const ids = ((data.models ?? []) as Array<{ name: string }>).map((item) => item.name).sort();
 
   const details = await Promise.all(
     ids.map(async (id) => {
       try {
-        const detailResponse = await fetch(joinUrl(DEFAULT_BASE_URLS.ollama, "/api/show"), {
+        const detailResponse = await fetch(joinUrl(baseUrl, "/api/show"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json"

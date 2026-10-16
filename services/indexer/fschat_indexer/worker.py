@@ -3,37 +3,70 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import itertools
 import json
 import math
+import multiprocessing
+import os
 import re
+import sqlite3
+import stat as stat_module
 import sys
+import threading
+import time
 import traceback
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
 
-from embeddings import batched, embed_query, embed_texts
-from extractors import extract_document, normalize_text
+from embeddings import EmbeddingError, batched, embed_query, embed_texts
+from extractors import dedupe_preserve_order, extract_document, normalize_text
 from index_store import (
+    CHUNK_COLUMNS,
     INDEX_DIR_NAME,
+    INDEX_OLD_DIR_NAME,
+    INDEX_TEMP_DIR_NAME,
     INDEX_VERSION,
+    SUPPORTED_INDEX_VERSIONS,
+    IndexWriter,
+    chunk_from_row,
     cleanup_temp_store,
     commit_temp_store,
+    connect,
+    create_database,
+    db_path,
+    ensure_sqlite_index,
+    import_index,
     index_exists,
-    read_chunk_metadata,
-    read_documents,
+    index_key,
+    is_sqlite_index,
+    is_within,
+    legacy_index_path,
+    old_index_path,
+    open_index_db,
     prepare_temp_store,
+    read_documents,
+    read_files,
     read_manifest,
-    write_documents,
-    write_manifest,
+    read_meta,
+    read_store_root,
+    recover_index_store,
+    resolve_index_path,
+    store_lock,
+    temp_index_path,
+    write_marker,
 )
-from vector_store import clear_index_cache, get_vectors_for_labels, load_index_bundle, release_index_bundle, write_vector_store
+from vector_store import clear_index_cache, cosine_scores, load_vector_matrix, quantize_vector
 
 try:
     import fitz  # type: ignore
@@ -44,6 +77,11 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+
+
+STATUS_INDEXED = "indexed"
+STATUS_FAILED = "failed"
+STATUS_SKIPPED = "skipped"
 
 
 @dataclass
@@ -76,6 +114,7 @@ class FileRecord:
 @dataclass
 class CancelRequest:
     retain_partial: bool
+    sequence: int = 0
 
 
 class CancelledBuild(RuntimeError):
@@ -84,29 +123,192 @@ class CancelledBuild(RuntimeError):
         self.retain_partial = retain_partial
 
 
+def default_max_workers() -> int:
+    return max(1, min(4, (os.cpu_count() or 2) - 1))
+
+
+@dataclass
+class BuildOptions:
+    exclude_patterns: list[re.Pattern[str]] = field(default_factory=list)
+    max_file_size_mb: float = 50
+    include_hidden: bool = False
+    max_workers: int = field(default_factory=default_max_workers)
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        return int(self.max_file_size_mb * 1024 * 1024)
+
+
+@dataclass
+class DiscoveredFile:
+    path: Path
+    relative_path: str
+    stat: Any = None  # stat result captured during discovery (None: stat on demand)
+
+
+@dataclass
+class FilePlan:
+    """What the build has to do for one discovered file, decided from a cheap stat."""
+
+    item: DiscoveredFile
+    kind: str  # "unchanged" | "work" | "too_large" | "stat_error" | "vanished"
+    previous: dict[str, Any] | None
+    size: int = 0
+    mtime: float = 0.0
+    error: str | None = None
+    previous_hash: str | None = None
+
+
+@dataclass
+class BuildState:
+    seen_paths: set[str] = field(default_factory=set)
+    stats: dict[str, int] = field(
+        default_factory=lambda: {"added": 0, "updated": 0, "removed": 0, "unchanged": 0, "failed": 0, "skipped": 0}
+    )
+    processed_files: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    record_count: int = 0
+
+    def add(self, record: "FileRecord", category: str) -> None:
+        self.seen_paths.add(record.relative_path)
+        self.stats[category] += 1
+        self.record_count += 1
+        if record.status == STATUS_INDEXED:
+            self.success_count += 1
+        elif record.status == STATUS_FAILED:
+            self.failure_count += 1
+
+
+@dataclass
+class BuildContext:
+    channel_id: str
+    root_path: Path
+    index_dir: Path
+    retrieval: dict[str, Any]
+    build_options: BuildOptions
+    embedding_provider: dict[str, Any]
+    model_key: str | None
+    writer: IndexWriter
+    in_place: bool
+    previous_files: dict[str, dict[str, Any]]
+    state: BuildState = field(default_factory=BuildState)
+    total_files: int = 0
+    missing_vectors: set[str] = field(default_factory=set)
+    missing_documents: set[str] = field(default_factory=set)
+    embedding_dimension: int = 0
+
+    @property
+    def vector_mode(self) -> bool:
+        return self.retrieval["mode"] == "vector"
+
+
+# channelId -> pending cancel request. Guarded by _BUILD_LOCK.
 CANCELLED_CHANNELS: dict[str, CancelRequest] = {}
+# channelId -> number of builds queued or running. Guarded by _BUILD_LOCK.
+_PENDING_BUILDS: dict[str, int] = {}
+_BUILD_LOCK = threading.Lock()
+_BUILD_SEQUENCE = itertools.count(1)
+_STDOUT_LOCK = threading.Lock()
 BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+
 VISION_MAX_IMAGE_EDGE = 1600
 VISION_MAX_IMAGE_PIXELS = 2_500_000
 VISUAL_QUERY_TOKENS = {"chart", "charts", "graph", "graphs", "image", "images", "diagram", "diagrams", "figure", "figures", "screenshot", "screenshots", "visual", "visuals"}
 MAX_DOCUMENT_VISUAL_ASSETS = 24
 MAX_VISUAL_SUMMARY_LABELS = 12
 
+DEFAULT_MAX_FILE_SIZE_MB = 50
+MAX_WORKERS_LIMIT = 32
+# Spawning extraction processes costs ~1-3 s on Windows (each re-imports the parsers), so
+# the pool is only used when the estimated extraction work is larger than that.
+PARALLEL_MIN_ESTIMATED_SECONDS = 3.0
+HEAVY_EXTRACTION_SECONDS = 0.5
+HEAVY_EXTENSIONS = {
+    ".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".xls",
+    ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
+}
+PREFETCH_PER_WORKER = 4
+MAX_POOL_RESTARTS = 3
+FUTURE_POLL_SECONDS = 0.2
+UNCHANGED_PROGRESS_INTERVAL = 0.1
+IGNORED_DIR_NAMES = {
+    name.lower()
+    for name in {
+        ".git",
+        ".svn",
+        ".hg",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".idea",
+        ".vs",
+        INDEX_DIR_NAME,
+        INDEX_TEMP_DIR_NAME,
+        INDEX_OLD_DIR_NAME,
+    }
+}
+IGNORED_FILE_NAMES = {"thumbs.db", "desktop.ini"}
+FILE_ATTRIBUTE_HIDDEN = 0x02
+FILE_ATTRIBUTE_SYSTEM = 0x04
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+
+PATH_MATCH_BOOST = 0.75
+VISUAL_ASSET_BOOST = 1.5
+MAX_QUERY_TERMS = 64
+MIN_TEXT_CANDIDATES = 200
+_PATH_TOKEN_CACHE: dict[str, "PathTokenIndex"] = {}
+_PATH_TOKEN_CACHE_LIMIT = 4
+_LEXICAL_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
+
+
+def _write_stdout(message: dict[str, Any]) -> None:
+    line = json.dumps(message)
+    with _STDOUT_LOCK:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
 
 def emit_response(request_id: str | None, ok: bool, payload: Any = None, error: str | None = None) -> None:
-    print(json.dumps({"id": request_id, "type": "response", "ok": ok, "payload": payload, "error": error}), flush=True)
+    _write_stdout({"id": request_id, "type": "response", "ok": ok, "payload": payload, "error": error})
 
 
 def emit_progress(payload: dict[str, Any]) -> None:
-    print(json.dumps({"type": "event", "method": "progress", "payload": payload}), flush=True)
+    _write_stdout({"type": "event", "method": "progress", "payload": payload})
 
 
 def emit_file_update(payload: dict[str, Any]) -> None:
-    print(json.dumps({"type": "event", "method": "file_update", "payload": payload}), flush=True)
+    _write_stdout({"type": "event", "method": "file_update", "payload": payload})
+
+
+def report_exception(exc: BaseException) -> str:
+    """Log the traceback to stderr and return a concise user-facing message."""
+    with _STDOUT_LOCK:
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        sys.stderr.flush()
+    return describe_error(exc)
+
+
+def describe_error(exc: BaseException) -> str:
+    if isinstance(exc, KeyError):
+        return f"Missing required field {exc}."
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def request_paths(payload: dict[str, Any]) -> tuple[Path, Path]:
+    root_path = Path(payload["rootPath"])
+    return root_path, resolve_index_path(root_path, payload.get("indexPath"))
 
 
 def handle_request(request: dict[str, Any]) -> None:
@@ -116,53 +318,49 @@ def handle_request(request: dict[str, Any]) -> None:
 
     try:
         if method == "get_index_status":
-            root_path = Path(payload["rootPath"])
-            if not index_exists(root_path):
+            _, index_path = request_paths(payload)
+            if not index_exists(index_path):
                 emit_response(request_id, True, {"exists": False})
                 return
             try:
-                emit_response(request_id, True, {"exists": True, "manifest": read_manifest(root_path)})
-            except ValueError:
+                manifest = read_manifest(index_path)
+            except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+                log_warning(f"Index at {index_path} is unreadable: {describe_error(exc)}")
                 emit_response(request_id, True, {"exists": False})
+                return
+            emit_response(request_id, True, {"exists": True, "manifest": manifest})
             return
 
         if method == "open_index":
-            emit_response(request_id, True, {"manifest": read_manifest(Path(payload["rootPath"]))})
+            _, index_path = request_paths(payload)
+            emit_response(request_id, True, {"manifest": read_manifest(index_path)})
             return
 
-        if method == "build_index":
+        if method in {"build_index", "rebuild_index"}:
+            root_path, _ = request_paths(payload)
             submit_build_request(
                 request_id,
                 payload["channelId"],
-                Path(payload["rootPath"]),
+                root_path,
                 payload.get("options") or {},
-                False,
-            )
-            return
-
-        if method == "rebuild_index":
-            submit_build_request(
-                request_id,
-                payload["channelId"],
-                Path(payload["rootPath"]),
-                payload.get("options") or {},
-                True,
+                method == "rebuild_index",
+                index_path=payload.get("indexPath"),
             )
             return
 
         if method == "cancel_build":
-            CANCELLED_CHANNELS[payload["channelId"]] = CancelRequest(retain_partial=bool(payload.get("retainPartial")))
-            emit_response(request_id, True, {"cancelled": True})
+            accepted = request_cancel(payload["channelId"], bool(payload.get("retainPartial")))
+            emit_response(request_id, True, {"cancelled": accepted})
             return
 
         if method == "list_files":
-            manifest = read_manifest(Path(payload["rootPath"]))
-            files = [item for item in manifest["files"] if item["status"] == payload["status"]]
-            emit_response(request_id, True, {"files": files})
+            _, index_path = request_paths(payload)
+            emit_response(request_id, True, {"files": read_files(index_path, payload["status"])})
             return
 
         if method == "list_documents":
-            emit_response(request_id, True, {"documents": read_documents(Path(payload["rootPath"]))})
+            _, index_path = request_paths(payload)
+            emit_response(request_id, True, {"documents": read_documents(index_path)})
             return
 
         if method == "resolve_visual_assets":
@@ -172,489 +370,1238 @@ def handle_request(request: dict[str, Any]) -> None:
             return
 
         if method == "search":
-            result = search_index(Path(payload["rootPath"]), payload["query"], int(payload.get("topK", 6)), payload.get("options") or {})
+            root_path, index_path = request_paths(payload)
+            result = search_index(
+                root_path,
+                payload["query"],
+                int(payload.get("topK", 6)),
+                payload.get("options") or {},
+                index_path=index_path,
+            )
             emit_response(request_id, True, {"results": result})
             return
 
         raise ValueError(f"Unknown method '{method}'.")
     except Exception as exc:
-        emit_response(request_id, False, error=f"{exc}\n{traceback.format_exc(limit=2)}")
+        emit_response(request_id, False, error=report_exception(exc))
 
 
-def build_index(channel_id: str, root_path: Path, options: dict, force: bool = False) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Build scheduling and cancellation
+# ---------------------------------------------------------------------------
+
+
+def register_build(channel_id: str) -> int:
+    with _BUILD_LOCK:
+        _PENDING_BUILDS[channel_id] = _PENDING_BUILDS.get(channel_id, 0) + 1
+        return next(_BUILD_SEQUENCE)
+
+
+def finish_build(channel_id: str) -> None:
+    with _BUILD_LOCK:
+        remaining = _PENDING_BUILDS.get(channel_id, 0) - 1
+        if remaining > 0:
+            _PENDING_BUILDS[channel_id] = remaining
+        else:
+            _PENDING_BUILDS.pop(channel_id, None)
+
+
+def request_cancel(channel_id: str, retain_partial: bool) -> bool:
+    """Record a cancel request. Ignored (returns False) when the channel has no queued or running build."""
+    with _BUILD_LOCK:
+        if _PENDING_BUILDS.get(channel_id, 0) <= 0:
+            return False
+        CANCELLED_CHANNELS[channel_id] = CancelRequest(retain_partial=retain_partial, sequence=next(_BUILD_SEQUENCE))
+        return True
+
+
+def clear_stale_cancel(channel_id: str, submit_sequence: int | None) -> None:
+    """Drop cancel requests issued before this build was submitted (they targeted an earlier build)."""
+    with _BUILD_LOCK:
+        request = CANCELLED_CHANNELS.get(channel_id)
+        if request is None:
+            return
+        if submit_sequence is None or request.sequence < submit_sequence:
+            CANCELLED_CHANNELS.pop(channel_id, None)
+
+
+def take_cancel_request(channel_id: str) -> CancelRequest | None:
+    with _BUILD_LOCK:
+        return CANCELLED_CHANNELS.pop(channel_id, None)
+
+
+def submit_build_request(
+    request_id: str | None,
+    channel_id: str,
+    root_path: Path,
+    options: dict,
+    force: bool,
+    index_path: str | None = None,
+) -> None:
+    submit_sequence = register_build(channel_id)
+
+    def run() -> None:
+        try:
+            result = build_index(
+                channel_id,
+                root_path,
+                options,
+                force=force,
+                index_path=index_path,
+                submit_sequence=submit_sequence,
+            )
+            emit_response(request_id, True, result)
+        except Exception as exc:
+            emit_response(request_id, False, error=report_exception(exc))
+        finally:
+            finish_build(channel_id)
+
+    BUILD_EXECUTOR.submit(run)
+
+
+def ensure_not_cancelled(
+    channel_id: str,
+    total_files: int,
+    processed_files: int,
+    success_count: int,
+    failure_count: int,
+    current_file: str | None = None,
+) -> None:
+    request = take_cancel_request(channel_id)
+    if request is None:
+        return
+    message = "Indexing cancelled. Retaining partial index." if request.retain_partial else "Indexing cancelled. Discarding partial index."
+    emit_progress(
+        {
+            "channelId": channel_id,
+            "phase": "cancelled",
+            "totalFiles": total_files,
+            "processedFiles": processed_files,
+            "successCount": success_count,
+            "failureCount": failure_count,
+            "currentFile": current_file,
+            "message": message,
+        }
+    )
+    raise CancelledBuild(retain_partial=request.retain_partial)
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+
+def build_index(
+    channel_id: str,
+    root_path: Path,
+    options: dict,
+    force: bool = False,
+    index_path: str | os.PathLike | None = None,
+    submit_sequence: int | None = None,
+) -> dict[str, Any]:
+    """Incremental build. With a usable previous index the live SQLite database is updated
+    in one transaction (only rows of added/changed/removed files are touched; nothing is
+    written when nothing changed). Otherwise (first build, `force`, unreadable or foreign
+    index) a fresh database is written to `<index>.tmp` and swapped in."""
+    clear_stale_cancel(channel_id, submit_sequence)
     if not root_path.exists() or not root_path.is_dir():
         raise ValueError("Selected root path does not exist or is not a directory.")
+    index_dir = resolve_index_path(root_path, index_path)
     retrieval = resolve_retrieval_options(options)
-    if not force and index_exists(root_path):
-        try:
-            manifest = read_manifest(root_path)
-            if manifest.get("retrievalMode") == retrieval["mode"]:
-                return {"manifest": manifest, "files": manifest["files"], "cancelled": False, "retainedPartial": False}
-        except ValueError:
-            pass
-
+    build_options = resolve_build_options(options)
     embedding_provider = options.get("embeddingProvider") or {}
     if retrieval["mode"] == "vector" and not embedding_provider:
         raise ValueError("Embedding provider configuration is required.")
+    model_key = build_embedding_model_key(embedding_provider) if retrieval["mode"] == "vector" else None
 
-    temp_store = prepare_temp_store(root_path)
+    prepare_index_location(index_dir, root_path)
+    previous_meta = load_previous_meta(index_dir, root_path)
+    in_place = previous_meta is not None and not force
+    if in_place:
+        writer = IndexWriter(connect(db_path(index_dir)))
+        previous_files = writer.file_map()
+    else:
+        previous_files = load_previous_file_map(index_dir) if previous_meta is not None else {}
+        writer = IndexWriter(create_database(db_path(prepare_temp_store(index_dir))))
+    created_at = (previous_meta.get("createdAt") if previous_meta else None) or utc_now()
+    settings_dirty = not in_place or index_settings_changed(previous_meta or {}, retrieval, model_key)
+    ctx = BuildContext(
+        channel_id=channel_id,
+        root_path=root_path,
+        index_dir=index_dir,
+        retrieval=retrieval,
+        build_options=build_options,
+        embedding_provider=embedding_provider,
+        model_key=model_key,
+        writer=writer,
+        in_place=in_place,
+        previous_files=previous_files,
+    )
+    state = ctx.state
+
+    def discard() -> None:
+        writer.close()
+        if not in_place:
+            cleanup_temp_store(index_dir)
+
+    discovered: list[DiscoveredFile] = []
+    position = 0
+    pipeline: ExtractionPipeline | None = None
     try:
-        previous_manifest = None if force else (read_manifest(root_path) if index_exists(root_path) else None)
-    except ValueError:
-        previous_manifest = None
-    previous_file_map: dict[str, dict[str, Any]] = {}
-    previous_chunks_by_path: dict[str, list[dict[str, Any]]] = {}
-    previous_vectors_by_hash: dict[str, list[float]] = {}
-    previous_documents_by_path: dict[str, dict[str, Any]] = {}
-    created_at = previous_manifest.get("createdAt") if previous_manifest else utc_now()
-
-    if previous_manifest:
-        try:
-            previous_chunks = read_chunk_metadata(root_path)
-            for chunk in previous_chunks:
-                previous_chunks_by_path.setdefault(chunk["relativePath"], []).append(chunk)
-            previous_documents_by_path = {
-                item["relativePath"]: item for item in read_documents(root_path)
-            }
-            if previous_manifest.get("retrievalMode") == "vector":
-                index_bundle = load_index_bundle(root_path, previous_manifest)
-                labels = [chunk["label"] for chunk in index_bundle["chunks"]]
-                vectors = get_vectors_for_labels(index_bundle, labels)
-                for chunk, vector in zip(index_bundle["chunks"], vectors):
-                    if chunk.get("chunkHash") not in previous_vectors_by_hash:
-                        previous_vectors_by_hash[chunk["chunkHash"]] = vector
-            previous_file_map = {item["relativePath"]: item for item in previous_manifest.get("files", [])}
-        except Exception:
-            clear_index_cache(root_path)
-            previous_manifest = None
-            previous_file_map = {}
-            previous_chunks_by_path = {}
-            previous_vectors_by_hash = {}
-            previous_documents_by_path = {}
-            created_at = utc_now()
-        finally:
-            release_index_bundle(locals().get("index_bundle"))
-            clear_index_cache(root_path)
-
-    try:
-        emit_progress(
-            {
-                "channelId": channel_id,
-                "phase": "discovering",
-                "totalFiles": 0,
-                "processedFiles": 0,
-                "successCount": 0,
-                "failureCount": 0,
-                "message": "Scanning folder for supported files.",
-            }
-        )
-
-        file_paths = discover_files(
+        if in_place:
+            prepare_in_place_vectors(ctx, previous_meta)
+        progress(ctx, "discovering", 0, message="Scanning folder for supported files.")
+        discovered = discover_files(
             root_path,
-            on_progress=lambda discovered_count: emit_progress(
-                {
-                    "channelId": channel_id,
-                    "phase": "discovering",
-                    "totalFiles": discovered_count,
-                    "processedFiles": 0,
-                    "successCount": 0,
-                    "failureCount": 0,
-                    "message": f"Scanning folder... discovered {discovered_count} files so far.",
-                }
-            ),
+            build_options,
+            index_path=index_dir,
+            on_progress=lambda count: progress(ctx, "discovering", count, message=f"Scanning folder... discovered {count} files so far."),
         )
-        total_files = len(file_paths)
-        emit_progress(
-            {
-                "channelId": channel_id,
-                "phase": "discovering",
-                "totalFiles": total_files,
-                "processedFiles": 0,
-                "successCount": 0,
-                "failureCount": 0,
-                "message": f"Discovered {total_files} files.",
-            }
-        )
+        ctx.total_files = len(discovered)
+        progress(ctx, "discovering", ctx.total_files, message=f"Discovered {ctx.total_files} files.")
 
-        file_records: list[FileRecord] = []
-        embedded_chunks: list[dict[str, Any]] = []
-        document_records: list[dict[str, Any]] = []
-        success_count = 0
-        failure_count = 0
-        processed_files = 0
-
-        for path in file_paths:
-            relative_path = str(path.relative_to(root_path))
-            ensure_not_cancelled(channel_id, total_files, processed_files, success_count, failure_count, relative_path)
-            stat = path.stat()
-            previous_file = previous_file_map.get(relative_path)
-            previous_chunks = previous_chunks_by_path.get(relative_path, [])
-            previous_document = previous_documents_by_path.get(relative_path)
-
-            emit_progress(
-                {
-                    "channelId": channel_id,
-                    "phase": "extracting",
-                    "totalFiles": total_files,
-                    "processedFiles": processed_files,
-                    "successCount": success_count,
-                    "failureCount": failure_count,
-                    "currentFile": relative_path,
-                }
+        plans = plan_files(ctx, discovered)
+        pipeline = ExtractionPipeline(plans, build_options.max_workers, lambda relative_path: check_cancel(ctx, relative_path))
+        last_quiet_progress = 0.0
+        for position, plan in enumerate(plans):
+            relative_path = plan.item.relative_path
+            ensure_not_cancelled(
+                channel_id, ctx.total_files, state.processed_files, state.success_count, state.failure_count, relative_path
             )
-
-            completed_current_file = False
-            file_hash: str | None = None
-            try:
-                if previous_file and is_unchanged_by_stat(previous_file, stat):
-                    reused_chunks = reuse_previous_chunks(
-                        previous_chunks,
-                        previous_vectors_by_hash,
-                        include_embeddings=retrieval["mode"] == "vector",
-                    )
-                    can_reuse = len(reused_chunks) == len(previous_chunks) and (
-                        retrieval["mode"] != "vector" or len(reused_chunks) > 0 or len(previous_chunks) == 0
-                    )
-                    if can_reuse:
-                        record = reused_file_record(previous_file, stat)
-                        file_records.append(record)
-                        embedded_chunks.extend(reused_chunks)
-                        if previous_document:
-                            document_records.append(reused_document_record(previous_document, stat))
-                        elif record.status == "indexed":
-                            reused_visual_assets = visual_assets_from_chunks(reused_chunks)
-                            document_records.append(
-                                build_document_record(
-                                    relative_path,
-                                    record.parser,
-                                    stat,
-                                    [chunk["text"] for chunk in reused_chunks],
-                                    record.content_hash,
-                                    visual_assets=reused_visual_assets,
-                                )
-                            )
-                        if record.status == "indexed":
-                            success_count += 1
-                        else:
-                            failure_count += 1
-                        emit_file_update({"channelId": channel_id, "file": record.to_dict()})
-                        completed_current_file = True
-                        continue
-
-                file_hash = hash_file(path)
-                if previous_file and previous_file.get("contentHash") == file_hash:
-                    reused_chunks = reuse_previous_chunks(
-                        previous_chunks,
-                        previous_vectors_by_hash,
-                        include_embeddings=retrieval["mode"] == "vector",
-                    )
-                    can_reuse = len(reused_chunks) == len(previous_chunks) and (
-                        retrieval["mode"] != "vector" or len(reused_chunks) > 0 or len(previous_chunks) == 0
-                    )
-                    if can_reuse:
-                        record = reused_file_record(previous_file, stat, content_hash=file_hash)
-                        file_records.append(record)
-                        embedded_chunks.extend(reused_chunks)
-                        if previous_document:
-                            document_records.append(reused_document_record(previous_document, stat, content_hash=file_hash))
-                        elif record.status == "indexed":
-                            reused_visual_assets = visual_assets_from_chunks(reused_chunks)
-                            document_records.append(
-                                build_document_record(
-                                    relative_path,
-                                    record.parser,
-                                    stat,
-                                    [chunk["text"] for chunk in reused_chunks],
-                                    record.content_hash,
-                                    visual_assets=reused_visual_assets,
-                                )
-                            )
-                        if record.status == "indexed":
-                            success_count += 1
-                        else:
-                            failure_count += 1
-                        emit_file_update({"channelId": channel_id, "file": record.to_dict()})
-                        completed_current_file = True
-                        continue
-
-                extracted = extract_document(path)
-                parser_name = extracted["parser"]
-                raw_text = extracted.get("text") or ""
-                normalized = normalize_text(raw_text)
-                if not normalized:
-                    raise ValueError("No extractable text found.")
-                visual_assets = normalize_visual_assets(extracted.get("visualAssets") or [], relative_path)
-                chunk_payloads = build_chunk_payloads(normalized, extracted.get("chunks") or [], visual_assets)
-                if not chunk_payloads:
-                    raise ValueError("No extractable text chunks found.")
-
-                file_chunk_entries: list[dict[str, Any]] = []
-                entries_to_embed: list[dict[str, Any]] = []
-                for chunk_index, chunk_payload in enumerate(chunk_payloads):
-                    chunk_text = chunk_payload["text"]
-                    chunk_hash = hash_text(chunk_text)
-                    entry = {
-                        "chunkId": f"{relative_path}:{chunk_index}:{uuid4().hex[:8]}",
-                        "relativePath": relative_path,
-                        "snippet": chunk_text[:240],
-                        "text": chunk_text,
-                        "chunkHash": chunk_hash,
-                        "fileHash": file_hash,
-                    }
-                    if chunk_payload.get("chunkType"):
-                        entry["chunkType"] = chunk_payload["chunkType"]
-                    if chunk_payload.get("sheetName"):
-                        entry["sheetName"] = chunk_payload["sheetName"]
-                    if chunk_payload.get("rowNumber") is not None:
-                        entry["rowNumber"] = chunk_payload["rowNumber"]
-                    if chunk_payload.get("visualAssets"):
-                        entry["visualAssets"] = chunk_payload["visualAssets"]
-                    cached_vector = previous_vectors_by_hash.get(chunk_hash)
-                    if cached_vector is not None:
-                        entry["embedding"] = cached_vector
-                    else:
-                        entries_to_embed.append(entry)
-                    file_chunk_entries.append(entry)
-
-                if retrieval["mode"] == "vector":
-                    batch_size = embedding_batch_size(embedding_provider)
-                    total_batches = max(1, math.ceil(len(entries_to_embed) / batch_size)) if entries_to_embed else 0
-                    embedded_chunk_count = 0
-                    for batch_index, batch in enumerate(batched(entries_to_embed, batch_size), start=1):
-                        ensure_not_cancelled(channel_id, total_files, processed_files, success_count, failure_count, relative_path)
-                        emit_progress(
-                            {
-                                "channelId": channel_id,
-                                "phase": "embedding",
-                                "totalFiles": total_files,
-                                "processedFiles": processed_files,
-                                "successCount": success_count,
-                                "failureCount": failure_count,
-                                "currentFile": relative_path,
-                                "message": (
-                                    f"Embedding batch {batch_index}/{total_batches} "
-                                    f"({embedded_chunk_count + 1}-{embedded_chunk_count + len(batch)} of {len(entries_to_embed)} new chunks)."
-                                ),
-                            }
-                        )
-                        vectors = embed_texts(embedding_provider, [item["text"] for item in batch], timeout_seconds=None)
-                        for item, vector in zip(batch, vectors):
-                            item["embedding"] = vector
-                            previous_vectors_by_hash[item["chunkHash"]] = vector
-                        embedded_chunk_count += len(batch)
-
-                    if any("embedding" not in entry for entry in file_chunk_entries):
-                        raise ValueError("Failed to create embeddings for one or more chunks.")
-
-                embedded_chunks.extend(file_chunk_entries)
-                document_records.append(
-                    build_document_record(
-                        relative_path,
-                        parser_name,
-                        stat,
-                        [chunk["text"] for chunk in chunk_payloads],
-                        file_hash,
-                        structure=extracted.get("structure"),
-                        visual_assets=visual_assets,
-                    )
-                )
-                record = FileRecord(
-                    relative_path=relative_path,
-                    status="indexed",
-                    size=stat.st_size,
-                    mtime=stat.st_mtime,
-                    parser=parser_name,
-                    chunks=len(chunk_payloads),
-                    content_hash=file_hash,
-                )
-                file_records.append(record)
-                success_count += 1
+            quiet = plan.kind == "unchanged"
+            now = time.monotonic()
+            if not quiet or now - last_quiet_progress >= UNCHANGED_PROGRESS_INTERVAL:
+                progress(ctx, "extracting", ctx.total_files, currentFile=relative_path)
+            result = pipeline.result_for(position) if plan.kind == "work" else None
+            outcome = apply_plan(ctx, plan, result)
+            if outcome is not None:
+                record, category = outcome
+                state.add(record, category)
                 emit_file_update({"channelId": channel_id, "file": record.to_dict()})
-                completed_current_file = True
-            except CancelledBuild:
-                raise
-            except Exception as exc:
-                record = FileRecord(
-                    relative_path=relative_path,
-                    status="failed",
-                    size=stat.st_size if path.exists() else 0,
-                    mtime=stat.st_mtime if path.exists() else 0,
-                    parser="unavailable",
-                    chunks=0,
-                    content_hash=file_hash,
-                    error_reason=str(exc),
-                )
-                file_records.append(record)
-                emit_file_update({"channelId": channel_id, "file": record.to_dict()})
-                failure_count += 1
-                completed_current_file = True
-            finally:
-                if completed_current_file:
-                    processed_files += 1
-                    emit_progress(
-                        {
-                            "channelId": channel_id,
-                            "phase": "extracting",
-                            "totalFiles": total_files,
-                            "processedFiles": processed_files,
-                            "successCount": success_count,
-                            "failureCount": failure_count,
-                            "currentFile": relative_path,
-                        }
-                    )
-
-        emit_progress(
-            {
-                "channelId": channel_id,
-                "phase": "writing",
-                "totalFiles": total_files,
-                "processedFiles": processed_files,
-                "successCount": success_count,
-                "failureCount": failure_count,
-                "message": "Writing index files.",
-            }
-        )
-        manifest = finalize_index(
-            temp_store,
-            root_path,
-            file_records,
-            embedded_chunks,
-            document_records,
-            created_at,
-            embedding_provider,
-            retrieval,
-        )
-        emit_progress(
-            {
-                "channelId": channel_id,
-                "phase": "completed",
-                "totalFiles": total_files,
-                "processedFiles": processed_files,
-                "successCount": success_count,
-                "failureCount": failure_count,
-                "message": "Index complete.",
-            }
-        )
-        return {"manifest": manifest, "files": manifest["files"], "cancelled": False, "retainedPartial": False}
+            state.processed_files += 1
+            if not quiet or now - last_quiet_progress >= UNCHANGED_PROGRESS_INTERVAL:
+                progress(ctx, "extracting", ctx.total_files, currentFile=relative_path)
+                last_quiet_progress = now
+        position = len(plans)
+        pipeline.close()
     except CancelledBuild as exc:
-        retainable_records = [record.to_dict() for record in file_records]
-        if exc.retain_partial:
-            if not retainable_records and not embedded_chunks:
-                cleanup_temp_store(root_path)
-                return {"manifest": None, "files": [], "cancelled": True, "retainedPartial": False}
-            manifest = finalize_index(
-                temp_store,
-                root_path,
-                file_records,
-                embedded_chunks,
-                document_records,
-                created_at,
-                embedding_provider,
-                retrieval,
-            )
-            return {"manifest": manifest, "files": retainable_records, "cancelled": True, "retainedPartial": True}
-        cleanup_temp_store(root_path)
-        clear_index_cache(root_path)
-        return {"manifest": None, "files": [], "cancelled": True, "retainedPartial": False}
-    except Exception:
-        cleanup_temp_store(root_path)
-        clear_index_cache(root_path)
+        if pipeline is not None:
+            pipeline.close(cancel=True)
+        if not exc.retain_partial:
+            discard()
+            return {"manifest": None, "files": [], "cancelled": True, "retainedPartial": False, "stats": state.stats}
+        try:
+            if in_place:
+                carry_over_unprocessed(ctx, discovered[position:])
+            remove_unseen(ctx)
+            if not in_place and state.record_count == 0:
+                discard()
+                return {"manifest": None, "files": [], "cancelled": True, "retainedPartial": False, "stats": state.stats}
+            manifest = commit_build(ctx, created_at, settings_dirty)
+        except Exception:
+            discard()
+            raise
+        return {
+            "manifest": manifest,
+            "files": manifest["files"],
+            "cancelled": True,
+            "retainedPartial": True,
+            "stats": state.stats,
+        }
+    except BaseException:
+        if pipeline is not None:
+            pipeline.close(cancel=True)
+        discard()
         raise
 
+    try:
+        remove_unseen(ctx)
+        changed = settings_dirty or writer.dirty
+        if changed:
+            progress(ctx, "writing", ctx.total_files, message="Writing index files.")
+        manifest = commit_build(ctx, created_at, settings_dirty)
+    except BaseException:
+        discard()
+        raise
+    progress(ctx, "completed", ctx.total_files, message="Index complete." if changed else "Index is up to date.")
+    return {"manifest": manifest, "files": manifest["files"], "cancelled": False, "retainedPartial": False, "stats": state.stats}
 
-def search_index(root_path: Path, query: str, top_k: int, options: dict) -> list[dict[str, Any]]:
+
+def progress(ctx: BuildContext, phase: str, total: int, **extra: Any) -> None:
+    state = ctx.state
+    emit_progress(
+        {
+            "channelId": ctx.channel_id,
+            "phase": phase,
+            "totalFiles": total,
+            "processedFiles": state.processed_files,
+            "successCount": state.success_count,
+            "failureCount": state.failure_count,
+            **extra,
+        }
+    )
+
+
+def check_cancel(ctx: BuildContext, relative_path: str | None) -> None:
+    state = ctx.state
+    ensure_not_cancelled(
+        ctx.channel_id, ctx.total_files, state.processed_files, state.success_count, state.failure_count, relative_path
+    )
+
+
+def prepare_index_location(index_dir: Path, root_path: Path) -> None:
+    """Recover an interrupted swap, migrate a v2/v3 JSON index to SQLite, and import a
+    legacy in-folder index into `index_dir` (then remove it) when `index_dir` is empty."""
+    with store_lock(index_dir):
+        recover_index_store(index_dir)
+        try:
+            ensure_sqlite_index(index_dir)
+        except Exception as exc:
+            log_warning(f"Ignoring unreadable previous index at {index_dir}: {describe_error(exc)}")
+        if index_exists(index_dir):
+            return
+        legacy = legacy_index_path(root_path)
+        if index_key(legacy) == index_key(index_dir) or not index_exists(legacy):
+            return
+        try:
+            if same_root(read_store_root(legacy), root_path):
+                import_index(legacy, index_dir, hide=is_within(index_dir, root_path))
+        except Exception as exc:
+            log_warning(f"Ignoring unreadable legacy index at {legacy}: {describe_error(exc)}")
+
+
+def load_previous_meta(index_dir: Path, root_path: Path) -> dict[str, Any] | None:
+    if not is_sqlite_index(index_dir):
+        return None
+    try:
+        with open_index_db(index_dir) as conn:
+            meta = read_meta(conn)
+            conn.execute("SELECT 1 FROM files LIMIT 1").fetchall()
+            conn.execute("SELECT 1 FROM chunks_fts LIMIT 1").fetchall()
+    except Exception as exc:
+        log_warning(f"Ignoring unreadable previous index at {index_dir}: {describe_error(exc)}")
+        return None
+    if meta.get("version") not in SUPPORTED_INDEX_VERSIONS or not same_root(meta.get("rootPath"), root_path):
+        return None
+    return meta
+
+
+def load_previous_file_map(index_dir: Path) -> dict[str, dict[str, Any]]:
+    try:
+        return {item["relativePath"]: item for item in read_files(index_dir)}
+    except Exception:
+        return {}
+
+
+def prepare_in_place_vectors(ctx: BuildContext, previous_meta: dict[str, Any] | None) -> None:
+    """Drop vectors that can't be reused (mode or model changed) and note which files
+    still need embeddings and which indexed files lack a document record."""
+    writer = ctx.writer
+    previous_meta = previous_meta or {}
+    vectors_usable = previous_meta.get("retrievalMode") == "vector" and previous_meta.get("embeddingModelKey") == ctx.model_key
+    if ctx.vector_mode:
+        if not vectors_usable and writer.has_vectors():
+            writer.delete_all_vectors()
+        ctx.missing_vectors = writer.paths_missing_vectors()
+        ctx.embedding_dimension = writer.embedding_dimension()
+    elif writer.has_vectors():
+        writer.delete_all_vectors()
+    ctx.missing_documents = {
+        row[0]
+        for row in writer.conn.execute(
+            "SELECT relative_path FROM files WHERE status = ? AND relative_path NOT IN (SELECT relative_path FROM documents)",
+            (STATUS_INDEXED,),
+        )
+    }
+
+
+def plan_files(ctx: BuildContext, discovered: list[DiscoveredFile]) -> list[FilePlan]:
+    plans: list[FilePlan] = []
+    max_bytes = ctx.build_options.max_file_size_bytes
+    for position, item in enumerate(discovered):
+        if position % 512 == 0:
+            check_cancel(ctx, item.relative_path)
+        previous_file = ctx.previous_files.get(item.relative_path)
+        try:
+            stat_result = item.stat if item.stat is not None else os.stat(item.path)
+        except FileNotFoundError:
+            plans.append(FilePlan(item, "vanished", previous_file))
+            continue
+        except OSError as exc:
+            plans.append(FilePlan(item, "stat_error", previous_file, error=f"Could not read file: {exc.strerror or exc}"))
+            continue
+        size, mtime = stat_result.st_size, stat_result.st_mtime
+        if size > max_bytes:
+            plans.append(FilePlan(item, "too_large", previous_file, size, mtime))
+            continue
+        reusable = (
+            ctx.in_place
+            and previous_file is not None
+            and previous_file.get("status") in {STATUS_INDEXED, STATUS_FAILED}
+        )
+        if reusable and is_unchanged_by_stat(previous_file, stat_result):
+            plans.append(FilePlan(item, "unchanged", previous_file, size, mtime))
+            continue
+        previous_hash = previous_file.get("contentHash") if reusable else None
+        plans.append(FilePlan(item, "work", previous_file, size, mtime, previous_hash=previous_hash))
+    return plans
+
+
+def apply_plan(ctx: BuildContext, plan: FilePlan, result: dict[str, Any] | None) -> tuple[FileRecord, str] | None:
+    """Write the outcome for one file. Returns (record, statsCategory) or None if the file vanished."""
+    writer = ctx.writer
+    relative_path = plan.item.relative_path
+    previous_file = plan.previous
+    stat_result = SimpleNamespace(st_size=plan.size, st_mtime=plan.mtime)
+
+    if plan.kind == "vanished":
+        return None
+    if plan.kind == "stat_error":
+        record = failed_record(relative_path, None, None, plan.error or "Could not read file.")
+        writer.replace_file(record.to_dict(), None, [])
+        return record, "failed"
+    if plan.kind == "too_large":
+        record = FileRecord(
+            relative_path=relative_path,
+            status=STATUS_SKIPPED,
+            size=plan.size,
+            mtime=plan.mtime,
+            parser="skipped",
+            chunks=0,
+            error_reason=f"Larger than {format_megabytes(ctx.build_options.max_file_size_mb)} MB limit",
+        )
+        if not ctx.in_place or previous_file != record.to_dict():
+            writer.replace_file(record.to_dict(), None, [])
+        return record, "skipped"
+    if plan.kind == "unchanged":
+        record = reused_file_record(previous_file, stat_result)
+        finish_reused_file(ctx, record, stat_result)
+        return record, "unchanged"
+
+    assert result is not None
+    kind = result.get("kind")
+    if kind == "vanished":
+        return None
+    if kind == "same":
+        record = reused_file_record(previous_file, stat_result, content_hash=result.get("hash"))
+        writer.update_file_stat(record.to_dict())
+        finish_reused_file(ctx, record, stat_result)
+        return record, "unchanged"
+    if kind == "failed":
+        record = failed_record(relative_path, stat_result, result.get("hash"), result.get("reason") or "Extraction failed.")
+        writer.replace_file(record.to_dict(), None, [])
+        return record, "failed"
+
+    file_hash = result["hash"]
+    chunks = [new_chunk_entry(relative_path, index, payload, file_hash) for index, payload in enumerate(result["chunks"])]
+    if ctx.vector_mode:
+        embed_chunk_entries(ctx, chunks, relative_path)
+    record = FileRecord(
+        relative_path=relative_path,
+        status=STATUS_INDEXED,
+        size=plan.size,
+        mtime=plan.mtime,
+        parser=result["parser"],
+        chunks=len(chunks),
+        content_hash=file_hash,
+    )
+    writer.replace_file(record.to_dict(), result["document"], chunks)
+    return record, ("updated" if previous_file else "added")
+
+
+def finish_reused_file(ctx: BuildContext, record: FileRecord, stat_result) -> None:
+    """Embed chunks that have no vector yet and rebuild a missing document record."""
+    relative_path = record.relative_path
+    if ctx.vector_mode and relative_path in ctx.missing_vectors:
+        rows = ctx.writer.chunks_missing_vectors(relative_path)
+        if rows:
+            entries = [{"rowId": row[0], "text": row[1], "chunkHash": row[2]} for row in rows]
+            embed_chunk_entries(ctx, entries, relative_path)
+            ctx.writer.insert_vectors([(entry["rowId"], *entry["quantized"]) for entry in entries])
+        ctx.missing_vectors.discard(relative_path)
+    if relative_path in ctx.missing_documents and record.status == STATUS_INDEXED:
+        chunks = ctx.writer.chunks_for_path(relative_path)
+        document = build_document_record(
+            relative_path,
+            record.parser,
+            stat_result,
+            [chunk["text"] for chunk in chunks],
+            record.content_hash,
+            visual_assets=visual_assets_from_chunks(chunks),
+        )
+        ctx.writer.upsert_document(document)
+        ctx.missing_documents.discard(relative_path)
+
+
+def failed_record(relative_path: str, stat_result, file_hash: str | None, reason: str) -> FileRecord:
+    return FileRecord(
+        relative_path=relative_path,
+        status=STATUS_FAILED,
+        size=stat_result.st_size if stat_result is not None else 0,
+        mtime=stat_result.st_mtime if stat_result is not None else 0,
+        parser="unavailable",
+        chunks=0,
+        content_hash=file_hash,
+        error_reason=reason,
+    )
+
+
+def new_chunk_entry(relative_path: str, chunk_index: int, chunk_payload: dict[str, Any], file_hash: str) -> dict[str, Any]:
+    chunk_text = chunk_payload["text"]
+    entry: dict[str, Any] = {
+        "chunkId": f"{relative_path}:{chunk_index}:{uuid4().hex[:8]}",
+        "relativePath": relative_path,
+        "snippet": chunk_text[:240],
+        "text": chunk_text,
+        "chunkHash": hash_text(chunk_text),
+        "fileHash": file_hash,
+    }
+    for key in ("chunkType", "sheetName", "visualAssets"):
+        if chunk_payload.get(key):
+            entry[key] = chunk_payload[key]
+    if chunk_payload.get("rowNumber") is not None:
+        entry["rowNumber"] = chunk_payload["rowNumber"]
+    return entry
+
+
+def embed_chunk_entries(ctx: BuildContext, entries: list[dict[str, Any]], relative_path: str) -> None:
+    """Set `quantized` on every entry: reuse a stored vector with the same chunk hash
+    (same model; old rows of a changed file are still readable at this point), else embed."""
+    pending: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.get("quantized") is not None:
+            continue
+        cached = ctx.writer.vector_for_hash(entry["chunkHash"])
+        if cached is not None:
+            entry["quantized"] = cached
+        else:
+            pending.append(entry)
+    if not pending:
+        return
+
+    batch_size = embedding_batch_size(ctx.embedding_provider)
+    total_batches = math.ceil(len(pending) / batch_size)
+    done = 0
+    for batch_index, batch in enumerate(batched(pending, batch_size), start=1):
+        check_cancel(ctx, relative_path)
+        progress(
+            ctx,
+            "embedding",
+            ctx.total_files,
+            currentFile=relative_path,
+            message=f"Embedding batch {batch_index}/{total_batches} ({done + 1}-{done + len(batch)} of {len(pending)} new chunks).",
+        )
+        try:
+            vectors = embed_texts(ctx.embedding_provider, [item["text"] for item in batch])
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"Embedding request failed: {describe_error(exc)}") from exc
+        if len(vectors) != len(batch):
+            raise EmbeddingError("Embedding provider returned an unexpected number of vectors.")
+        for item, vector in zip(batch, vectors):
+            quantized = quantize_vector(vector)
+            if ctx.embedding_dimension and quantized[0] != ctx.embedding_dimension:
+                raise EmbeddingError(
+                    f"Embedding provider returned {quantized[0]} dimensions but the index has "
+                    f"{ctx.embedding_dimension}; rebuild required."
+                )
+            ctx.embedding_dimension = quantized[0]
+            item["quantized"] = quantized
+        done += len(batch)
+
+
+def carry_over_unprocessed(ctx: BuildContext, remaining: list[DiscoveredFile]) -> None:
+    """On retain-partial cancel, keep previous entries for files not processed yet if they
+    are unchanged on disk. Everything else from the previous index is removed afterwards."""
+    state = ctx.state
+    for item in remaining:
+        if item.relative_path in state.seen_paths:
+            continue
+        previous_file = ctx.previous_files.get(item.relative_path)
+        if not previous_file or previous_file.get("status") not in {STATUS_INDEXED, STATUS_FAILED, STATUS_SKIPPED}:
+            continue
+        try:
+            stat_result = os.stat(item.path)
+        except OSError:
+            continue
+        if not is_unchanged_by_stat(previous_file, stat_result):
+            continue
+        if previous_file.get("status") == STATUS_SKIPPED:
+            state.add(FileRecord(**file_record_kwargs(previous_file)), "skipped")
+            continue
+        if ctx.vector_mode and item.relative_path in ctx.missing_vectors:
+            continue
+        state.add(reused_file_record(previous_file, stat_result), "unchanged")
+
+
+def remove_unseen(ctx: BuildContext) -> None:
+    removed = [relative_path for relative_path in ctx.previous_files if relative_path not in ctx.state.seen_paths]
+    ctx.state.stats["removed"] = len(removed)
+    if ctx.in_place:
+        for relative_path in removed:
+            ctx.writer.delete_file(relative_path)
+
+
+def commit_build(ctx: BuildContext, created_at: str, settings_dirty: bool) -> dict[str, Any]:
+    writer = ctx.writer
+    if ctx.in_place and not (settings_dirty or writer.dirty):
+        writer.close()
+        return read_manifest(ctx.index_dir)
+
+    meta: dict[str, Any] = {
+        "version": INDEX_VERSION,
+        "rootPath": str(ctx.root_path),
+        "createdAt": created_at,
+        "updatedAt": utc_now(),
+        "retrievalMode": ctx.retrieval["mode"],
+        "indexEngine": ctx.retrieval["engine"],
+    }
+    drop_keys: list[str] = []
+    if ctx.vector_mode:
+        meta["embeddingDimension"] = writer.embedding_dimension()
+        meta["embeddingModelKey"] = ctx.model_key
+    else:
+        drop_keys = ["embeddingDimension", "embeddingModelKey"]
+    writer.finish(meta, drop_keys)
+    writer.close()
+    if not ctx.in_place:
+        temp_store = temp_index_path(ctx.index_dir)
+        write_marker(temp_store)
+        commit_temp_store(ctx.index_dir, hide=is_within(ctx.index_dir, ctx.root_path))
+    clear_search_caches(ctx.index_dir)
+    return read_manifest(ctx.index_dir)
+
+
+def clear_search_caches(index_dir: Path) -> None:
+    clear_index_cache(index_key(index_dir))
+    clear_lexical_cache(index_dir)
+
+
+def index_settings_changed(meta: dict[str, Any], retrieval: dict[str, Any], model_key: str | None) -> bool:
+    if meta.get("version") != INDEX_VERSION:
+        return True
+    if meta.get("retrievalMode") != retrieval["mode"] or meta.get("indexEngine") != retrieval["engine"]:
+        return True
+    return retrieval["mode"] == "vector" and meta.get("embeddingModelKey") != model_key
+
+
+def same_root(recorded: str | dict[str, Any] | None, root_path: Path) -> bool:
+    if isinstance(recorded, dict):
+        recorded = recorded.get("rootPath")
+    if not recorded:
+        return True
+    return os.path.normcase(os.path.abspath(recorded)) == os.path.normcase(os.path.abspath(str(root_path)))
+
+
+def log_warning(message: str) -> None:
+    with _STDOUT_LOCK:
+        print(message, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Parallel extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_file_task(path_str: str, relative_path: str, previous_hash: str | None, size: int, mtime: float) -> dict[str, Any]:
+    """Hash, extract and chunk one file. Runs in a worker process (or inline for small
+    batches); returns only picklable data and never raises for per-file problems."""
+    path = Path(path_str)
+    file_hash: str | None = None
+    try:
+        file_hash = hash_file(path)
+        if previous_hash is not None and file_hash == previous_hash:
+            return {"kind": "same", "hash": file_hash}
+        extracted = extract_document(path)
+        parser_name = extracted["parser"]
+        normalized = normalize_text(extracted.get("text") or "")
+        if not normalized:
+            raise ValueError("No extractable text found.")
+        visual_assets = normalize_visual_assets(extracted.get("visualAssets") or [], relative_path)
+        chunk_payloads = build_chunk_payloads(normalized, extracted.get("chunks") or [], visual_assets)
+        if not chunk_payloads:
+            raise ValueError("No extractable text chunks found.")
+        document = build_document_record(
+            relative_path,
+            parser_name,
+            SimpleNamespace(st_size=size, st_mtime=mtime),
+            [chunk["text"] for chunk in chunk_payloads],
+            file_hash,
+            structure=extracted.get("structure"),
+            visual_assets=visual_assets,
+        )
+        return {"kind": "extracted", "hash": file_hash, "parser": parser_name, "chunks": chunk_payloads, "document": document}
+    except FileNotFoundError:
+        if not path.exists():
+            return {"kind": "vanished"}
+        return {"kind": "failed", "hash": file_hash, "reason": "File could not be opened."}
+    except Exception as exc:
+        return {"kind": "failed", "hash": file_hash, "reason": describe_error(exc)}
+
+
+def _init_extraction_process() -> None:
+    """Worker-process initializer: stdout belongs to the JSON protocol, so anything a
+    parser prints (from Python or native code) is redirected to stderr."""
+    try:
+        sys.stdout.flush()
+        os.dup2(sys.stderr.fileno(), 1)
+    except (OSError, AttributeError, ValueError):
+        pass
+    sys.stdout = sys.stderr
+
+
+def create_extraction_pool(max_workers: int) -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_init_extraction_process,
+    )
+
+
+def estimate_extraction_seconds(plan: FilePlan) -> float:
+    if plan.item.path.suffix.lower() in HEAVY_EXTENSIONS:
+        return HEAVY_EXTRACTION_SECONDS
+    return 0.002 + plan.size / 40_000_000
+
+
+class ExtractionPipeline:
+    """Runs `extract_file_task` for the "work" plans with a bounded look-ahead window and
+    hands results back strictly in plan order, so events stay ordered and at most
+    `max_workers * PREFETCH_PER_WORKER` extracted files are held in memory."""
+
+    def __init__(self, plans: list[FilePlan], max_workers: int, check_cancel: Callable[[str | None], None]):
+        self.plans = plans
+        self.pending: deque[int] = deque(index for index, plan in enumerate(plans) if plan.kind == "work")
+        self.max_workers = max(1, int(max_workers))
+        estimated = sum(estimate_extraction_seconds(plans[index]) for index in self.pending)
+        self.parallel = self.max_workers > 1 and len(self.pending) >= 2 and estimated >= PARALLEL_MIN_ESTIMATED_SECONDS
+        self.window = self.max_workers * PREFETCH_PER_WORKER
+        self.check_cancel = check_cancel
+        self.futures: dict[int, Future] = {}
+        self.crashes: dict[int, int] = {}
+        self.executor: ProcessPoolExecutor | None = None
+        self.restarts = 0
+
+    def _task_args(self, index: int) -> tuple:
+        plan = self.plans[index]
+        return (str(plan.item.path), plan.item.relative_path, plan.previous_hash, plan.size, plan.mtime)
+
+    def _restart(self) -> None:
+        """Drop a broken pool and requeue everything that was in flight."""
+        in_flight = sorted(self.futures)
+        self.futures.clear()
+        self._shutdown(terminate=True)
+        self.pending.extendleft(reversed(in_flight))
+        self.restarts += 1
+        if self.restarts > MAX_POOL_RESTARTS:
+            log_warning("Extraction worker processes keep failing; continuing in the main process.")
+            self.parallel = False
+
+    def _fill(self) -> None:
+        while self.parallel and self.pending and len(self.futures) < self.window:
+            index = self.pending[0]
+            try:
+                if self.executor is None:
+                    self.executor = create_extraction_pool(self.max_workers)
+                future = self.executor.submit(extract_file_task, *self._task_args(index))
+            except (BrokenProcessPool, OSError, RuntimeError) as exc:
+                log_warning(f"Extraction worker pool failed: {describe_error(exc)}")
+                self._restart()
+                continue
+            self.pending.popleft()
+            self.futures[index] = future
+
+    def result_for(self, index: int) -> dict[str, Any]:
+        while True:
+            self._fill()
+            if not self.parallel:
+                return extract_file_task(*self._task_args(index))
+            future = self.futures.pop(index)
+            try:
+                while True:
+                    try:
+                        result = future.result(timeout=FUTURE_POLL_SECONDS)
+                        break
+                    except FuturesTimeoutError:
+                        self.check_cancel(self.plans[index].item.relative_path)
+            except BrokenProcessPool:
+                # A worker died (for example a native crash in a parser). Restart the pool and
+                # retry; a file that takes the pool down twice is marked failed.
+                self.crashes[index] = self.crashes.get(index, 0) + 1
+                self._restart()
+                if self.crashes[index] >= 2:
+                    return {"kind": "failed", "hash": None, "reason": "The extraction process crashed on this file."}
+                self.pending.appendleft(index)
+                continue
+            self._fill()
+            return result
+
+    def _shutdown(self, terminate: bool) -> None:
+        executor, self.executor = self.executor, None
+        if executor is None:
+            return
+        if terminate:
+            processes = list((getattr(executor, "_processes", None) or {}).values())
+            executor.shutdown(wait=False, cancel_futures=True)
+            for process in processes:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            for process in processes:
+                try:
+                    process.join(timeout=2)
+                except Exception:
+                    pass
+        else:
+            executor.shutdown(wait=True)
+
+    def close(self, cancel: bool = False) -> None:
+        busy = bool(self.futures)
+        self.futures.clear()
+        self.pending.clear()
+        self._shutdown(terminate=cancel or busy)
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+
+def resolve_build_options(options: dict[str, Any]) -> BuildOptions:
+    patterns = [str(item).strip() for item in options.get("excludePatterns") or [] if str(item).strip()]
+    max_size = options.get("maxFileSizeMb")
+    try:
+        max_size_mb = float(max_size) if max_size is not None else DEFAULT_MAX_FILE_SIZE_MB
+    except (TypeError, ValueError):
+        max_size_mb = DEFAULT_MAX_FILE_SIZE_MB
+    if max_size_mb <= 0:
+        max_size_mb = DEFAULT_MAX_FILE_SIZE_MB
+    return BuildOptions(
+        exclude_patterns=[compile_glob(pattern) for pattern in patterns],
+        max_file_size_mb=max_size_mb,
+        include_hidden=bool(options.get("includeHidden", False)),
+    )
+
+
+def compile_glob(pattern: str) -> re.Pattern[str]:
+    """Translate a gitignore-style glob to a regex over POSIX relative paths.
+    `**` spans directories, `*`/`?` stay within one segment. Patterns without a `/`
+    match the basename at any depth. Matching is case-insensitive."""
+    normalized = pattern.replace("\\", "/").lstrip("/")
+    if "/" not in normalized.rstrip("/"):
+        normalized = "**/" + normalized
+    if normalized.endswith("/"):
+        normalized += "**"
+    parts: list[str] = []
+    index = 0
+    while index < len(normalized):
+        char = normalized[index]
+        if normalized.startswith("**/", index):
+            parts.append("(?:.*/)?")
+            index += 3
+            continue
+        if normalized.startswith("**", index):
+            parts.append(".*")
+            index += 2
+            continue
+        if char == "*":
+            parts.append("[^/]*")
+        elif char == "?":
+            parts.append("[^/]")
+        elif char == "[":
+            closing = normalized.find("]", index + 1)
+            if closing == -1:
+                parts.append(re.escape(char))
+            else:
+                body = normalized[index + 1 : closing]
+                if body.startswith("!"):
+                    body = "^" + body[1:]
+                parts.append(f"[{body}]")
+                index = closing + 1
+                continue
+        else:
+            parts.append(re.escape(char))
+        index += 1
+    return re.compile("".join(parts) + r"\Z", re.IGNORECASE | re.DOTALL)
+
+
+def matches_exclude(relative_posix: str, patterns: list[re.Pattern[str]]) -> bool:
+    return any(pattern.match(relative_posix) for pattern in patterns)
+
+
+def path_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def has_hidden_attribute(lstat_result) -> bool:
+    attributes = getattr(lstat_result, "st_file_attributes", 0) or 0
+    return bool(attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))
+
+
+def discover_files(
+    root_path: Path,
+    build_options: BuildOptions | None = None,
+    index_path: Path | None = None,
+    on_progress: Callable[[int], Any] | None = None,
+) -> list[DiscoveredFile]:
+    """Walk the root with os.scandir. On Windows the directory listing already carries
+    size/mtime/attributes, so a no-change sync needs no per-file system calls; the stat is
+    kept on each DiscoveredFile and reused by the build planner."""
+    options = build_options or BuildOptions(max_file_size_mb=DEFAULT_MAX_FILE_SIZE_MB)
+    root = Path(os.path.abspath(root_path))
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        resolved_root = root
+    excluded_dirs: set[str] = set()
+    if index_path is not None:
+        for candidate in (index_path, temp_index_path(index_path), old_index_path(index_path)):
+            excluded_dirs.add(path_key(candidate))
+            try:
+                excluded_dirs.add(path_key(candidate.resolve()))
+            except OSError:
+                pass
+
+    files: list[DiscoveredFile] = []
+    stack: list[tuple[str, str]] = [(str(root), "")]
+    while stack:
+        directory, relative_dir = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError:
+            continue
+        subdirectories: list[tuple[str, str]] = []
+        for entry in entries:
+            name = entry.name
+            relative = os.path.join(relative_dir, name) if relative_dir else name
+            relative_posix = relative.replace(os.sep, "/") if os.sep != "/" else relative
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_dir:
+                if not should_skip_directory_entry(entry, name, relative_posix, options, excluded_dirs):
+                    subdirectories.append((entry.path, relative))
+                continue
+            stat_result = file_entry_stat(entry, name, relative_posix, options, resolved_root)
+            if stat_result is None:
+                continue
+            files.append(DiscoveredFile(path=Path(entry.path), relative_path=relative, stat=stat_result))
+            if on_progress and (len(files) == 1 or len(files) % 25 == 0):
+                on_progress(len(files))
+        stack.extend(reversed(subdirectories))
+    files.sort(key=lambda item: item.relative_path.lower())
+    return files
+
+
+def entry_is_link_or_junction(entry: os.DirEntry, lstat_result) -> bool:
+    if entry.is_symlink():
+        return True
+    is_junction = getattr(entry, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    return getattr(lstat_result, "st_reparse_tag", 0) == IO_REPARSE_TAG_MOUNT_POINT
+
+
+def should_skip_directory_entry(
+    entry: os.DirEntry,
+    name: str,
+    relative_posix: str,
+    options: BuildOptions,
+    excluded_dirs: set[str],
+) -> bool:
+    if name.lower() in IGNORED_DIR_NAMES:
+        return True
+    if not options.include_hidden and name.startswith("."):
+        return True
+    if excluded_dirs and path_key(entry.path) in excluded_dirs:
+        return True
+    if matches_exclude(relative_posix, options.exclude_patterns) or matches_exclude(relative_posix + "/", options.exclude_patterns):
+        return True
+    try:
+        lstat_result = entry.stat(follow_symlinks=False)
+    except OSError:
+        return True
+    # Never descend into symlinked/junction directories: avoids cycles, duplicates and escaping the root.
+    if entry_is_link_or_junction(entry, lstat_result):
+        return True
+    if not options.include_hidden and has_hidden_attribute(lstat_result):
+        return True
+    return False
+
+
+def file_entry_stat(entry: os.DirEntry, name: str, relative_posix: str, options: BuildOptions, resolved_root: Path):
+    """The file's stat result if it should be indexed, else None."""
+    lowered = name.lower()
+    if lowered in IGNORED_FILE_NAMES or name.startswith("~$"):
+        return None
+    if not options.include_hidden and name.startswith("."):
+        return None
+    if matches_exclude(relative_posix, options.exclude_patterns):
+        return None
+    try:
+        lstat_result = entry.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if not options.include_hidden and has_hidden_attribute(lstat_result):
+        return None
+    if entry_is_link_or_junction(entry, lstat_result):
+        full = Path(entry.path)
+        try:
+            target = full.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if not is_within(target, resolved_root) or not target.is_file():
+            return None
+        try:
+            return os.stat(full)
+        except OSError:
+            return None
+    if not stat_module.S_ISREG(lstat_result.st_mode):
+        return None
+    return lstat_result
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+
+def search_index(
+    root_path: Path,
+    query: str,
+    top_k: int,
+    options: dict,
+    index_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    index_dir = index_path or resolve_index_path(root_path)
     retrieval = resolve_retrieval_options(options)
-    manifest = read_manifest(root_path)
-    if manifest.get("retrievalMode") != retrieval["mode"]:
-        raise ValueError("Index retrieval mode does not match the requested retrieval mode.")
-    if manifest.get("chunkCount", 0) == 0:
-        return []
-
-    if retrieval["mode"] == "vectorless":
-        selected_document_ids = set(retrieval.get("documentIds") or [])
-        query_tokens = tokenize_query(query)
-        query_lower = query.lower().strip()
-        scored_chunks: list[tuple[float, dict[str, Any]]] = []
-        for chunk in read_chunk_metadata(root_path):
-            if selected_document_ids and chunk.get("relativePath") not in selected_document_ids:
-                continue
-            score = lexical_chunk_score(
-                query_tokens,
-                query_lower,
-                chunk.get("text", ""),
-                chunk.get("relativePath", ""),
-                has_visual_assets=bool(chunk.get("visualAssets")),
-            )
-            if score <= 0:
-                continue
-            scored_chunks.append((score, chunk))
-        scored_chunks.sort(key=lambda item: item[0], reverse=True)
-        results: list[dict[str, Any]] = []
-        for score, chunk in scored_chunks[: max(int(top_k), 0)]:
-            item = {
-                "chunkId": chunk["chunkId"],
-                "relativePath": chunk["relativePath"],
-                "score": float(score),
-                "snippet": chunk["snippet"],
-                "text": chunk["text"],
-            }
-            if chunk.get("chunkType"):
-                item["chunkType"] = chunk["chunkType"]
-            if chunk.get("sheetName"):
-                item["sheetName"] = chunk["sheetName"]
-            if chunk.get("rowNumber") is not None:
-                item["rowNumber"] = chunk["rowNumber"]
-            if chunk.get("visualAssets"):
-                item["visualAssets"] = chunk["visualAssets"]
-            results.append(item)
-        return results
+    with open_index_db(index_dir) as conn:
+        meta = read_meta(conn)
+        if meta.get("version") not in SUPPORTED_INDEX_VERSIONS:
+            raise ValueError("Unsupported index version.")
+        if (meta.get("retrievalMode") or "vector") != retrieval["mode"]:
+            raise ValueError("Index retrieval mode does not match the requested retrieval mode.")
+        if top_k <= 0 or not conn.execute("SELECT EXISTS(SELECT 1 FROM chunks)").fetchone()[0]:
+            return []
+        if retrieval["mode"] == "vectorless":
+            return lexical_search_conn(conn, index_dir, str(meta.get("dataVersion") or ""), query, top_k, set(retrieval.get("documentIds") or []))
 
     embedding_provider = options.get("embeddingProvider") or {}
     if not embedding_provider:
         raise ValueError("Embedding provider configuration is required for search.")
+    query_model_key = build_embedding_model_key(embedding_provider)
+    index_model_key = meta.get("embeddingModelKey")
+    if index_model_key and index_model_key != query_model_key:
+        raise ValueError(
+            f"Index was built with {describe_model_key(index_model_key)} but search uses "
+            f"{describe_model_key(query_model_key)}; rebuild required."
+        )
 
-    bundle = load_index_bundle(root_path, manifest)
-    vectors = bundle.get("vectors")
-    if vectors is None:
-        return []
-
+    # The query is embedded without holding the index open (it is a network call).
     query_embedding = np.asarray(embed_query(embedding_provider, query), dtype=np.float32)
     query_norm = np.linalg.norm(query_embedding)
     if query_norm == 0:
         return []
-    normalized_query = query_embedding / query_norm
-    scores = np.asarray(vectors @ normalized_query, dtype=np.float32)
-    limit = min(int(top_k), int(scores.shape[0]))
-    if limit <= 0:
-        return []
-    if limit == scores.shape[0]:
-        top_labels = np.argsort(scores)[::-1]
-    else:
-        candidate_labels = np.argpartition(scores, -limit)[-limit:]
-        top_labels = candidate_labels[np.argsort(scores[candidate_labels])[::-1]]
+    with open_index_db(index_dir) as conn:
+        data_version = str(read_meta(conn).get("dataVersion") or "")
+        matrix = load_vector_matrix(conn, index_key(index_dir), data_version)
+        if matrix is None:
+            return []
+        scores = cosine_scores(matrix, query_embedding / query_norm)
+        limit = min(int(top_k), int(scores.shape[0]))
+        if limit <= 0:
+            return []
+        if limit == scores.shape[0]:
+            top_rows = np.argsort(-scores, kind="stable")
+        else:
+            candidates = np.argpartition(scores, -limit)[-limit:]
+            top_rows = candidates[np.argsort(-scores[candidates], kind="stable")]
+        ranked = [(int(matrix.chunk_ids[row]), max(0.0, float(scores[row]))) for row in top_rows.tolist()]
+        chunks = fetch_chunks(conn, [chunk_id for chunk_id, _ in ranked])
+    return [search_result(chunks[chunk_id], score) for chunk_id, score in ranked if chunk_id in chunks]
 
-    results: list[dict[str, Any]] = []
-    for label in top_labels.tolist():
-        chunk = bundle["chunkByLabel"].get(int(label))
-        if not chunk:
+
+def fetch_chunks(conn: sqlite3.Connection, chunk_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not chunk_ids:
+        return {}
+    rows = conn.execute(
+        f"SELECT {CHUNK_COLUMNS} FROM chunks WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(chunk_ids),)
+    )
+    return {row[0]: chunk_from_row(row) for row in rows}
+
+
+def describe_model_key(model_key: str) -> str:
+    parts = model_key.split("|")
+    provider = parts[0] if parts else ""
+    model = (parts[4] if len(parts) > 4 else "") or (parts[3] if len(parts) > 3 else "")
+    label = "/".join(part for part in (provider, model) if part)
+    return label or "an unknown embedding model"
+
+
+def search_result(chunk: dict[str, Any], score: float) -> dict[str, Any]:
+    item = {
+        "chunkId": chunk["chunkId"],
+        "relativePath": chunk["relativePath"],
+        "score": score,
+        "snippet": chunk["snippet"],
+        "text": chunk["text"],
+    }
+    for key in ("chunkType", "sheetName", "visualAssets"):
+        if chunk.get(key):
+            item[key] = chunk[key]
+    if chunk.get("rowNumber") is not None:
+        item["rowNumber"] = chunk["rowNumber"]
+    return item
+
+
+_TOKEN_PATTERN = re.compile(r"[^\W_]+")
+
+
+def tokenize(text: str) -> list[str]:
+    """Unicode-aware word tokens: casefolded, split on non-word chars (and `_`), length >= 2, numbers kept."""
+    return [token for token in _TOKEN_PATTERN.findall((text or "").casefold()) if len(token) >= 2]
+
+
+def fts_match_expression(query: str) -> str | None:
+    """Build a safe FTS5 MATCH expression: every word (letters/digits only, length >= 2)
+    becomes a quoted string, OR-ed together (BM25 over any matching term, like before).
+    Operators and syntax characters in user input (`"`, `*`, `-`, `:`, `^`, parentheses,
+    NEAR/AND/OR/NOT) never reach FTS5 unquoted."""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for word in _TOKEN_PATTERN.findall(query or ""):
+        key = word.casefold()
+        if len(key) < 2 or key in seen:
             continue
-        item = {
-            "chunkId": chunk["chunkId"],
-            "relativePath": chunk["relativePath"],
-            "score": max(0.0, float(scores[int(label)])),
-            "snippet": chunk["snippet"],
-            "text": chunk["text"],
-        }
-        if chunk.get("chunkType"):
-            item["chunkType"] = chunk["chunkType"]
-        if chunk.get("sheetName"):
-            item["sheetName"] = chunk["sheetName"]
-        if chunk.get("rowNumber") is not None:
-            item["rowNumber"] = chunk["rowNumber"]
-        if chunk.get("visualAssets"):
-            item["visualAssets"] = chunk["visualAssets"]
-        results.append(item)
-    return results
+        seen.add(key)
+        terms.append('"' + word.replace('"', '""') + '"')
+        if len(terms) >= MAX_QUERY_TERMS:
+            break
+    return " OR ".join(terms) if terms else None
+
+
+@dataclass
+class PathTokenIndex:
+    data_version: str
+    postings: dict[str, list[str]]
+
+
+def clear_lexical_cache(index_dir: Path | None = None) -> None:
+    with _LEXICAL_LOCK:
+        if index_dir is None:
+            _PATH_TOKEN_CACHE.clear()
+        else:
+            _PATH_TOKEN_CACHE.pop(index_key(index_dir), None)
+
+
+def load_path_tokens(conn: sqlite3.Connection, index_dir: Path, data_version: str) -> PathTokenIndex:
+    """token -> paths, from `files` (one entry per file rather than per chunk); cached per data version."""
+    cache_key = index_key(index_dir)
+    with _LEXICAL_LOCK:
+        cached = _PATH_TOKEN_CACHE.get(cache_key)
+        if cached is not None and cached.data_version == data_version and data_version:
+            return cached
+    postings: dict[str, list[str]] = {}
+    for (relative_path,) in conn.execute("SELECT relative_path FROM files WHERE chunks > 0"):
+        for token in set(tokenize(relative_path)):
+            postings.setdefault(token, []).append(relative_path)
+    index = PathTokenIndex(data_version, postings)
+    with _LEXICAL_LOCK:
+        _PATH_TOKEN_CACHE[cache_key] = index
+        while len(_PATH_TOKEN_CACHE) > _PATH_TOKEN_CACHE_LIMIT:
+            _PATH_TOKEN_CACHE.pop(next(iter(_PATH_TOKEN_CACHE)))
+    return index
+
+
+def lexical_search(index_dir: Path, query: str, top_k: int, selected_document_ids: set[str]) -> list[dict[str, Any]]:
+    with open_index_db(index_dir) as conn:
+        data_version = str(read_meta(conn).get("dataVersion") or "")
+        return lexical_search_conn(conn, index_dir, data_version, query, top_k, selected_document_ids)
+
+
+def lexical_search_conn(
+    conn: sqlite3.Connection,
+    index_dir: Path,
+    data_version: str,
+    query: str,
+    top_k: int,
+    selected_document_ids: set[str],
+) -> list[dict[str, Any]]:
+    """FTS5 BM25 (higher = better) plus the path bonus (+0.75 per query token found in the
+    file path) and the visual bonus (+1.5 for chunks with visual assets when the query asks
+    for charts/images). Text candidates are the best `max(200, 25 * topK)` BM25 hits."""
+    top_k = max(int(top_k), 0)
+    if top_k == 0:
+        return []
+    query_tokens = set(tokenize(query))
+    visual_query = any(token in VISUAL_QUERY_TOKENS for token in query_tokens)
+    selected_json = json.dumps(sorted(selected_document_ids)) if selected_document_ids else None
+
+    # chunk id -> [text score, relative path, has visual]
+    candidates: dict[int, list[Any]] = {}
+    match = fts_match_expression(query)
+    if match:
+        # FTS5 ranks (bm25, lower = better) and limits on its own; only the best candidates
+        # are joined to `chunks`. The documentIds filter is applied before the limit.
+        inner = "SELECT rowid, rank FROM chunks_fts WHERE chunks_fts MATCH ?"
+        params: list[Any] = [match]
+        if selected_json is not None:
+            inner += " AND rowid IN (SELECT id FROM chunks WHERE relative_path IN (SELECT value FROM json_each(?)))"
+            params.append(selected_json)
+        inner += " ORDER BY rank LIMIT ?"
+        params.append(max(MIN_TEXT_CANDIDATES, top_k * 25))
+        sql = f"SELECT c.id, c.relative_path, c.has_visual, -f.rank FROM ({inner}) f JOIN chunks c ON c.id = f.rowid"
+        for chunk_id, relative_path, has_visual, score in conn.execute(sql, params):
+            candidates[chunk_id] = [float(score), relative_path, has_visual]
+
+    bonus: dict[str, float] = {}
+    if query_tokens:
+        path_index = load_path_tokens(conn, index_dir, data_version)
+        for token in query_tokens:
+            for relative_path in path_index.postings.get(token, ()):
+                if selected_document_ids and relative_path not in selected_document_ids:
+                    continue
+                bonus[relative_path] = bonus.get(relative_path, 0.0) + PATH_MATCH_BOOST
+    visual_weight = VISUAL_ASSET_BOOST if visual_query else 0.0
+    extra_limit = top_k + len(candidates)
+    if bonus:
+        rows = conn.execute(
+            "SELECT c.id, c.relative_path, c.has_visual FROM json_each(?) j JOIN chunks c ON c.relative_path = j.key "
+            "ORDER BY j.value + c.has_visual * ? DESC, c.id LIMIT ?",
+            (json.dumps(bonus), visual_weight, extra_limit),
+        )
+        for chunk_id, relative_path, has_visual in rows:
+            candidates.setdefault(chunk_id, [0.0, relative_path, has_visual])
+    if visual_query:
+        sql = "SELECT id, relative_path, has_visual FROM chunks WHERE has_visual = 1"
+        params = []
+        if selected_json is not None:
+            sql += " AND relative_path IN (SELECT value FROM json_each(?))"
+            params.append(selected_json)
+        sql += " ORDER BY id LIMIT ?"
+        params.append(extra_limit + len(bonus))
+        for chunk_id, relative_path, has_visual in conn.execute(sql, params):
+            candidates.setdefault(chunk_id, [0.0, relative_path, has_visual])
+
+    ranked = sorted(
+        (
+            (text_score + bonus.get(relative_path, 0.0) + (visual_weight if has_visual else 0.0), chunk_id)
+            for chunk_id, (text_score, relative_path, has_visual) in candidates.items()
+        ),
+        key=lambda item: (-item[0], item[1]),
+    )
+    ranked = [(score, chunk_id) for score, chunk_id in ranked if score > 0][:top_k]
+    chunks = fetch_chunks(conn, [chunk_id for _, chunk_id in ranked])
+    return [search_result(chunks[chunk_id], float(score)) for score, chunk_id in ranked if chunk_id in chunks]
+
+
+# ---------------------------------------------------------------------------
+# Visual assets
+# ---------------------------------------------------------------------------
 
 
 def resolve_visual_assets(root_path: Path, assets: list[dict[str, Any]], max_assets: int) -> list[dict[str, Any]]:
@@ -773,32 +1720,45 @@ def resize_image_for_vision(image):
     return image.resize(new_size, resampling_module.LANCZOS)
 
 
-def discover_files(root_path: Path, on_progress=None) -> list[Path]:
-    files: list[Path] = []
-    for path in root_path.rglob("*"):
-        if not path.is_file():
-            continue
-        relative_parts = path.relative_to(root_path).parts
-        if relative_parts and relative_parts[0] in {INDEX_DIR_NAME, ".fschat-index.tmp"}:
-            continue
-        files.append(path)
-        if on_progress and (len(files) == 1 or len(files) % 25 == 0):
-            on_progress(len(files))
-    files.sort(key=lambda item: str(item.relative_to(root_path)).lower())
-    return files
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+_SENTENCE_END = re.compile(r"[.!?。！？][\"')\]]*\s")
 
 
-def split_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> list[str]:
+def find_break(segment: str) -> int | None:
+    """Return the offset just after the best boundary in `segment`: paragraph, then line, then sentence."""
+    paragraph = segment.rfind("\n\n")
+    if paragraph != -1:
+        return paragraph + 2
+    line = segment.rfind("\n")
+    if line != -1:
+        return line + 1
+    last_sentence = None
+    for match in _SENTENCE_END.finditer(segment):
+        last_sentence = match.end()
+    return last_sentence
+
+
+def split_text(text: str, chunk_size: int = 1200, overlap: int = 200, boundary_window: float = 0.25) -> list[str]:
     chunks: list[str] = []
     cursor = 0
     length = len(text)
+    search_span = max(1, int(chunk_size * boundary_window))
     while cursor < length:
-        window = text[cursor : cursor + chunk_size].strip()
+        end = min(cursor + chunk_size, length)
+        if end < length:
+            window_start = end - search_span
+            offset = find_break(text[window_start:end])
+            if offset is not None and window_start + offset > cursor + overlap:
+                end = window_start + offset
+        window = text[cursor:end].strip()
         if window:
             chunks.append(window)
-        if cursor + chunk_size >= length:
+        if end >= length:
             break
-        cursor += chunk_size - overlap
+        cursor = max(end - overlap, cursor + 1)
     return chunks
 
 
@@ -882,40 +1842,9 @@ def visual_asset_key(asset: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def finalize_index(
-    temp_store: Path,
-    root_path: Path,
-    file_records: list[FileRecord],
-    embedded_chunks: list[dict[str, Any]],
-    document_records: list[dict[str, Any]],
-    created_at: str,
-    embedding_provider: dict[str, Any],
-    retrieval: dict[str, Any],
-) -> dict[str, Any]:
-    files_payload = [record.to_dict() for record in file_records]
-    timestamp = utc_now()
-    manifest = {
-        "version": INDEX_VERSION,
-        "rootPath": str(root_path),
-        "createdAt": created_at,
-        "updatedAt": timestamp,
-        "files": files_payload,
-        "chunkCount": len(embedded_chunks),
-        "documentCount": len(document_records),
-        "retrievalMode": retrieval["mode"],
-        "indexEngine": retrieval["engine"],
-    }
-    if retrieval["mode"] == "vector":
-        embedding_dimension = len(embedded_chunks[0]["embedding"]) if embedded_chunks else 0
-        manifest["embeddingDimension"] = embedding_dimension
-        manifest["embeddingModelKey"] = build_embedding_model_key(embedding_provider)
-    write_manifest(temp_store, manifest)
-    write_documents(temp_store, document_records)
-    write_vector_store(temp_store, embedded_chunks, int(manifest.get("embeddingDimension", 0)))
-    clear_index_cache(root_path)
-    commit_temp_store(root_path)
-    clear_index_cache(root_path)
-    return manifest
+# ---------------------------------------------------------------------------
+# Reuse helpers
+# ---------------------------------------------------------------------------
 
 
 def hash_file(path: Path) -> str:
@@ -930,91 +1859,32 @@ def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def format_megabytes(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
 def is_unchanged_by_stat(previous_file: dict[str, Any], stat_result) -> bool:
     return previous_file.get("size") == stat_result.st_size and previous_file.get("mtime") == stat_result.st_mtime
 
 
+def file_record_kwargs(previous_file: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "relative_path": previous_file["relativePath"],
+        "status": previous_file["status"],
+        "size": int(previous_file.get("size", 0)),
+        "mtime": previous_file.get("mtime", 0),
+        "parser": previous_file.get("parser", "reused"),
+        "chunks": int(previous_file.get("chunks", 0)),
+        "content_hash": previous_file.get("contentHash"),
+        "error_reason": previous_file.get("errorReason"),
+    }
+
+
 def reused_file_record(previous_file: dict[str, Any], stat_result, content_hash: str | None = None) -> FileRecord:
-    return FileRecord(
-        relative_path=previous_file["relativePath"],
-        status=previous_file["status"],
-        size=stat_result.st_size,
-        mtime=stat_result.st_mtime,
-        parser=previous_file.get("parser", "reused"),
-        chunks=int(previous_file.get("chunks", 0)),
-        content_hash=content_hash or previous_file.get("contentHash"),
-        error_reason=previous_file.get("errorReason"),
-    )
+    kwargs = file_record_kwargs(previous_file)
+    kwargs.update(size=stat_result.st_size, mtime=stat_result.st_mtime, content_hash=content_hash or kwargs["content_hash"])
+    return FileRecord(**kwargs)
 
-
-def reuse_previous_chunks(
-    previous_chunks: list[dict[str, Any]],
-    previous_vectors_by_hash: dict[str, list[float]],
-    include_embeddings: bool = True,
-) -> list[dict[str, Any]]:
-    reused: list[dict[str, Any]] = []
-    for chunk in previous_chunks:
-        entry = {
-            "chunkId": chunk["chunkId"],
-            "relativePath": chunk["relativePath"],
-            "snippet": chunk["snippet"],
-            "text": chunk["text"],
-            "chunkHash": chunk["chunkHash"],
-            "fileHash": chunk.get("fileHash"),
-        }
-        if chunk.get("chunkType"):
-            entry["chunkType"] = chunk["chunkType"]
-        if chunk.get("sheetName"):
-            entry["sheetName"] = chunk["sheetName"]
-        if chunk.get("rowNumber") is not None:
-            entry["rowNumber"] = chunk["rowNumber"]
-        if chunk.get("visualAssets"):
-            entry["visualAssets"] = chunk["visualAssets"]
-        if include_embeddings:
-            vector = previous_vectors_by_hash.get(chunk.get("chunkHash"))
-            if vector is None:
-                continue
-            entry["embedding"] = vector
-        reused.append(entry)
-    return reused
-
-
-def ensure_not_cancelled(
-    channel_id: str,
-    total_files: int,
-    processed_files: int,
-    success_count: int,
-    failure_count: int,
-    current_file: str | None = None,
-) -> None:
-    request = CANCELLED_CHANNELS.get(channel_id)
-    if request is None:
-        return
-    CANCELLED_CHANNELS.pop(channel_id, None)
-    message = "Indexing cancelled. Retaining partial index." if request.retain_partial else "Indexing cancelled. Discarding partial index."
-    emit_progress(
-        {
-            "channelId": channel_id,
-            "phase": "cancelled",
-            "totalFiles": total_files,
-            "processedFiles": processed_files,
-            "successCount": success_count,
-            "failureCount": failure_count,
-            "currentFile": current_file,
-            "message": message,
-        }
-    )
-    raise CancelledBuild(retain_partial=request.retain_partial)
-
-
-def submit_build_request(request_id: str | None, channel_id: str, root_path: Path, options: dict, force: bool) -> None:
-    def run() -> None:
-        try:
-            emit_response(request_id, True, build_index(channel_id, root_path, options, force=force))
-        except Exception as exc:
-            emit_response(request_id, False, error=f"{exc}\n{traceback.format_exc(limit=2)}")
-
-    BUILD_EXECUTOR.submit(run)
 
 
 def build_embedding_model_key(embedding_provider: dict[str, Any]) -> str:
@@ -1045,6 +1915,13 @@ def resolve_retrieval_options(options: dict[str, Any]) -> dict[str, Any]:
     engine = str(retrieval.get("engine") or default_engine)
     document_ids = [str(item) for item in retrieval.get("documentIds") or [] if str(item).strip()]
     return {"mode": mode, "engine": engine, "documentIds": document_ids}
+
+
+
+
+# ---------------------------------------------------------------------------
+# Document records
+# ---------------------------------------------------------------------------
 
 
 def build_document_record(
@@ -1182,17 +2059,6 @@ def looks_like_heading(line: str) -> bool:
     return uppercase_ratio > 0.55 or line.endswith(":")
 
 
-def dedupe_preserve_order(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        ordered.append(item)
-    return ordered
-
-
 def summarize_spreadsheet_structure(relative_path: str, structure: dict[str, Any]) -> str:
     sheet_count = int(structure.get("sheetCount") or 0)
     row_count = int(structure.get("rowCount") or 0)
@@ -1220,43 +2086,20 @@ def extract_spreadsheet_section_hints(structure: dict[str, Any], limit: int = 6)
     return dedupe_preserve_order(hints)[:limit]
 
 
-def tokenize_query(text: str) -> list[str]:
-    return [token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(token) > 1]
-
-
-def lexical_chunk_score(
-    query_tokens: list[str],
-    query_lower: str,
-    text: str,
-    relative_path: str,
-    has_visual_assets: bool = False,
-) -> float:
-    haystack = f"{relative_path}\n{text}".lower()
-    if not haystack.strip():
-        return 0.0
-    score = 0.0
-    if query_lower and query_lower in haystack:
-        score += 4.0
-    unique_matches = 0
-    path_lower = relative_path.lower()
-    for token in set(query_tokens):
-        count = haystack.count(token)
-        if count:
-            unique_matches += 1
-            score += min(count, 8) * 0.65
-        if token in path_lower:
-            score += 1.5
-    if has_visual_assets and any(token in VISUAL_QUERY_TOKENS for token in query_tokens):
-        score += 3.0
-    score += unique_matches * 0.9
-    return score
-
 
 def main() -> None:
     for raw_line in sys.stdin:
-        if raw_line.strip():
-            handle_request(json.loads(raw_line))
+        if not raw_line.strip():
+            continue
+        try:
+            request = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            emit_response(None, False, error=f"Invalid request JSON: {exc.msg}.")
+            continue
+        handle_request(request)
 
 
 if __name__ == "__main__":
+    # Required for ProcessPoolExecutor (spawn) in a PyInstaller-frozen binary; a no-op otherwise.
+    multiprocessing.freeze_support()
     main()

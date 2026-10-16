@@ -1,36 +1,44 @@
+/** Semantic design tokens. Values live in src/renderer/styles/index.css (light + dark). */
+const token = (name) => `rgb(var(--${name}) / <alpha-value>)`;
+
 module.exports = {
-  content: [
-    "./src/renderer/index.html",
-    "./src/renderer/**/*.{ts,tsx}"
-  ],
+  darkMode: ["selector", '[data-theme="dark"]'],
+  content: ["./src/renderer/index.html", "./src/renderer/**/*.{ts,tsx}"],
   theme: {
+    // Radii are restricted on purpose: 6px (controls), 8px (cards), 12px (dialogs).
+    borderRadius: {
+      none: "0",
+      sm: "4px",
+      DEFAULT: "6px",
+      md: "8px",
+      lg: "12px",
+      full: "9999px"
+    },
     extend: {
       colors: {
-        black: "rgb(var(--color-layer-dark) / <alpha-value>)",
-        white: "rgb(var(--color-layer-light) / <alpha-value>)",
-        ink: "rgb(var(--color-ink) / <alpha-value>)",
-        mist: "rgb(var(--color-mist) / <alpha-value>)",
-        ember: "rgb(var(--color-ember) / <alpha-value>)",
-        pine: "rgb(var(--color-pine) / <alpha-value>)",
-        paper: "rgb(var(--color-paper) / <alpha-value>)",
-        coral: "rgb(var(--color-coral) / <alpha-value>)",
-        moss: "rgb(var(--color-moss) / <alpha-value>)"
+        bg: token("bg"),
+        surface: token("surface"),
+        "surface-2": token("surface-2"),
+        border: token("border"),
+        text: token("text"),
+        "text-muted": token("text-muted"),
+        accent: token("accent"),
+        "accent-fg": token("accent-fg"),
+        success: token("success"),
+        warning: token("warning"),
+        danger: token("danger")
       },
       fontFamily: {
-        display: ["Inter", "Segoe UI", "system-ui", "sans-serif"],
-        body: ["Inter", "Segoe UI", "system-ui", "sans-serif"]
+        sans: ['"Segoe UI Variable Text"', '"Segoe UI Variable"', '"Segoe UI"', "Inter", "system-ui", "-apple-system", "sans-serif"],
+        mono: ['"Cascadia Code"', "Consolas", "ui-monospace", "monospace"]
+      },
+      fontSize: {
+        "2xs": ["11px", "16px"]
       },
       boxShadow: {
-        panel: "var(--shadow-panel)"
-      },
-      backgroundImage: {
-        "shell-gradient": "var(--background-shell)"
-      },
-      opacity: {
-        6: "0.06",
-        7: "0.07",
-        8: "0.08",
-        12: "0.12"
+        card: "var(--shadow-card)",
+        popover: "var(--shadow-popover)",
+        dialog: "var(--shadow-dialog)"
       }
     }
   },

@@ -2,6 +2,16 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!--
+      CSP notes for rich answers (components/rich/):
+      - script-src stays 'self' with NO 'unsafe-eval': mermaid and ECharts are bundled lazy chunks and were
+        verified to render under this exact policy.
+      - style-src 'unsafe-inline' is required by Mermaid's inline <style> inside the generated SVG and by
+        ECharts / React inline style attributes.
+      - img-src data: is used to rasterise diagram/chart SVG to PNG (SVG -> data: <img> -> canvas). blob: is NOT
+        needed: exports are saved through <a download href="blob:..."> which CSP fetch directives don't govern.
+      - connect-src 'self': nothing in the renderer fetches remote resources; rendering is fully offline.
+    -->
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'none';"

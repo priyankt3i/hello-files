@@ -12,7 +12,8 @@
     "build:indexer": "npm run build:indexer -w @fschat/desktop",
     "dist": "npm run dist -w @fschat/desktop",
     "typecheck": "npm run typecheck -w @fschat/shared && npm run typecheck -w @fschat/desktop",
-    "python:check": "python -m py_compile services/indexer/fschat_indexer/*.py"
+    "python:check": "python -m compileall -q services/indexer/fschat_indexer",
+    "python:test": "python -m pytest services/indexer/tests -q"
   },
   "devDependencies": {
     "electron": "35.0.1"

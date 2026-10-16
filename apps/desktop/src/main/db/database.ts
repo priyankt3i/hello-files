@@ -2,9 +2,11 @@ import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import type {
+  AppSettings,
   Channel,
   ChannelSnapshot,
   FileIndexStatus,
+  IndexBuildStats,
   IndexedFileRecord,
   Message,
   ProviderConnection,
@@ -140,6 +142,10 @@ export class AppDatabase {
     this.ensureColumn("channels", "embedding_model_id", "TEXT");
     this.ensureColumn("channels", "retrieval_mode", "TEXT NOT NULL DEFAULT 'vector'");
     this.ensureColumn("channels", "system_prompt", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("channels", "auto_sync", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("channels", "exclude_patterns_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("channels", "last_index_stats_json", "TEXT");
+    this.ensureColumn("channels", "last_error", "TEXT");
     this.ensureColumn("indexed_files", "content_hash", "TEXT");
 
     this.migrateLegacyProviderProfiles();
@@ -301,8 +307,8 @@ export class AppDatabase {
     this.db
       .prepare(
         `INSERT INTO channels (
-          id, display_name, root_path, index_path, chat_profile_id, embedding_profile_id, preferred_connection_id, chat_model_id, embedding_model_id, retrieval_mode, system_prompt, last_indexed_at, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          id, display_name, root_path, index_path, chat_profile_id, embedding_profile_id, preferred_connection_id, chat_model_id, embedding_model_id, retrieval_mode, system_prompt, auto_sync, exclude_patterns_json, last_index_stats_json, last_error, last_indexed_at, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         channel.id,
@@ -316,6 +322,10 @@ export class AppDatabase {
         channel.embeddingModelId,
         channel.retrievalMode,
         channel.systemPrompt,
+        channel.autoSync ? 1 : 0,
+        JSON.stringify(channel.excludePatterns),
+        channel.lastIndexStats ? JSON.stringify(channel.lastIndexStats) : null,
+        channel.lastError,
         channel.lastIndexedAt,
         channel.status,
         channel.createdAt,
@@ -348,11 +358,16 @@ export class AppDatabase {
       Pick<
         Channel,
         | "displayName"
+        | "indexPath"
         | "preferredConnectionId"
         | "chatModelId"
         | "embeddingModelId"
         | "retrievalMode"
         | "systemPrompt"
+        | "autoSync"
+        | "excludePatterns"
+        | "lastIndexStats"
+        | "lastError"
         | "lastIndexedAt"
         | "status"
         | "updatedAt"
@@ -372,16 +387,21 @@ export class AppDatabase {
     this.db
       .prepare(
         `UPDATE channels
-         SET display_name = ?, preferred_connection_id = ?, chat_model_id = ?, embedding_model_id = ?, retrieval_mode = ?, system_prompt = ?, last_indexed_at = ?, status = ?, updated_at = ?
+         SET display_name = ?, index_path = ?, preferred_connection_id = ?, chat_model_id = ?, embedding_model_id = ?, retrieval_mode = ?, system_prompt = ?, auto_sync = ?, exclude_patterns_json = ?, last_index_stats_json = ?, last_error = ?, last_indexed_at = ?, status = ?, updated_at = ?
          WHERE id = ?`
       )
       .run(
         next.displayName,
+        next.indexPath,
         next.preferredConnectionId,
         next.chatModelId,
         next.embeddingModelId,
         next.retrievalMode,
         next.systemPrompt,
+        next.autoSync ? 1 : 0,
+        JSON.stringify(next.excludePatterns),
+        next.lastIndexStats ? JSON.stringify(next.lastIndexStats) : null,
+        next.lastError,
         next.lastIndexedAt,
         next.status,
         next.updatedAt,
@@ -563,6 +583,36 @@ export class AppDatabase {
       );
   }
 
+  deleteProviderConnection(connectionId: string) {
+    const transaction = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE channels SET
+             preferred_connection_id = CASE WHEN preferred_connection_id = ? THEN NULL ELSE preferred_connection_id END,
+             chat_model_id = CASE WHEN chat_model_id IN (SELECT id FROM provider_models WHERE connection_id = ?) THEN NULL ELSE chat_model_id END,
+             embedding_model_id = CASE WHEN embedding_model_id IN (SELECT id FROM provider_models WHERE connection_id = ?) THEN NULL ELSE embedding_model_id END`
+        )
+        .run(connectionId, connectionId, connectionId);
+      this.db.prepare("DELETE FROM provider_models WHERE connection_id = ?").run(connectionId);
+      this.db.prepare("DELETE FROM provider_default_models WHERE connection_id = ?").run(connectionId);
+      this.db.prepare("DELETE FROM provider_connections WHERE id = ?").run(connectionId);
+    });
+    transaction();
+  }
+
+  getAppSettings(): AppSettings {
+    const row = this.db.prepare("SELECT value FROM app_settings WHERE key = 'dataPolicy'").get() as { value?: string } | undefined;
+    return {
+      dataPolicy: row?.value === "local-only" ? "local-only" : "any"
+    };
+  }
+
+  saveAppSettings(settings: AppSettings) {
+    this.db
+      .prepare("INSERT INTO app_settings (key, value) VALUES ('dataPolicy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(settings.dataPolicy);
+  }
+
   resetAllAppData() {
     const statements = [
       "DELETE FROM messages",
@@ -589,6 +639,10 @@ export class AppDatabase {
     return (this.db
       .prepare("SELECT * FROM threads WHERE channel_id = ? ORDER BY updated_at DESC")
       .all(channelId) as any[]).map(mapThread);
+  }
+
+  listAllThreads(): Thread[] {
+    return (this.db.prepare("SELECT * FROM threads ORDER BY updated_at DESC").all() as any[]).map(mapThread);
   }
 
   getThread(id: string): Thread | null {
@@ -679,7 +733,8 @@ export class AppDatabase {
       channel,
       threads: this.listThreads(channelId),
       indexedFiles: this.listChannelFiles(channelId, "indexed"),
-      failedFiles: this.listChannelFiles(channelId, "failed")
+      failedFiles: this.listChannelFiles(channelId, "failed"),
+      skippedFiles: this.listChannelFiles(channelId, "skipped")
     };
   }
 }
@@ -695,6 +750,10 @@ function mapChannel(row: any): Channel {
     embeddingModelId: row.embedding_model_id ?? null,
     retrievalMode: row.retrieval_mode ?? "vector",
     systemPrompt: row.system_prompt ?? "",
+    autoSync: row.auto_sync === undefined || row.auto_sync === null ? true : Boolean(row.auto_sync),
+    excludePatterns: parseJson<string[]>(row.exclude_patterns_json, []),
+    lastIndexStats: parseJson<IndexBuildStats | null>(row.last_index_stats_json, null),
+    lastError: row.last_error ?? null,
     lastIndexedAt: row.last_indexed_at,
     status: row.status,
     createdAt: row.created_at,
@@ -765,4 +824,15 @@ function mapIndexedFile(row: any): IndexedFileRecord {
     contentHash: row.content_hash ?? undefined,
     errorReason: row.error_reason ?? undefined
   };
+}
+
+function parseJson<T>(value: unknown, fallback: T): T {
+  if (typeof value !== "string" || !value) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
 }

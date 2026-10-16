@@ -11,7 +11,6 @@ import type {
   IndexFileUpdateEvent,
   IndexManifest,
   IndexProgressEvent,
-  IndexedFileRecord,
   ResolvedVisualAsset,
   SearchResult,
   VisualAssetReference,
@@ -22,6 +21,12 @@ import type {
 
 const require = createRequire(import.meta.url);
 const { app } = require("electron") as typeof import("electron");
+
+/** Where a channel's source files live and where its search index is stored. */
+export type IndexTarget = {
+  rootPath: string;
+  indexPath: string;
+};
 
 type PendingRequest = {
   resolve: (value: any) => void;
@@ -42,20 +47,16 @@ export class PythonWorkerBridge extends EventEmitter {
   private activeBuildChannels = new Set<string>();
   private workerCommand: WorkerCommand | null = null;
 
-  async openIndex(rootPath: string): Promise<{ manifest: IndexManifest }> {
-    return this.request("open_index", { rootPath });
+  async getIndexStatus(target: IndexTarget): Promise<{ exists: boolean; manifest?: IndexManifest }> {
+    return this.request("get_index_status", { ...target });
   }
 
-  async getIndexStatus(rootPath: string): Promise<{ exists: boolean; manifest?: IndexManifest }> {
-    return this.request("get_index_status", { rootPath });
+  async buildIndex(channelId: string, target: IndexTarget, options: WorkerBuildOptions): Promise<WorkerBuildResponse> {
+    return this.request("build_index", { channelId, ...target, options });
   }
 
-  async buildIndex(channelId: string, rootPath: string, options: WorkerBuildOptions): Promise<WorkerBuildResponse> {
-    return this.request("build_index", { channelId, rootPath, options });
-  }
-
-  async rebuildIndex(channelId: string, rootPath: string, options: WorkerBuildOptions): Promise<WorkerBuildResponse> {
-    return this.request("rebuild_index", { channelId, rootPath, options });
+  async rebuildIndex(channelId: string, target: IndexTarget, options: WorkerBuildOptions): Promise<WorkerBuildResponse> {
+    return this.request("rebuild_index", { channelId, ...target, options });
   }
 
   async cancelBuild(channelId: string, retainPartial: boolean): Promise<void> {
@@ -66,28 +67,20 @@ export class PythonWorkerBridge extends EventEmitter {
     return this.activeBuildChannels.has(channelId);
   }
 
-  hasAnyActiveBuild() {
-    return this.activeBuildChannels.size > 0;
-  }
-
-  async listFiles(rootPath: string, status: "indexed" | "failed"): Promise<{ files: IndexedFileRecord[] }> {
-    return this.request("list_files", { rootPath, status });
-  }
-
-  async listDocuments(rootPath: string): Promise<{ documents: IndexedDocumentRecord[] }> {
-    return this.request("list_documents", { rootPath });
+  async listDocuments(target: IndexTarget): Promise<{ documents: IndexedDocumentRecord[] }> {
+    return this.request("list_documents", { ...target });
   }
 
   async resolveVisualAssets(
-    rootPath: string,
+    target: IndexTarget,
     assets: VisualAssetReference[],
     maxAssets = 3
   ): Promise<{ assets: ResolvedVisualAsset[] }> {
-    return this.request("resolve_visual_assets", { rootPath, assets, maxAssets });
+    return this.request("resolve_visual_assets", { ...target, assets, maxAssets });
   }
 
-  async search(rootPath: string, query: string, topK: number, options: WorkerBuildOptions): Promise<{ results: SearchResult[] }> {
-    return this.request("search", { rootPath, query, topK, options });
+  async search(target: IndexTarget, query: string, topK: number, options: WorkerBuildOptions): Promise<{ results: SearchResult[] }> {
+    return this.request("search", { ...target, query, topK, options });
   }
 
   private async request<TResponse>(method: string, payload: unknown): Promise<TResponse> {

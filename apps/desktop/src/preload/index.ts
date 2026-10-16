@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  AppSettings,
   CancelIndexInput,
   BootstrapResponse,
   ChannelSnapshot,
@@ -16,6 +17,7 @@ import type {
   ProviderDefaults,
   RefreshProviderModelsResult,
   SendMessageInput,
+  UpdateChannelSettingsInput,
   UpdateChannelSystemPromptInput,
   UpdateThreadTitleInput,
   UpdateChannelModelsInput
@@ -29,6 +31,11 @@ const api = {
   connectProvider: (input: ConnectProviderInput): Promise<ConnectProviderResult> =>
     ipcRenderer.invoke("fschat:connect-provider", input),
   resetAppData: (): Promise<void> => ipcRenderer.invoke("fschat:reset-app-data"),
+  updateAppSettings: (settings: AppSettings): Promise<AppSettings> => ipcRenderer.invoke("fschat:update-app-settings", settings),
+  deleteProviderConnection: (connectionId: string): Promise<void> =>
+    ipcRenderer.invoke("fschat:delete-provider-connection", connectionId),
+  updateChannelSettings: (input: UpdateChannelSettingsInput): Promise<ChannelSnapshot> =>
+    ipcRenderer.invoke("fschat:update-channel-settings", input),
   refreshProviderModels: (connectionId: string): Promise<RefreshProviderModelsResult> =>
     ipcRenderer.invoke("fschat:refresh-provider-models", connectionId),
   saveProviderDefaults: (
@@ -53,6 +60,7 @@ const api = {
   deleteThread: (threadId: string): Promise<ChannelSnapshot> => ipcRenderer.invoke("fschat:delete-thread", threadId),
   openChannelFile: (input: OpenChannelFileInput): Promise<void> => ipcRenderer.invoke("fschat:open-channel-file", input),
   revealChannelFile: (input: OpenChannelFileInput): Promise<void> => ipcRenderer.invoke("fschat:reveal-channel-file", input),
+  openChannelFolder: (channelId: string): Promise<void> => ipcRenderer.invoke("fschat:open-channel-folder", channelId),
   getThreadMessages: (threadId: string) => ipcRenderer.invoke("fschat:get-thread-messages", threadId),
   sendMessage: (input: SendMessageInput) => ipcRenderer.invoke("fschat:send-message", input),
   openExternalUrl: (url: string): Promise<void> => ipcRenderer.invoke("fschat:open-external-url", url),

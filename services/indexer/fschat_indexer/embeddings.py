@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 import json
+import socket
+import time
 from typing import Iterable
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 
-def embed_texts(provider: dict, texts: list[str], timeout_seconds: int | None = 120) -> list[list[float]]:
+DEFAULT_TIMEOUT_SECONDS = 60
+QUERY_TIMEOUT_SECONDS = 30
+MAX_RETRIES = 2
+RETRY_BASE_DELAY_SECONDS = 1.0
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+# Indirection so tests can avoid real sleeps.
+_sleep = time.sleep
+
+
+class EmbeddingError(RuntimeError):
+    """Raised when the embedding provider cannot be reached or rejects the request."""
+
+
+def embed_texts(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
     kind = provider.get("provider")
     if kind == "openai":
         return openai_embeddings(provider, texts, timeout_seconds=timeout_seconds)
@@ -18,11 +36,11 @@ def embed_texts(provider: dict, texts: list[str], timeout_seconds: int | None = 
     raise ValueError(f"Provider '{kind}' is not supported for embeddings.")
 
 
-def embed_query(provider: dict, text: str, timeout_seconds: int | None = 120) -> list[float]:
+def embed_query(provider: dict, text: str, timeout_seconds: float = QUERY_TIMEOUT_SECONDS) -> list[float]:
     return embed_texts(provider, [text], timeout_seconds=timeout_seconds)[0]
 
 
-def openai_embeddings(provider: dict, texts: list[str], timeout_seconds: int | None = 180) -> list[list[float]]:
+def openai_embeddings(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
     url = join_url(provider.get("baseUrl") or "https://api.openai.com", "/v1/embeddings")
     payload = {"model": provider.get("model"), "input": texts}
     headers = {"Authorization": f"Bearer {provider.get('apiKey', '')}", "Content-Type": "application/json"}
@@ -30,7 +48,7 @@ def openai_embeddings(provider: dict, texts: list[str], timeout_seconds: int | N
     return [item["embedding"] for item in data["data"]]
 
 
-def azure_openai_embeddings(provider: dict, texts: list[str], timeout_seconds: int | None = 180) -> list[list[float]]:
+def azure_openai_embeddings(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
     base_url = provider.get("baseUrl")
     deployment = provider.get("deployment") or provider.get("model")
     if not base_url or not deployment:
@@ -42,7 +60,7 @@ def azure_openai_embeddings(provider: dict, texts: list[str], timeout_seconds: i
     return [item["embedding"] for item in data["data"]]
 
 
-def google_embeddings(provider: dict, texts: list[str], timeout_seconds: int | None = 180) -> list[list[float]]:
+def google_embeddings(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
     model = provider.get("model")
     api_key = provider.get("apiKey")
     if not model:
@@ -53,7 +71,7 @@ def google_embeddings(provider: dict, texts: list[str], timeout_seconds: int | N
     return [item["values"] for item in data["embeddings"]]
 
 
-def ollama_embeddings(provider: dict, texts: list[str], timeout_seconds: int | None = 900) -> list[list[float]]:
+def ollama_embeddings(provider: dict, texts: list[str], timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> list[list[float]]:
     model = provider.get("model")
     if not model:
         raise ValueError("Ollama embeddings require a model.")
@@ -72,15 +90,6 @@ def ollama_embeddings(provider: dict, texts: list[str], timeout_seconds: int | N
     raise ValueError("Ollama embedding response did not contain embeddings.")
 
 
-def cosine_similarity(left: list[float], right: list[float]) -> float:
-    numerator = sum(a * b for a, b in zip(left, right))
-    left_norm = sum(a * a for a in left) ** 0.5
-    right_norm = sum(b * b for b in right) ** 0.5
-    if left_norm == 0 or right_norm == 0:
-        return 0.0
-    return numerator / (left_norm * right_norm)
-
-
 def batched(items: Iterable[str], size: int) -> Iterable[list[str]]:
     batch: list[str] = []
     for item in items:
@@ -92,16 +101,78 @@ def batched(items: Iterable[str], size: int) -> Iterable[list[str]]:
         yield batch
 
 
-def post_json(url: str, headers: dict, payload: dict, timeout_seconds: int | None = 120) -> dict:
+def post_json(
+    url: str,
+    headers: dict,
+    payload: dict,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_retries: int = MAX_RETRIES,
+) -> dict:
     data = json.dumps(payload).encode("utf-8")
-    req = urllib_request.Request(url, data=data, headers=headers, method="POST")
-    if timeout_seconds is None:
-        response = urllib_request.urlopen(req)
-    else:
-        response = urllib_request.urlopen(req, timeout=timeout_seconds)
-    with response:
-        body = response.read().decode("utf-8")
-        return json.loads(body)
+    host = describe_endpoint(url)
+    attempt = 0
+    while True:
+        req = urllib_request.Request(url, data=data, headers=headers, method="POST")
+        retry_after: float | None = None
+        try:
+            with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise EmbeddingError(f"Embedding provider at {host} returned invalid JSON.") from exc
+        except urllib_error.HTTPError as exc:
+            detail = read_error_detail(exc)
+            message = f"Embedding request to {host} failed with HTTP {exc.code}{f': {detail}' if detail else ''}."
+            if exc.code not in RETRYABLE_STATUS_CODES or attempt >= max_retries:
+                raise EmbeddingError(message) from None
+            retry_after = parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+        except (urllib_error.URLError, socket.timeout, TimeoutError, ConnectionError) as exc:
+            reason = getattr(exc, "reason", None) or exc
+            if isinstance(reason, (socket.timeout, TimeoutError)):
+                message = f"Embedding request to {host} timed out after {timeout_seconds:g}s."
+            else:
+                message = f"Could not reach embedding provider at {host}: {reason}."
+            if attempt >= max_retries:
+                raise EmbeddingError(message) from None
+        delay = RETRY_BASE_DELAY_SECONDS * (2**attempt)
+        if retry_after is not None:
+            delay = max(delay, min(retry_after, 30.0))
+        _sleep(delay)
+        attempt += 1
+
+
+def describe_endpoint(url: str) -> str:
+    """Scheme + host only, so API keys in query strings never reach error messages."""
+    parsed = urllib_parse.urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "the embedding endpoint"
+
+
+def read_error_detail(exc: urllib_error.HTTPError, limit: int = 300) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    try:
+        parsed = json.loads(body)
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(error, dict) and error.get("message"):
+            body = str(error["message"])
+        elif isinstance(error, str):
+            body = error
+    except Exception:
+        pass
+    body = " ".join(body.split())
+    return body[:limit]
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
 
 
 def join_url(base_url: str, path: str) -> str:

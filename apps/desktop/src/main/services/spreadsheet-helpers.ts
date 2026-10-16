@@ -11,7 +11,22 @@ export function analyzeSpreadsheetQuery(query: string) {
   const wantsList = /\b(list|show all|find all|which rows|which entries)\b/.test(normalized);
   const wantsFilter = /\b(rows where|entries where|matching rows|matching entries|filter|filtered)\b/.test(normalized);
   const exhaustive = wantsCount || wantsList;
-  return { wantsCount, wantsList, wantsFilter, exhaustive };
+  return { wantsCount, wantsList, wantsFilter, exhaustive, plainRowCount: wantsCount && !wantsFilter && isPlainRowCountQuery(normalized) };
+}
+
+/**
+ * True only for unconditioned size questions ("how many rows are in the claims sheet?").
+ * Anything with a condition ("how many rows where status is open") must go to the model,
+ * because sheet row totals cannot answer filtered counts.
+ */
+export function isPlainRowCountQuery(query: string): boolean {
+  const normalized = query.toLowerCase();
+  if (!/(rows?|records?|entries|lines)/.test(normalized)) {
+    return false;
+  }
+  return !/(where|with|whose|that|which|having|has|have|contain|contains|containing|equal|equals|greater|less|more than|fewer|above|below|after|before|between|over|under|exceed|exceeds|is|are not|status|named|called|marked)|[<>=]/.test(
+    normalized.replace(/how many (rows?|records?|entries|lines) (are|is) (there )?(in|on)/, "")
+  );
 }
 
 export function summarizeSpreadsheetSearch(

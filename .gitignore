@@ -16,4 +16,3 @@ coverage/
 Thumbs.db
 apps/desktop/.indexer-build/
 apps/desktop/resources/indexer/
-package-lock.json

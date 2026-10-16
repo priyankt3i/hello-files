@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import mimetypes
@@ -31,10 +32,9 @@ try:
 except ImportError:
     np = None
 
-try:
-    from rapidocr_onnxruntime import RapidOCR
-except ImportError:
-    RapidOCR = None
+# rapidocr/onnxruntime is imported on first OCR use (see get_ocr_engine): it is the slowest
+# import here and most extraction worker processes never need it.
+_OCR_UNAVAILABLE = False
 
 try:
     import xlrd  # type: ignore
@@ -90,13 +90,13 @@ TEXT_EXTENSIONS = {
     ".rb",
     ".php",
     ".swl",
+    ".svg",
 }
 
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xlsm"}
 LEGACY_SPREADSHEET_EXTENSIONS = {".xls"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
 MIN_TEXT_CHARS_FOR_VISUAL_OCR = 160
-MIN_TEXT_CHARS_FOR_DOC_IMAGE_OCR = 320
 MAX_EMBEDDED_IMAGES_PER_PDF_PAGE = 3
 MAX_EMBEDDED_IMAGES_PER_DOCX = 12
 OCR_MAX_IMAGE_EDGE = 1800
@@ -105,11 +105,6 @@ HEADER_SCAN_LIMIT = 12
 MAX_PROFILE_HEADERS = 12
 
 _OCR_ENGINE = None
-
-
-def extract_text(path: Path) -> Tuple[str, str]:
-    payload = extract_document(path)
-    return payload["text"], payload["parser"]
 
 
 def extract_document(path: Path) -> dict[str, Any]:
@@ -134,17 +129,14 @@ def extract_document(path: Path) -> dict[str, Any]:
     return {"text": text, "parser": parser}
 
 
-def extract_pdf(path: Path) -> str:
-    return extract_pdf_document(path)["text"]
-
-
 def extract_pdf_document(path: Path) -> dict[str, Any]:
     if fitz is None:
         raise ValueError("PDF support requires PyMuPDF.")
 
     parts: list[str] = []
     visual_assets: list[dict[str, Any]] = []
-    seen_image_digests: set[int] = set()
+    seen_image_xrefs: set[int] = set()
+    seen_image_digests: set[str] = set()
     with fitz.open(path) as document:
         for page_index, page in enumerate(document, start=1):
             page_text = page.get_text("text").strip()
@@ -169,10 +161,14 @@ def extract_pdf_document(path: Path) -> dict[str, Any]:
             for image_index, image_info in enumerate(page.get_images(full=True), start=1):
                 if image_index > MAX_EMBEDDED_IMAGES_PER_PDF_PAGE:
                     break
-                image_bytes = document.extract_image(image_info[0]).get("image")
+                xref = int(image_info[0])
+                if xref in seen_image_xrefs:
+                    continue
+                seen_image_xrefs.add(xref)
+                image_bytes = document.extract_image(xref).get("image")
                 if not image_bytes:
                     continue
-                digest = hash(image_bytes[:2048])
+                digest = hashlib.sha1(image_bytes).hexdigest()
                 if digest in seen_image_digests:
                     continue
                 seen_image_digests.add(digest)
@@ -336,41 +332,6 @@ def extract_doc_ole_text(path: Path) -> str:
     return "\n\n".join(parts)
 
 
-def extract_legacy_workbook(path: Path) -> str:
-    if xlrd is None:
-        raise ValueError("Legacy .xls support requires xlrd.")
-
-    workbook = xlrd.open_workbook(path)
-    parts: list[str] = []
-    for sheet in workbook.sheets():
-        parts.append(f"# Sheet: {sheet.name}")
-        for row_index in range(sheet.nrows):
-            values = [str(sheet.cell_value(row_index, column_index)).strip() for column_index in range(sheet.ncols)]
-            values = [value for value in values if value]
-            if values:
-                parts.append(" | ".join(values))
-    return "\n".join(parts)
-
-
-def extract_workbook(path: Path) -> str:
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Conditional Formatting extension is not supported and will be removed",
-            category=UserWarning,
-            module=r"openpyxl\.worksheet\._reader",
-        )
-        workbook = load_workbook(path, read_only=True, data_only=True)
-    parts: list[str] = []
-    for sheet in workbook.worksheets:
-        parts.append(f"# Sheet: {sheet.title}")
-        for row in sheet.iter_rows(values_only=True):
-            values = [str(value).strip() for value in row if value is not None and str(value).strip()]
-            if values:
-                parts.append(" | ".join(values))
-    return "\n".join(parts)
-
-
 def extract_legacy_workbook_document(path: Path) -> dict[str, Any]:
     if xlrd is None:
         raise ValueError("Legacy .xls support requires xlrd.")
@@ -438,15 +399,13 @@ def build_spreadsheet_document(sheets: list[dict[str, Any]], parser_name: str) -
 
             if header_values:
                 row_text = build_labeled_row_text(title, row_number, header_values, values)
-                chunk_type = "spreadsheet-row"
             else:
                 row_text = build_generic_row_text(title, row_number, values)
-                chunk_type = "spreadsheet-row"
 
             row_chunks.append(
                 {
                     "text": row_text,
-                    "chunkType": chunk_type,
+                    "chunkType": "spreadsheet-row",
                     "sheetName": title,
                     "rowNumber": row_number,
                 }
@@ -717,10 +676,13 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
 
 
 def get_ocr_engine():
-    global _OCR_ENGINE
-    if RapidOCR is None:
-        return None
-    if _OCR_ENGINE is None:
+    global _OCR_ENGINE, _OCR_UNAVAILABLE
+    if _OCR_ENGINE is None and not _OCR_UNAVAILABLE:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            _OCR_UNAVAILABLE = True
+            return None
         _OCR_ENGINE = RapidOCR()
     return _OCR_ENGINE
 

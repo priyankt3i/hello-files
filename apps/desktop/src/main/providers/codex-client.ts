@@ -285,7 +285,8 @@ class CodexOAuthClient {
 
   saveCredentials(credentials: CodexCredentials) {
     ensureParentDir(this.config.credentialsFile);
-    fs.writeFileSync(this.config.credentialsFile, `${JSON.stringify(credentials, null, 2)}\n`, "utf8");
+    // Owner-only permissions; Windows ignores the mode, so the file inherits the user profile ACL.
+    fs.writeFileSync(this.config.credentialsFile, `${JSON.stringify(credentials, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   }
 
   clearCredentials() {

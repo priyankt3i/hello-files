@@ -2,153 +2,139 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Semantic colour tokens (RGB triplets so Tailwind can apply alpha).
+ * Contrast targets: text and text-muted >= 4.5:1 on bg/surface; accent >= 4.5:1 against accent-fg.
+ */
 :root {
   color-scheme: light;
-  --color-background: 247 247 245;
-  --color-surface: 255 255 255;
-  --color-surface-muted: 242 241 238;
-  --color-border: 223 220 215;
-  --color-layer-light: 43 43 40;
-  --color-layer-dark: 43 43 40;
-  --color-paper: 43 43 40;
-  --color-mist: 105 101 94;
-  --color-ink: 255 255 255;
-  --color-ember: 35 131 226;
-  --color-pine: 226 238 255;
-  --color-coral: 217 76 54;
-  --color-moss: 68 131 97;
-  --background-shell: linear-gradient(180deg, rgb(250 250 249) 0%, rgb(241 241 239) 100%);
-  --shadow-panel: 0 12px 36px rgba(15, 23, 42, 0.08);
-  font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-  background: rgb(var(--color-background));
+  --bg: 245 246 248;
+  --surface: 255 255 255;
+  --surface-2: 240 242 245;
+  --border: 222 225 230;
+  --text: 24 27 32;
+  --text-muted: 88 95 107;
+  --accent: 15 108 189;
+  --accent-fg: 255 255 255;
+  --success: 16 124 65;
+  --warning: 150 89 0;
+  --danger: 192 40 28;
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-popover: 0 4px 16px rgba(16, 24, 40, 0.1), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --shadow-dialog: 0 16px 48px rgba(16, 24, 40, 0.18), 0 2px 6px rgba(16, 24, 40, 0.08);
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --color-background: 25 25 24;
-  --color-surface: 32 32 31;
-  --color-surface-muted: 42 42 40;
-  --color-border: 63 63 60;
-  --color-layer-light: 248 250 252;
-  --color-layer-dark: 9 9 11;
-  --color-paper: 245 245 244;
-  --color-mist: 168 162 158;
-  --color-ink: 255 255 255;
-  --color-ember: 82 156 255;
-  --color-pine: 45 61 82;
-  --color-coral: 255 113 91;
-  --color-moss: 115 173 130;
-  --background-shell: linear-gradient(180deg, rgb(25 25 24) 0%, rgb(18 18 17) 100%);
-  --shadow-panel: 0 18px 48px rgba(0, 0, 0, 0.28);
+  --bg: 23 24 27;
+  --surface: 31 32 36;
+  --surface-2: 40 42 47;
+  --border: 55 58 65;
+  --text: 235 237 240;
+  --text-muted: 162 168 178;
+  --accent: 98 168 245;
+  --accent-fg: 12 20 33;
+  --success: 92 184 128;
+  --warning: 232 172 72;
+  --danger: 244 120 108;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-popover: 0 6px 20px rgba(0, 0, 0, 0.45);
+  --shadow-dialog: 0 20px 56px rgba(0, 0, 0, 0.55);
 }
 
-html,
-body,
-#root {
-  height: 100vh;
-  overflow: hidden;
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--text));
+    font-family: theme("fontFamily.sans");
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--accent));
+    outline-offset: 2px;
+  }
+
+  select option,
+  select optgroup {
+    background: rgb(var(--surface));
+    color: rgb(var(--text));
+  }
+
+  ::selection {
+    background: rgb(var(--accent) / 0.25);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--text-muted) / 0.3);
+    border: 2px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--text-muted) / 0.5);
+    background-clip: content-box;
+  }
 }
 
-body {
-  margin: 0;
-  background: rgb(var(--color-background));
-  color: rgb(var(--color-paper));
-  font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+@layer components {
+  /* Shared form control look. */
+  .control {
+    @apply w-full rounded border border-border bg-surface px-3 py-1.5 text-sm text-text placeholder:text-text-muted/80 transition-colors;
+  }
+  .control:hover:not(:disabled) {
+    @apply border-text-muted/50;
+  }
+  .control:focus-visible {
+    outline-offset: 0;
+    @apply border-accent;
+  }
+  .control:disabled {
+    @apply cursor-not-allowed opacity-60;
+  }
 }
 
-* {
-  box-sizing: border-box;
+@layer utilities {
+  .break-anywhere {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
 }
 
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+/* Assistant answer rendering (HTML is produced by lib/markdown.ts after escaping). */
+.markdown-body {
+  line-height: 1.6;
 }
-
-::-webkit-scrollbar-thumb {
-  background: rgb(var(--color-mist) / 0.25);
-  border-radius: 999px;
-}
-
-.glass-panel {
-  background: rgb(var(--color-surface));
-  border: 1px solid rgb(var(--color-border));
-}
-
-.shell-border {
-  border: 1px solid rgb(var(--color-border));
-}
-
-button,
-input,
-select,
-textarea {
-  font: inherit;
-}
-
-button,
-input,
-select,
-textarea,
-.glass-panel {
-  transition:
-    background-color 140ms ease,
-    border-color 140ms ease,
-    color 140ms ease,
-    box-shadow 140ms ease;
-}
-
-button:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible {
-  outline: 2px solid rgb(var(--color-ember) / 0.55);
-  outline-offset: 2px;
-}
-
-select option {
-  background: rgb(var(--color-surface));
-  color: rgb(var(--color-paper));
-}
-
-.rounded-2xl,
-.rounded-3xl,
-.rounded-\[18px\],
-.rounded-\[22px\],
-.rounded-\[24px\],
-.rounded-\[26px\],
-.rounded-\[28px\],
-.rounded-\[30px\] {
-  border-radius: 0.5rem;
-}
-
-button.rounded-full,
-input.rounded-full,
-textarea.rounded-\[24px\] {
-  border-radius: 0.5rem;
-}
-
-.tracking-tight,
-.tracking-\[0\.16em\],
-.tracking-\[0\.18em\],
-.tracking-\[0\.2em\],
-.tracking-\[0\.3em\] {
-  letter-spacing: 0;
-}
-
-.break-anywhere {
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
 .markdown-body > :first-child {
   margin-top: 0;
 }
-
 .markdown-body > :last-child {
   margin-bottom: 0;
 }
-
 .markdown-body p,
 .markdown-body ul,
 .markdown-body ol,
@@ -160,86 +146,289 @@ textarea.rounded-\[24px\] {
 .markdown-body h4,
 .markdown-body h5,
 .markdown-body h6 {
-  margin: 0 0 1rem;
+  margin: 0 0 0.75rem;
 }
-
-.markdown-body ul,
+.markdown-body ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+}
 .markdown-body ol {
-  padding-left: 1.4rem;
+  list-style: decimal;
+  padding-left: 1.25rem;
 }
-
 .markdown-body li + li {
-  margin-top: 0.35rem;
+  margin-top: 0.25rem;
 }
-
 .markdown-body strong {
-  color: rgb(var(--color-paper));
-  font-weight: 700;
+  font-weight: 600;
 }
-
 .markdown-body em {
   font-style: italic;
 }
-
 .markdown-body code {
-  border: 1px solid rgb(var(--color-border));
-  background: rgb(var(--color-surface-muted));
-  border-radius: 0.5rem;
-  padding: 0.1rem 0.35rem;
-  font-family: "Cascadia Code", "Consolas", monospace;
-  font-size: 0.92em;
+  border: 1px solid rgb(var(--border));
+  background: rgb(var(--surface-2));
+  border-radius: 4px;
+  padding: 0.05rem 0.3rem;
+  font-family: theme("fontFamily.mono");
+  font-size: 0.9em;
 }
-
 .markdown-body pre {
   overflow-x: auto;
-  border: 1px solid rgb(var(--color-border));
-  background: rgb(var(--color-surface-muted));
-  border-radius: 1rem;
-  padding: 1rem;
+  border: 1px solid rgb(var(--border));
+  background: rgb(var(--surface-2));
+  border-radius: 8px;
+  padding: 0.75rem;
 }
-
 .markdown-body pre code {
   border: 0;
   background: transparent;
   padding: 0;
 }
-
 .markdown-body blockquote {
-  border-left: 3px solid rgb(var(--color-ember) / 0.65);
-  padding-left: 1rem;
-  color: rgb(var(--color-mist));
+  border-left: 3px solid rgb(var(--border));
+  padding-left: 0.75rem;
+  color: rgb(var(--text-muted));
 }
-
 .markdown-body a {
-  color: rgb(var(--color-ember));
+  color: rgb(var(--accent));
   text-decoration: underline;
+  text-underline-offset: 2px;
 }
-
 .markdown-body h1,
 .markdown-body h2,
 .markdown-body h3,
 .markdown-body h4,
 .markdown-body h5,
 .markdown-body h6 {
-  color: rgb(var(--color-paper));
-  font-weight: 700;
-  line-height: 1.25;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.markdown-body h1 {
+  font-size: 1.25rem;
+}
+.markdown-body h2 {
+  font-size: 1.125rem;
+}
+.markdown-body h3 {
+  font-size: 1rem;
 }
 
-.splash-progress-fill {
-  animation: splash-progress 1.8s ease-in-out infinite;
+/* Indeterminate progress (splash + unknown totals). */
+.progress-indeterminate {
+  animation: progress-indeterminate 1.6s ease-in-out infinite;
 }
-
-@keyframes splash-progress {
+@keyframes progress-indeterminate {
   0% {
-    transform: translateX(-70%);
+    transform: translateX(-100%);
   }
-
-  55% {
-    transform: translateX(38%);
-  }
-
   100% {
-    transform: translateX(112%);
+    transform: translateX(250%);
   }
+}
+
+.thinking-dot {
+  animation: thinking 1.2s ease-in-out infinite;
+}
+.thinking-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.thinking-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes thinking {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/*
+ * Rich answers (components/rich/): tables, code blocks, Mermaid diagrams and charts.
+ * Chart palette: 8 fixed-order categorical slots, CVD-validated, with separate steps for dark mode.
+ */
+:root {
+  --chart-1: 42 120 214;
+  --chart-2: 235 104 52;
+  --chart-3: 27 175 122;
+  --chart-4: 237 161 0;
+  --chart-5: 232 123 164;
+  --chart-6: 0 131 0;
+  --chart-7: 98 80 214;
+  --chart-8: 227 73 72;
+}
+:root[data-theme="dark"] {
+  --chart-1: 57 135 229;
+  --chart-2: 217 89 38;
+  --chart-3: 25 158 112;
+  --chart-4: 201 133 0;
+  --chart-5: 213 81 129;
+  --chart-6: 0 131 0;
+  --chart-7: 144 133 233;
+  --chart-8: 230 103 103;
+}
+
+.markdown-body .rich-block {
+  margin: 0 0 0.75rem;
+  border: 1px solid rgb(var(--border));
+  border-radius: 8px;
+  background: rgb(var(--surface));
+  overflow: hidden;
+}
+.markdown-body .rich-block pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+.rich-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 2rem;
+  padding: 0.125rem 0.375rem 0.125rem 0.75rem;
+  border-bottom: 1px solid rgb(var(--border));
+  background: rgb(var(--surface-2));
+  font-size: 0.75rem;
+  color: rgb(var(--text-muted));
+}
+.rich-toolbar-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.rich-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  height: 1.5rem;
+  padding: 0 0.375rem;
+  border-radius: 4px;
+  color: rgb(var(--text-muted));
+  white-space: nowrap;
+}
+.rich-toolbar button:hover:not(:disabled) {
+  background: rgb(var(--border) / 0.6);
+  color: rgb(var(--text));
+}
+.rich-toolbar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.rich-note {
+  padding: 0.375rem 0.75rem;
+  font-size: 0.75rem;
+  color: rgb(var(--text-muted));
+}
+.rich-note-warning {
+  color: rgb(var(--warning));
+  border-bottom: 1px solid rgb(var(--border));
+}
+
+/* Tables: horizontal + vertical scroll inside the block, sticky header, zebra rows. */
+.rich-table-scroll {
+  max-height: 32rem;
+  overflow: auto;
+}
+.markdown-body .rich-table-scroll table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+.markdown-body .rich-table-scroll th,
+.markdown-body .rich-table-scroll td {
+  padding: 0.375rem 0.75rem;
+  border-bottom: 1px solid rgb(var(--border));
+  text-align: left;
+  vertical-align: top;
+  max-width: 28rem;
+  overflow-wrap: anywhere;
+}
+.markdown-body .rich-table-scroll th + th,
+.markdown-body .rich-table-scroll td + td {
+  border-left: 1px solid rgb(var(--border));
+}
+.markdown-body .rich-table-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgb(var(--surface-2));
+  font-weight: 600;
+  color: rgb(var(--text));
+}
+.markdown-body .rich-table-scroll tbody tr:nth-child(even) td {
+  background: rgb(var(--surface-2) / 0.5);
+}
+.markdown-body .rich-table-scroll tbody tr:last-child td {
+  border-bottom: 0;
+}
+.markdown-body .rich-table-scroll td[align="right"],
+.markdown-body .rich-table-scroll th[align="right"] {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.markdown-body .rich-table-scroll td[align="center"],
+.markdown-body .rich-table-scroll th[align="center"] {
+  text-align: center;
+}
+
+/* Diagrams and charts. */
+.rich-figure {
+  display: flex;
+  justify-content: center;
+  padding: 0.75rem;
+  overflow-x: auto;
+  color: rgb(var(--text));
+}
+.rich-figure svg {
+  max-width: 100%;
+  height: auto;
+}
+.rich-chart {
+  width: 100%;
+  height: 320px;
+}
+.rich-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 6rem;
+  font-size: 0.75rem;
+  color: rgb(var(--text-muted));
+}
+.markdown-body .rich-block .rich-source {
+  padding: 0.375rem 0.75rem;
+  border-top: 1px solid rgb(var(--border));
+  font-size: 0.75rem;
+  color: rgb(var(--text-muted));
+}
+.markdown-body input[type="checkbox"] {
+  margin-right: 0.375rem;
+  vertical-align: middle;
+}
+.markdown-body ul.contains-task-list {
+  list-style: none;
+  padding-left: 0.25rem;
+}
+.markdown-body del {
+  text-decoration: line-through;
 }

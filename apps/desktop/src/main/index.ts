@@ -88,6 +88,11 @@ function registerIpc() {
   ipcMain.handle("fschat:inspect-root-folder", (_event, rootPath: string) => getService().inspectRootFolder(rootPath));
   ipcMain.handle("fschat:connect-provider", (_event, input) => getService().connectProvider(input));
   ipcMain.handle("fschat:reset-app-data", () => getService().resetAppData());
+  ipcMain.handle("fschat:update-app-settings", (_event, settings) => getService().updateAppSettings(settings));
+  ipcMain.handle("fschat:delete-provider-connection", (_event, connectionId: string) =>
+    getService().deleteProviderConnection(connectionId)
+  );
+  ipcMain.handle("fschat:update-channel-settings", (_event, input) => getService().updateChannelSettings(input));
   ipcMain.handle("fschat:refresh-provider-models", (_event, connectionId: string) =>
     getService().refreshProviderModels(connectionId)
   );
@@ -108,6 +113,7 @@ function registerIpc() {
   ipcMain.handle("fschat:delete-thread", (_event, threadId: string) => getService().deleteThread(threadId));
   ipcMain.handle("fschat:open-channel-file", (_event, input) => getService().openChannelFile(input));
   ipcMain.handle("fschat:reveal-channel-file", (_event, input) => getService().revealChannelFile(input));
+  ipcMain.handle("fschat:open-channel-folder", (_event, channelId: string) => getService().openChannelFolder(channelId));
   ipcMain.handle("fschat:get-thread-messages", (_event, threadId: string) => getService().getThreadMessages(threadId));
   ipcMain.handle("fschat:send-message", (_event, input) => getService().sendMessage(input));
   ipcMain.handle("fschat:open-external-url", (_event, url: string) => openExternalUrl(url));

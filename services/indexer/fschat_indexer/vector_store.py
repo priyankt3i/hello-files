@@ -1,127 +1,113 @@
+"""Quantized vector storage helpers and the in-memory search cache.
+
+Vectors are L2-normalized, then stored in SQLite as int8 with a per-vector scale
+(`value ~= int8 * scale`). Cosine similarity only needs the direction, so search
+scores are `(q_int8 . query) / ||q_int8||`; the scale is kept so vectors can be
+dequantized exactly when needed.
+"""
+
 from __future__ import annotations
 
-from pathlib import Path
+import sqlite3
+import threading
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
-from index_store import (
-    chunk_metadata_path,
-    read_chunk_metadata,
-    root_index_path,
-    vector_index_path,
-    write_chunk_metadata,
-)
+
+SCORE_BLOCK_ROWS = 8192
+
+# Keyed by index key. Guarded by _CACHE_LOCK because searches run on the stdin
+# thread while builds run on the executor thread.
+_VECTOR_CACHE: dict[str, "VectorMatrix"] = {}
+_VECTOR_CACHE_LIMIT = 4
+_CACHE_LOCK = threading.RLock()
 
 
-_INDEX_CACHE: dict[str, dict[str, Any]] = {}
+@dataclass
+class VectorMatrix:
+    data_version: str
+    chunk_ids: np.ndarray  # int64, row -> chunks.id
+    quantized: np.ndarray  # int8, (n, dim)
+    inverse_norms: np.ndarray  # float32, 1 / ||quantized row||
 
-
-def clear_index_cache(root_path: Path | None = None) -> None:
-    if root_path is None:
-        for bundle in list(_INDEX_CACHE.values()):
-            release_index_bundle(bundle)
-        _INDEX_CACHE.clear()
-        return
-    cache_key = str(root_index_path(root_path))
-    bundle = _INDEX_CACHE.pop(cache_key, None)
-    if bundle is not None:
-        release_index_bundle(bundle)
-
-
-def write_vector_store(index_path: Path, chunks: list[dict], embedding_dimension: int) -> None:
-    metadata_rows = []
-    vectors = []
-    for label, chunk in enumerate(chunks):
-        row = {
-            "label": label,
-            "chunkId": chunk["chunkId"],
-            "relativePath": chunk["relativePath"],
-            "snippet": chunk["snippet"],
-            "text": chunk["text"],
-            "chunkHash": chunk["chunkHash"],
-            "fileHash": chunk["fileHash"],
-        }
-        if chunk.get("chunkType"):
-            row["chunkType"] = chunk["chunkType"]
-        if chunk.get("sheetName"):
-            row["sheetName"] = chunk["sheetName"]
-        if chunk.get("rowNumber") is not None:
-            row["rowNumber"] = chunk["rowNumber"]
-        if chunk.get("visualAssets"):
-            row["visualAssets"] = chunk["visualAssets"]
-        metadata_rows.append(row)
-        if "embedding" in chunk:
-            vectors.append(chunk["embedding"])
-
-    write_chunk_metadata(index_path, metadata_rows)
-
-    vector_file = vector_index_path(index_path)
-    if not vectors:
-        if vector_file.exists():
-            vector_file.unlink()
-        return
-
-    matrix = np.asarray(vectors, dtype=np.float32)
-    normalized = normalize_rows(matrix)
-    if embedding_dimension and normalized.shape[1] != embedding_dimension:
-        raise ValueError("Embedding dimension mismatch while writing vector store.")
-    np.save(vector_file, normalized)
-
-
-def load_index_bundle(root_path: Path, manifest: dict) -> dict[str, Any]:
-    cache_key = str(root_index_path(root_path))
-    vector_file = vector_index_path(root_index_path(root_path))
-    metadata_file = chunk_metadata_path(root_index_path(root_path))
-    fingerprint = (
-        manifest.get("updatedAt"),
-        vector_file.stat().st_mtime if vector_file.exists() else 0,
-        metadata_file.stat().st_mtime if metadata_file.exists() else 0,
-    )
-
-    cached = _INDEX_CACHE.get(cache_key)
-    if cached and cached.get("fingerprint") == fingerprint:
-        return cached
-
-    chunks = read_chunk_metadata(root_path)
-    vectors = None
-    if manifest.get("chunkCount", 0) > 0 and manifest.get("embeddingDimension", 0) > 0 and vector_file.exists():
-        vectors = np.load(vector_file, mmap_mode="r")
-
-    bundle: dict[str, Any] = {
-        "fingerprint": fingerprint,
-        "chunks": chunks,
-        "chunkByLabel": {chunk["label"]: chunk for chunk in chunks},
-        "vectors": vectors,
-    }
-
-    _INDEX_CACHE[cache_key] = bundle
-    return bundle
-
-
-def get_vectors_for_labels(index_bundle: dict[str, Any], labels: list[int]) -> list[list[float]]:
-    if not labels:
-        return []
-    vectors = index_bundle.get("vectors")
-    if vectors is None:
-        return []
-    return np.asarray(vectors[labels], dtype=np.float32).tolist()
-
-
-def release_index_bundle(index_bundle: dict[str, Any] | None) -> None:
-    if not index_bundle:
-        return
-    vectors = index_bundle.get("vectors")
-    if vectors is None:
-        return
-
-    mmap_handle = getattr(vectors, "_mmap", None)
-    if mmap_handle is not None:
-        mmap_handle.close()
-    index_bundle["vectors"] = None
+    @property
+    def dimension(self) -> int:
+        return int(self.quantized.shape[1]) if self.quantized.ndim == 2 else 0
 
 
 def normalize_rows(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return matrix / norms
+
+
+def quantize_vector(vector: Any) -> tuple[int, float, bytes]:
+    """Normalize and quantize one vector. Returns (dimension, scale, int8 bytes)."""
+    values = np.asarray(vector, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(values))
+    if norm > 0:
+        values = values / norm
+    peak = float(np.max(np.abs(values))) if values.size else 0.0
+    scale = peak / 127.0 if peak > 0 else 1.0
+    quantized = np.clip(np.rint(values / scale), -127, 127).astype(np.int8)
+    return int(values.shape[0]), scale, quantized.tobytes()
+
+
+def dequantize_vector(scale: float, data: bytes) -> np.ndarray:
+    return np.frombuffer(data, dtype=np.int8).astype(np.float32) * np.float32(scale)
+
+
+def clear_index_cache(index_key: str | None = None) -> None:
+    with _CACHE_LOCK:
+        if index_key is None:
+            _VECTOR_CACHE.clear()
+        else:
+            _VECTOR_CACHE.pop(index_key, None)
+
+
+def load_vector_matrix(conn: sqlite3.Connection, index_key: str, data_version: str) -> VectorMatrix | None:
+    with _CACHE_LOCK:
+        cached = _VECTOR_CACHE.get(index_key)
+        if cached is not None and cached.data_version == data_version:
+            return cached
+
+    rows = conn.execute("SELECT chunk_id, dim, data FROM vectors ORDER BY chunk_id").fetchall()
+    if not rows:
+        matrix = None
+    else:
+        dimension = int(rows[0][1])
+        if any(int(row[1]) != dimension for row in rows):
+            raise ValueError("Index vectors have inconsistent dimensions; rebuild required.")
+        chunk_ids = np.fromiter((row[0] for row in rows), dtype=np.int64, count=len(rows))
+        quantized = np.frombuffer(b"".join(row[2] for row in rows), dtype=np.int8).reshape(len(rows), dimension)
+        norms = np.sqrt(np.einsum("ij,ij->i", quantized, quantized, dtype=np.float32))
+        norms[norms == 0] = 1.0
+        matrix = VectorMatrix(data_version, chunk_ids, quantized, (1.0 / norms).astype(np.float32))
+    del rows
+
+    if matrix is not None:
+        with _CACHE_LOCK:
+            _VECTOR_CACHE[index_key] = matrix
+            while len(_VECTOR_CACHE) > _VECTOR_CACHE_LIMIT:
+                _VECTOR_CACHE.pop(next(iter(_VECTOR_CACHE)))
+    return matrix
+
+
+def cosine_scores(matrix: VectorMatrix, query_vector: np.ndarray) -> np.ndarray:
+    """Cosine of a normalized float32 query against every stored vector, computed in
+    fixed-size blocks so the dequantized working set stays small."""
+    if matrix.dimension != query_vector.shape[0]:
+        raise ValueError(
+            f"Query embedding has {query_vector.shape[0]} dimensions but the index has "
+            f"{matrix.dimension}; rebuild required."
+        )
+    query = np.asarray(query_vector, dtype=np.float32)
+    total = matrix.quantized.shape[0]
+    scores = np.empty(total, dtype=np.float32)
+    for start in range(0, total, SCORE_BLOCK_ROWS):
+        block = matrix.quantized[start : start + SCORE_BLOCK_ROWS].astype(np.float32)
+        scores[start : start + block.shape[0]] = block @ query
+    scores *= matrix.inverse_norms
+    return scores

@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, join, resolve } from "node:path";
 import type { WebContents } from "electron";
-import { INDEX_DIR_NAME } from "@fschat/shared";
+import { DEFAULT_MAX_FILE_SIZE_MB, INDEX_DIR_NAME } from "@fschat/shared";
 import type {
+  AppSettings,
   BootstrapResponse,
   CancelIndexInput,
   Channel,
@@ -31,6 +32,7 @@ import type {
   SendMessageInput,
   SendMessageResult,
   Thread,
+  UpdateChannelSettingsInput,
   UpdateChannelSystemPromptInput,
   UpdateThreadTitleInput,
   UpdateChannelModelsInput,
@@ -48,7 +50,8 @@ import {
   selectRelevantDocuments
 } from "../providers/client";
 import { clearCodexCredentials, ensureCodexAuthorized } from "../providers/codex-client";
-import { PythonWorkerBridge } from "./python-worker";
+import { FolderWatcher } from "./folder-watcher";
+import { PythonWorkerBridge, type IndexTarget } from "./python-worker";
 import {
   DEFAULT_CHANNEL_SYSTEM_PROMPT,
   buildEmbeddingModelKey,
@@ -81,6 +84,9 @@ const SECRET_SERVICES = [SECRET_SERVICE, ...LEGACY_SECRET_SERVICES];
 const DB_FILE_NAME = "fschat.sqlite";
 const LEGACY_USER_DATA_DIRS = ["Filesystem RAG Chat", "filesystem-rag-chat"];
 const INDEX_TEMP_DIR_NAME = ".fschat-index.tmp";
+const INDEX_STORAGE_DIR_NAME = "indexes";
+const CODEX_ENABLED = process.env.HELLO_FILES_ENABLE_CODEX === "1";
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const require = createRequire(import.meta.url);
 const { app, dialog, shell } = require("electron") as typeof import("electron");
 const keytar = require("keytar") as typeof import("keytar");
@@ -93,11 +99,20 @@ export class DesktopAppService {
   private db: AppDatabase;
   private worker: PythonWorkerBridge;
   private webContents: WebContents | null = null;
+  private watcher: FolderWatcher;
+  private pendingResync = new Set<string>();
+  private startupSyncDone = false;
 
   constructor() {
     const dbPath = resolveDatabasePath();
     this.db = new AppDatabase(dbPath);
     this.worker = new PythonWorkerBridge();
+    this.watcher = new FolderWatcher(
+      (channelId) => void this.syncChannel(channelId),
+      (channelId, error) => {
+        console.warn(`[hello-files] Stopped watching channel ${channelId}: ${error.message}`);
+      }
+    );
     this.worker.on("progress", (event: IndexProgressEvent) => {
       this.webContents?.send("fschat:index-progress", event);
     });
@@ -116,19 +131,13 @@ export class DesktopAppService {
         message
       } as IndexProgressEvent);
     });
+    // Worker stderr carries library warnings and tracebacks for diagnostics. Request failures
+    // already reach the UI through rejected requests, so stderr is logged rather than shown.
     this.worker.on("stderr", (line: string) => {
       if (IGNORED_STDERR_PATTERNS.some((pattern) => line.includes(pattern))) {
         return;
       }
-      this.webContents?.send("fschat:index-progress", {
-        channelId: "global",
-        phase: "error",
-        totalFiles: 0,
-        processedFiles: 0,
-        successCount: 0,
-        failureCount: 0,
-        message: line
-      } as IndexProgressEvent);
+      console.warn(`[python-worker] ${line.trimEnd()}`);
     });
   }
 
@@ -137,6 +146,7 @@ export class DesktopAppService {
   }
 
   async bootstrap(): Promise<BootstrapResponse> {
+    this.migrateLegacyIndexLocations();
     for (const channel of this.db.listChannels()) {
       await this.ensureChannelSystemPrompt(channel);
       if (channel.status === "indexing" && !this.worker.hasActiveBuild(channel.id)) {
@@ -156,12 +166,74 @@ export class DesktopAppService {
       }
     }
 
+    this.refreshWatchers();
+    if (!this.startupSyncDone) {
+      this.startupSyncDone = true;
+      // Pick up changes made while the app was closed.
+      for (const channel of this.db.listChannels()) {
+        if (this.canAutoSync(channel)) {
+          void this.syncChannel(channel.id);
+        }
+      }
+    }
+
     return {
       channels: this.db.listChannels(),
       providerConnections: this.db.listProviderConnections(),
       providerDefaults: this.db.listProviderDefaults(),
       providerModels: this.db.listProviderModels(),
+      threads: this.db.listAllThreads(),
+      settings: this.db.getAppSettings(),
+      features: { codexEnabled: CODEX_ENABLED },
+      defaults: { systemPrompt: DEFAULT_CHANNEL_SYSTEM_PROMPT },
+      indexStorageDir: indexStorageDir()
     };
+  }
+
+  async updateAppSettings(settings: AppSettings): Promise<AppSettings> {
+    const next: AppSettings = { dataPolicy: settings.dataPolicy === "local-only" ? "local-only" : "any" };
+    this.db.saveAppSettings(next);
+    this.refreshWatchers();
+    return next;
+  }
+
+  async deleteProviderConnection(connectionId: string) {
+    const connection = this.db.getProviderConnection(connectionId);
+    if (!connection) {
+      return;
+    }
+    const affected = this.db.listChannels().filter((channel) => this.channelUsesConnection(channel, connectionId));
+    if (affected.some((channel) => this.worker.hasActiveBuild(channel.id))) {
+      throw new Error("Cancel indexing on channels that use this connection before removing it.");
+    }
+    if (connection.provider === "openai-codex") {
+      clearCodexCredentials();
+    } else if (connection.provider !== "ollama") {
+      await Promise.all(SECRET_SERVICES.map((service) => keytar.deletePassword(service, connection.secretRef)));
+    }
+    this.db.deleteProviderConnection(connectionId);
+    this.refreshWatchers();
+  }
+
+  async updateChannelSettings(input: UpdateChannelSettingsInput): Promise<ChannelSnapshot> {
+    const channel = this.db.getChannel(input.channelId);
+    if (!channel) {
+      throw new Error("Channel not found.");
+    }
+    const displayName = input.displayName?.trim();
+    const excludePatterns = input.excludePatterns ? normalizeExcludePatterns(input.excludePatterns) : channel.excludePatterns;
+    this.db.updateChannel(channel.id, {
+      displayName: displayName && displayName !== channel.displayName ? this.db.getUniqueChannelName(displayName) : channel.displayName,
+      autoSync: input.autoSync ?? channel.autoSync,
+      excludePatterns,
+      updatedAt: new Date().toISOString()
+    });
+    this.refreshWatchers();
+    const excludesChanged = JSON.stringify(excludePatterns) !== JSON.stringify(channel.excludePatterns);
+    if (excludesChanged && channel.lastIndexedAt && !this.worker.hasActiveBuild(channel.id)) {
+      void this.syncChannel(channel.id, { force: true });
+    }
+    return this.loadChannel(channel.id);
   }
 
   async selectRootFolder() {
@@ -174,13 +246,13 @@ export class DesktopAppService {
 
   async inspectRootFolder(rootPath: string) {
     const defaultDisplayName = basename(rootPath);
-    const indexPath = join(rootPath, INDEX_DIR_NAME);
-    const status = await this.worker.getIndexStatus(rootPath);
     const existingChannel = this.db.getChannelByRoot(rootPath);
+    const target: IndexTarget = existingChannel ? channelIndexTarget(existingChannel) : legacyIndexTarget(rootPath);
+    const status = await this.worker.getIndexStatus(target);
 
     return {
       rootPath,
-      indexPath,
+      indexPath: existingChannel?.indexPath ?? indexStorageDir(),
       defaultDisplayName,
       hasExistingIndex: status.exists,
       existingChannel
@@ -223,12 +295,35 @@ export class DesktopAppService {
       )
     );
     clearCodexCredentials();
+    this.watcher.unwatchAll();
+    this.pendingResync.clear();
+    rmSync(indexStorageDir(), { recursive: true, force: true });
     this.db.resetAllAppData();
   }
 
   async connectProvider(input: ConnectProviderInput): Promise<ConnectProviderResult> {
+    if (input.provider === "openai-codex" && !CODEX_ENABLED) {
+      throw new Error("OpenAI Codex sign-in is disabled in this build.");
+    }
+    if (input.provider === "ollama") {
+      input = { ...input, baseUrl: normalizeOllamaUrl(input.baseUrl) };
+    }
+    if (
+      this.db.getAppSettings().dataPolicy === "local-only" &&
+      (input.provider !== "ollama" || !isLocalUrl(input.baseUrl ?? ""))
+    ) {
+      throw new Error(
+        "Local-only mode is on. Only Ollama running on this computer can be added. Turn off local-only mode in Settings to add cloud providers or a remote Ollama server."
+      );
+    }
     if (!input.apiKey && !["ollama", "openai-codex"].includes(input.provider)) {
       throw new Error("API key is required for this provider.");
+    }
+    if (input.provider === "azure-openai") {
+      input = { ...input, baseUrl: normalizeAzureEndpoint(input.baseUrl) };
+      if (!input.azureChatDeployment?.trim() && !input.azureEmbeddingDeployment?.trim()) {
+        throw new Error("Enter at least one Azure OpenAI deployment name (chat or embedding).");
+      }
     }
 
     if (input.provider === "openai-codex") {
@@ -244,7 +339,7 @@ export class DesktopAppService {
             .find(
               (connection) =>
                 connection.provider === input.provider &&
-                (connection.baseUrl || defaultBaseUrl(input.provider)) === defaultBaseUrl(input.provider)
+                (connection.baseUrl || defaultBaseUrl(input.provider)) === (input.baseUrl || defaultBaseUrl(input.provider))
             ) ?? null
         : null;
     const connectionId = existingConnection?.id ?? randomUUID();
@@ -262,7 +357,9 @@ export class DesktopAppService {
     const baseName =
       input.connectionName?.trim() ||
       (input.provider === "ollama"
-        ? "Ollama Local"
+        ? isLocalUrl(input.baseUrl ?? "")
+          ? "Ollama Local"
+          : `Ollama ${new URL(input.baseUrl ?? "").host}`
         : input.provider === "openai-codex"
           ? "OpenAI Codex"
           : `${labelForProvider(input.provider)}${apiKeyHint ? ` ${apiKeyHint}` : ""}`);
@@ -271,8 +368,8 @@ export class DesktopAppService {
       id: connectionId,
       name: existingConnection?.name ?? this.db.getUniqueConnectionName(baseName),
       provider: input.provider,
-      baseUrl: defaultBaseUrl(input.provider),
-      apiVersion: input.provider === "azure-openai" ? "2024-10-21" : undefined,
+      baseUrl: input.provider === "azure-openai" || input.provider === "ollama" ? input.baseUrl : defaultBaseUrl(input.provider),
+      apiVersion: input.provider === "azure-openai" ? input.apiVersion?.trim() || "2024-10-21" : undefined,
       apiKeyHint,
       secretRef,
       createdAt: existingConnection?.createdAt ?? now,
@@ -312,11 +409,20 @@ export class DesktopAppService {
       throw new Error("Provider connection not found.");
     }
 
+    if (connection.provider === "azure-openai") {
+      return {
+        connection,
+        models: this.db.listProviderModels(connection.id),
+        warnings: ["Azure OpenAI deployments are configured manually. Reconnect Azure to change deployment names."]
+      };
+    }
+
     const secret = await this.getProviderSecret(connection);
     const discovery = await discoverProviderModels({
       provider: connection.provider,
       apiKey: connection.provider === "ollama" ? undefined : secret.apiKey,
-      connectionName: connection.name
+      connectionName: connection.name,
+      baseUrl: connection.provider === "ollama" ? connection.baseUrl : undefined
     });
     const now = new Date().toISOString();
     const models: ProviderModel[] = discovery.models.map((model) => ({
@@ -371,6 +477,12 @@ export class DesktopAppService {
     );
 
     if (existing) {
+      if (input.autoSync !== undefined || input.excludePatterns) {
+        this.db.updateChannel(existing.id, {
+          autoSync: input.autoSync ?? existing.autoSync,
+          excludePatterns: input.excludePatterns ? normalizeExcludePatterns(input.excludePatterns) : existing.excludePatterns
+        });
+      }
       const nextModels = this.enforceProviderRetrievalConstraints(
         retrievalMode,
         resolvedModels.preferredConnectionId ?? existing.preferredConnectionId,
@@ -398,17 +510,22 @@ export class DesktopAppService {
       resolvedModels.chatModelId,
       resolvedModels.embeddingModelId
     );
+    const channelId = randomUUID();
     const channel: Channel = {
-      id: randomUUID(),
+      id: channelId,
       displayName: uniqueName,
       rootPath: input.rootPath,
-      indexPath: join(input.rootPath, INDEX_DIR_NAME),
+      indexPath: channelIndexPath(channelId),
       preferredConnectionId: nextModels.preferredConnectionId,
       chatModelId: nextModels.chatModelId,
       embeddingModelId: nextModels.embeddingModelId,
       retrievalMode: nextModels.retrievalMode,
       systemPrompt: normalizeChannelSystemPrompt(input.systemPrompt),
+      autoSync: input.autoSync ?? true,
+      excludePatterns: normalizeExcludePatterns(input.excludePatterns ?? []),
       lastIndexedAt: null,
+      lastIndexStats: null,
+      lastError: null,
       status: "idle",
       createdAt: now,
       updatedAt: now
@@ -416,8 +533,10 @@ export class DesktopAppService {
 
     this.assertValidChannelModelSelection(channel.chatModelId, channel.embeddingModelId);
     this.db.createChannel(channel);
+    // An index left inside the folder by an older version is adopted rather than rebuilt.
+    moveLegacyIndex(channel.rootPath, channel.indexPath);
 
-    const status = await this.worker.getIndexStatus(channel.rootPath);
+    const status = await this.worker.getIndexStatus(channelIndexTarget(channel));
     if (status.exists && status.manifest) {
       this.db.replaceIndexedFiles(channel.id, status.manifest.files);
       this.db.updateChannel(channel.id, {
@@ -435,7 +554,7 @@ export class DesktopAppService {
     if (!channel) {
       throw new Error("Channel not found.");
     }
-    if (channel.status === "indexing") {
+    if (channel.status === "indexing" || this.worker.hasActiveBuild(channel.id)) {
       throw new Error("Cannot change channel models while indexing is in progress.");
     }
 
@@ -464,8 +583,8 @@ export class DesktopAppService {
       nextModels.embeddingModelId &&
       nextModels.embeddingModelId !== channel.embeddingModelId
     ) {
-      const embeddingSelection = await this.resolveModelSelection(nextModels.embeddingModelId);
-      const status = await this.worker.getIndexStatus(channel.rootPath);
+      const embeddingSelection = await this.resolveModelSelection(nextModels.embeddingModelId, { enforcePolicy: false });
+      const status = await this.worker.getIndexStatus(channelIndexTarget(channel));
       const expectedKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
       const matchesExistingIndex = status.exists && status.manifest?.embeddingModelKey === expectedKey;
 
@@ -489,6 +608,7 @@ export class DesktopAppService {
       lastIndexedAt: nextLastIndexedAt,
       updatedAt: new Date().toISOString()
     });
+    this.refreshWatchers();
 
     return this.loadChannel(channel.id);
   }
@@ -509,7 +629,6 @@ export class DesktopAppService {
 
   async deleteChannel(input: string | DeleteChannelInput) {
     const channelId = typeof input === "string" ? input : input.channelId;
-    const removeIndex = typeof input === "string" ? false : Boolean(input.removeIndex);
     const channel = this.db.getChannel(channelId);
     if (!channel) {
       return;
@@ -517,9 +636,10 @@ export class DesktopAppService {
     if (channel.status === "indexing" && this.worker.hasActiveBuild(channel.id)) {
       throw new Error("Cancel indexing before deleting this channel.");
     }
-    if (removeIndex) {
-      this.deleteChannelIndexArtifacts(channel.rootPath);
-    }
+    this.watcher.unwatch(channel.id);
+    this.pendingResync.delete(channel.id);
+    // Source files are never touched; only the app's own index copy is removed.
+    this.deleteChannelIndexArtifacts(channel);
     this.db.deleteChannel(channelId);
   }
 
@@ -571,7 +691,7 @@ export class DesktopAppService {
     await this.worker.cancelBuild(input.channelId, input.retainPartial);
   }
 
-  async listChannelFiles(channelId: string, status: "indexed" | "failed") {
+  async listChannelFiles(channelId: string, status: "indexed" | "failed" | "skipped") {
     return this.db.listChannelFiles(channelId, status);
   }
 
@@ -598,6 +718,20 @@ export class DesktopAppService {
   async openChannelFile(input: OpenChannelFileInput): Promise<void> {
     const filePath = this.resolveChannelFilePath(input);
     const error = await shell.openPath(filePath);
+    if (error) {
+      throw new Error(error);
+    }
+  }
+
+  async openChannelFolder(channelId: string): Promise<void> {
+    const channel = this.db.getChannel(channelId);
+    if (!channel) {
+      throw new Error("Channel not found.");
+    }
+    if (!existsSync(channel.rootPath)) {
+      throw new Error("This knowledge base's folder is not available. It may have been moved, renamed or be on a disconnected drive.");
+    }
+    const error = await shell.openPath(channel.rootPath);
     if (error) {
       throw new Error(error);
     }
@@ -684,7 +818,7 @@ export class DesktopAppService {
         secret: embeddingSelection.secret
       });
       try {
-        searchResponse = await this.worker.search(channel.rootPath, input.message, 6, queryOptions);
+        searchResponse = await this.worker.search(channelIndexTarget(channel), input.message, 6, queryOptions);
       } catch (error) {
         if (isInvalidIndexError(error)) {
           await this.invalidateChannelIndex(channel, "This channel's index is outdated or missing. Regenerate the index before chatting.");
@@ -692,7 +826,7 @@ export class DesktopAppService {
         throw error;
       }
     } else {
-      const documentManifest = await this.worker.listDocuments(channel.rootPath);
+      const documentManifest = await this.worker.listDocuments(channelIndexTarget(channel));
       documentManifestDocuments = documentManifest.documents;
       const candidateDocuments = preselectManifestDocuments(documentManifest.documents, input.message, 24);
       const queryProfile = analyzeSpreadsheetQuery(input.message);
@@ -722,10 +856,10 @@ export class DesktopAppService {
         documentIds: selectedDocumentIds
       });
       try {
-        searchResponse = await this.worker.search(channel.rootPath, input.message, 8, queryOptions);
+        searchResponse = await this.worker.search(channelIndexTarget(channel), input.message, 8, queryOptions);
         if (searchResponse.results.length === 0 && selectedDocumentIds.length > 0) {
           searchResponse = await this.worker.search(
-            channel.rootPath,
+            channelIndexTarget(channel),
             input.message,
             8,
             this.toWorkerBuildOptions({ retrievalMode: "vectorless" })
@@ -737,7 +871,7 @@ export class DesktopAppService {
           const spreadsheetStructureSummary = summarizeSpreadsheetStructureQuery(spreadsheetDocuments, input.message, queryProfile);
           if (spreadsheetStructureSummary) {
             contextNotes = [...contextNotes, ...spreadsheetStructureSummary.notes];
-            if (queryProfile.wantsCount) {
+            if (queryProfile.plainRowCount) {
               deterministicAssistantText = buildSpreadsheetCountAnswer(spreadsheetStructureSummary);
             }
           }
@@ -745,7 +879,7 @@ export class DesktopAppService {
           const exhaustiveLimit = spreadsheetDocuments.reduce((sum, document) => sum + Math.max(document.chunks, 0), 0);
           if (exhaustiveLimit > 0) {
             const exhaustiveSearch = await this.worker.search(
-              channel.rootPath,
+              channelIndexTarget(channel),
               input.message,
               exhaustiveLimit,
               this.toWorkerBuildOptions({ retrievalMode: "vectorless", documentIds: spreadsheetDocumentIds })
@@ -770,7 +904,7 @@ export class DesktopAppService {
     if (isVisualInventoryQuery(input.message)) {
       if (documentManifestDocuments.length === 0) {
         try {
-          documentManifestDocuments = (await this.worker.listDocuments(channel.rootPath)).documents;
+          documentManifestDocuments = (await this.worker.listDocuments(channelIndexTarget(channel))).documents;
         } catch {
           documentManifestDocuments = [];
         }
@@ -779,7 +913,7 @@ export class DesktopAppService {
     }
 
     visualAssets = await this.resolveVisualContext(
-      channel.rootPath,
+      channelIndexTarget(channel),
       chatSelection.connection,
       chatSelection.model,
       searchResponse.results,
@@ -787,32 +921,11 @@ export class DesktopAppService {
       input.message
     );
 
-    const now = new Date().toISOString();
+    const askedAt = new Date().toISOString();
     const existingThread = input.threadId ? this.db.listThreads(channel.id).find((candidate) => candidate.id === input.threadId) : null;
-    const thread: Thread =
-      existingThread ??
-      this.db.createThread({
-        id: randomUUID(),
-        channelId: channel.id,
-        title: resolveThreadTitle(input.message.slice(0, 50), this.db.listThreads(channel.id).length + 1),
-        createdAt: now,
-        updatedAt: now
-      });
-    const history = this.db.listMessages(thread.id);
+    const history = existingThread ? this.db.listMessages(existingThread.id) : [];
 
-    const userMessage: Message = {
-      id: randomUUID(),
-      threadId: thread.id,
-      role: "user",
-      content: input.message,
-      citations: [],
-      createdAt: now
-    };
-    this.db.createMessage(userMessage);
-    if (history.length === 0) {
-      this.db.updateThreadTitle(thread.id, input.message.slice(0, 50) || thread.title);
-    }
-
+    // Ask the model before writing anything, so a failed call does not leave an unanswered question behind.
     const assistantText =
       deterministicAssistantText ??
       (await generateAssistantReply({
@@ -826,6 +939,28 @@ export class DesktopAppService {
         userMessage: input.message,
         systemPrompt: channel.systemPrompt
       }));
+
+    const thread: Thread =
+      existingThread ??
+      this.db.createThread({
+        id: randomUUID(),
+        channelId: channel.id,
+        title: resolveThreadTitle(input.message.slice(0, 50), this.db.listThreads(channel.id).length + 1),
+        createdAt: askedAt,
+        updatedAt: askedAt
+      });
+    const userMessage: Message = {
+      id: randomUUID(),
+      threadId: thread.id,
+      role: "user",
+      content: input.message,
+      citations: [],
+      createdAt: askedAt
+    };
+    this.db.createMessage(userMessage);
+    if (history.length === 0) {
+      this.db.updateThreadTitle(thread.id, input.message.slice(0, 50) || thread.title);
+    }
 
     const assistantMessage: Message = {
       id: randomUUID(),
@@ -855,26 +990,50 @@ export class DesktopAppService {
     };
   }
 
-  private async runIndex(channelId: string, rebuild: boolean) {
+  /**
+   * Incremental sync triggered by the folder watcher or app start. Runs in the background:
+   * the channel stays chat-ready on its previous index while the sync is in progress.
+   */
+  private async syncChannel(channelId: string, options: { force?: boolean } = {}) {
+    const channel = this.db.getChannel(channelId);
+    if (!channel || (!options.force && !this.canAutoSync(channel))) {
+      return;
+    }
+    if (this.worker.hasActiveBuild(channel.id)) {
+      this.pendingResync.add(channel.id);
+      return;
+    }
+    try {
+      await this.runIndex(channel.id, false, { background: true });
+    } catch (error) {
+      console.warn(`[hello-files] Background sync failed for ${channel.displayName}:`, error);
+    }
+  }
+
+  private async runIndex(channelId: string, rebuild: boolean, runOptions: { background?: boolean } = {}) {
     const channel = this.db.getChannel(channelId);
     if (!channel) {
       throw new Error("Channel not found.");
     }
+    if (this.worker.hasActiveBuild(channel.id)) {
+      throw new Error("Indexing is already running for this channel.");
+    }
 
-    const options =
-      channel.retrievalMode === "vector"
-        ? await this.buildVectorIndexOptions(channel)
-        : this.toWorkerBuildOptions({ retrievalMode: "vectorless" });
-    this.db.updateChannel(channel.id, {
-      status: "indexing",
-      updatedAt: new Date().toISOString()
-    });
-    this.webContents?.send("fschat:channel-refreshed", this.db.getChannelSnapshot(channel.id));
+    const options = await this.buildIndexOptions(channel);
+    const background = Boolean(runOptions.background) && channel.lastIndexedAt !== null && ["ready", "stale"].includes(channel.status);
+    if (!background) {
+      this.db.updateChannel(channel.id, {
+        status: "indexing",
+        lastError: null,
+        updatedAt: new Date().toISOString()
+      });
+      this.webContents?.send("fschat:channel-refreshed", this.db.getChannelSnapshot(channel.id));
+    }
 
     try {
       const response = rebuild
-        ? await this.worker.rebuildIndex(channel.id, channel.rootPath, options)
-        : await this.worker.buildIndex(channel.id, channel.rootPath, options);
+        ? await this.worker.rebuildIndex(channel.id, channelIndexTarget(channel), options)
+        : await this.worker.buildIndex(channel.id, channelIndexTarget(channel), options);
 
       await this.applyIndexResult(channel, response);
 
@@ -883,13 +1042,20 @@ export class DesktopAppService {
       return snapshot;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Indexing failed.";
+      const cancelled = message.toLowerCase().includes("cancelled");
+      // A failed background sync leaves the previous index in place, so the channel stays usable.
       this.db.updateChannel(channel.id, {
-        status: message.includes("cancelled") ? "idle" : "error",
+        status: background ? channel.status : cancelled ? "idle" : "error",
+        lastError: cancelled ? null : message,
         updatedAt: new Date().toISOString()
       });
       const snapshot = await this.loadChannel(channel.id);
       this.webContents?.send("fschat:channel-refreshed", snapshot);
       throw error;
+    } finally {
+      if (this.pendingResync.delete(channel.id)) {
+        void this.syncChannel(channel.id);
+      }
     }
   }
 
@@ -899,13 +1065,14 @@ export class DesktopAppService {
         this.db.replaceIndexedFiles(channel.id, response.files);
         this.db.updateChannel(channel.id, {
           lastIndexedAt: response.manifest.updatedAt,
+          lastIndexStats: response.stats ?? null,
           status: deriveCancelledChannelStatus(response.files),
           updatedAt: new Date().toISOString()
         });
         return;
       }
 
-      const existing = await this.worker.getIndexStatus(channel.rootPath);
+      const existing = await this.worker.getIndexStatus(channelIndexTarget(channel));
       if (existing.exists && existing.manifest) {
         this.db.replaceIndexedFiles(channel.id, existing.manifest.files);
         this.db.updateChannel(channel.id, {
@@ -932,12 +1099,15 @@ export class DesktopAppService {
     this.db.replaceIndexedFiles(channel.id, response.files);
     this.db.updateChannel(channel.id, {
       lastIndexedAt: response.manifest.updatedAt,
+      lastIndexStats: response.stats ?? null,
+      lastError: null,
       status: deriveChannelStatusFromFiles(response.files),
       updatedAt: new Date().toISOString()
     });
+    this.refreshWatchers();
   }
 
-  private async resolveModelSelection(modelId: string) {
+  private async resolveModelSelection(modelId: string, options: { enforcePolicy?: boolean } = {}) {
     const model = this.db.getProviderModel(modelId);
     if (!model) {
       throw new Error("Provider model not found.");
@@ -945,6 +1115,9 @@ export class DesktopAppService {
     const connection = this.db.getProviderConnection(model.connectionId);
     if (!connection) {
       throw new Error("Provider connection not found.");
+    }
+    if (options.enforcePolicy !== false) {
+      this.assertConnectionAllowed(connection);
     }
     const secret = await this.getProviderSecret(connection);
     return { model, connection, secret };
@@ -969,7 +1142,7 @@ export class DesktopAppService {
   }
 
   private async resolveVisualContext(
-    rootPath: string,
+    target: IndexTarget,
     connection: ProviderConnection,
     model: ProviderModel,
     results: SearchResult[],
@@ -1035,7 +1208,7 @@ export class DesktopAppService {
     }
 
     try {
-      return (await this.worker.resolveVisualAssets(rootPath, selected, 3)).assets;
+      return (await this.worker.resolveVisualAssets(target, selected, 3)).assets;
     } catch {
       return [];
     }
@@ -1077,7 +1250,7 @@ export class DesktopAppService {
       return channel;
     }
 
-    const status = await this.worker.getIndexStatus(channel.rootPath);
+    const status = await this.worker.getIndexStatus(channelIndexTarget(channel));
     if (!status.exists || !status.manifest || status.manifest.retrievalMode !== channel.retrievalMode) {
       if (channel.lastIndexedAt || channel.status === "ready" || channel.status === "stale") {
         this.db.replaceIndexedFiles(channel.id, []);
@@ -1095,7 +1268,7 @@ export class DesktopAppService {
         return channel;
       }
 
-      const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId);
+      const embeddingSelection = await this.resolveModelSelection(channel.embeddingModelId, { enforcePolicy: false });
       const expectedEmbeddingKey = buildEmbeddingModelKey(embeddingSelection.connection, embeddingSelection.model);
       if (status.manifest.embeddingModelKey !== expectedEmbeddingKey) {
         if (channel.lastIndexedAt || channel.status === "ready" || channel.status === "stale") {
@@ -1158,8 +1331,14 @@ export class DesktopAppService {
     }
   }
 
-  private deleteChannelIndexArtifacts(rootPath: string) {
-    const targets = [join(rootPath, INDEX_DIR_NAME), join(rootPath, INDEX_TEMP_DIR_NAME)];
+  private deleteChannelIndexArtifacts(channel: Channel) {
+    const targets = [
+      channel.indexPath,
+      `${channel.indexPath}.tmp`,
+      `${channel.indexPath}.old`,
+      join(channel.rootPath, INDEX_DIR_NAME),
+      join(channel.rootPath, INDEX_TEMP_DIR_NAME)
+    ];
     for (const target of targets) {
       if (!existsSync(target)) {
         continue;
@@ -1213,6 +1392,18 @@ export class DesktopAppService {
       chatModelId,
       embeddingModelId,
       retrievalMode
+    };
+  }
+
+  private async buildIndexOptions(channel: Channel): Promise<WorkerBuildOptions> {
+    const retrievalOptions =
+      channel.retrievalMode === "vector"
+        ? await this.buildVectorIndexOptions(channel)
+        : this.toWorkerBuildOptions({ retrievalMode: "vectorless" });
+    return {
+      ...retrievalOptions,
+      excludePatterns: channel.excludePatterns,
+      maxFileSizeMb: DEFAULT_MAX_FILE_SIZE_MB
     };
   }
 
@@ -1310,11 +1501,189 @@ export class DesktopAppService {
         throw new Error("Selected embedding model does not support embeddings.");
       }
     }
+  }
 
-    if (chatModel && embeddingModel && chatModel.connectionId !== embeddingModel.connectionId) {
-      throw new Error("Selected chat and embedding models must come from the same provider connection.");
+  private assertConnectionAllowed(connection: ProviderConnection) {
+    if (connection.provider === "openai-codex" && !CODEX_ENABLED) {
+      throw new Error("OpenAI Codex is disabled in this build. Pick a different model for this knowledge base.");
+    }
+    if (this.db.getAppSettings().dataPolicy === "local-only" && !isLocalConnection(connection)) {
+      throw new Error(
+        `Local-only mode is on, so "${connection.name}" can't be used because it would send file content off this computer. ` +
+          "Pick a local Ollama model for this knowledge base, or turn off local-only mode in Settings."
+      );
     }
   }
+
+  private isConnectionAllowed(connection: ProviderConnection | null) {
+    if (!connection) {
+      return false;
+    }
+    try {
+      this.assertConnectionAllowed(connection);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private channelUsesConnection(channel: Channel, connectionId: string) {
+    if (channel.preferredConnectionId === connectionId) {
+      return true;
+    }
+    return [channel.chatModelId, channel.embeddingModelId].some(
+      (modelId) => modelId !== null && this.db.getProviderModel(modelId)?.connectionId === connectionId
+    );
+  }
+
+  /** Auto-sync only runs for indexed channels whose models are configured and allowed by the data policy. */
+  private canAutoSync(channel: Channel) {
+    if (!channel.autoSync || !channel.lastIndexedAt || channel.status === "indexing") {
+      return false;
+    }
+    if (channel.retrievalMode === "vector") {
+      const embeddingModel = channel.embeddingModelId ? this.db.getProviderModel(channel.embeddingModelId) : null;
+      if (!embeddingModel || !this.isConnectionAllowed(this.db.getProviderConnection(embeddingModel.connectionId))) {
+        return false;
+      }
+    }
+    return existsSync(channel.rootPath);
+  }
+
+  private watchSignatures = new Map<string, string>();
+
+  private refreshWatchers() {
+    const channels = this.db.listChannels();
+    const liveIds = new Set(channels.map((channel) => channel.id));
+    for (const channelId of [...this.watchSignatures.keys()]) {
+      if (!liveIds.has(channelId)) {
+        this.watcher.unwatch(channelId);
+        this.watchSignatures.delete(channelId);
+      }
+    }
+    for (const channel of channels) {
+      const shouldWatch = channel.autoSync && channel.lastIndexedAt !== null && existsSync(channel.rootPath);
+      const signature = `${channel.rootPath}|${JSON.stringify(channel.excludePatterns)}`;
+      if (!shouldWatch) {
+        this.watcher.unwatch(channel.id);
+        this.watchSignatures.delete(channel.id);
+        continue;
+      }
+      if (this.watchSignatures.get(channel.id) === signature && this.watcher.isWatching(channel.id)) {
+        continue;
+      }
+      this.watcher.watch(channel.id, channel.rootPath, channel.excludePatterns);
+      this.watchSignatures.set(channel.id, signature);
+    }
+  }
+
+  /** Older versions stored the index inside the user's folder; move it into app data. */
+  private migrateLegacyIndexLocations() {
+    for (const channel of this.db.listChannels()) {
+      const target = channelIndexPath(channel.id);
+      if (channel.indexPath === target || this.worker.hasActiveBuild(channel.id)) {
+        continue;
+      }
+      if (moveLegacyIndex(channel.rootPath, target)) {
+        this.db.updateChannel(channel.id, { indexPath: target });
+      }
+    }
+  }
+}
+
+function indexStorageDir() {
+  return join(app.getPath("userData"), INDEX_STORAGE_DIR_NAME);
+}
+
+function channelIndexPath(channelId: string) {
+  return join(indexStorageDir(), channelId);
+}
+
+function channelIndexTarget(channel: Channel): IndexTarget {
+  return { rootPath: channel.rootPath, indexPath: channel.indexPath };
+}
+
+function legacyIndexTarget(rootPath: string): IndexTarget {
+  return { rootPath, indexPath: join(rootPath, INDEX_DIR_NAME) };
+}
+
+/**
+ * Moves an in-folder index to `targetPath`. Returns true when the channel can point at
+ * `targetPath` (moved, or there was nothing to move); false when the move failed, for example
+ * because the folder is on a disconnected drive, so the caller keeps the old location for now.
+ */
+function moveLegacyIndex(rootPath: string, targetPath: string): boolean {
+  const legacyPath = join(rootPath, INDEX_DIR_NAME);
+  try {
+    rmSync(join(rootPath, INDEX_TEMP_DIR_NAME), { recursive: true, force: true });
+    if (!existsSync(legacyPath)) {
+      return true;
+    }
+    if (existsSync(join(targetPath, "manifest.json"))) {
+      rmSync(legacyPath, { recursive: true, force: true });
+      return true;
+    }
+    mkdirSync(indexStorageDir(), { recursive: true });
+    rmSync(targetPath, { recursive: true, force: true });
+    try {
+      renameSync(legacyPath, targetPath);
+    } catch {
+      // Cross-volume moves (EXDEV) need a copy.
+      cpSync(legacyPath, targetPath, { recursive: true });
+      rmSync(legacyPath, { recursive: true, force: true });
+    }
+    return true;
+  } catch (error) {
+    console.warn(`[hello-files] Could not move legacy index from ${legacyPath}:`, error);
+    return false;
+  }
+}
+
+function normalizeExcludePatterns(patterns: string[]) {
+  return [...new Set(patterns.map((pattern) => pattern.trim()).filter(Boolean))].slice(0, 200);
+}
+
+function normalizeAzureEndpoint(baseUrl: string | undefined) {
+  const trimmed = baseUrl?.trim().replace(/\/+$/, "") ?? "";
+  if (!trimmed) {
+    throw new Error("Azure OpenAI needs the resource endpoint, for example https://my-resource.openai.azure.com.");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("Azure OpenAI endpoint must be a valid URL.");
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error("Azure OpenAI endpoint must use https.");
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
+function isLocalConnection(connection: ProviderConnection) {
+  return connection.provider === "ollama" && isLocalUrl(connection.baseUrl || defaultBaseUrl("ollama") || "");
+}
+
+function isLocalUrl(url: string) {
+  try {
+    return LOCAL_HOSTNAMES.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeOllamaUrl(baseUrl: string | undefined) {
+  const trimmed = baseUrl?.trim().replace(/\/+$/, "") || defaultBaseUrl("ollama") || "";
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`);
+  } catch {
+    throw new Error("Ollama address must look like http://localhost:11434 or http://server-name:11434.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Ollama address must start with http:// or https://.");
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
 }
 
 

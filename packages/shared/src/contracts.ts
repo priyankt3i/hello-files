@@ -2,10 +2,23 @@ export const INDEX_DIR_NAME = ".fschat-index";
 export const INDEX_VERSION = 3;
 
 export type ChannelStatus = "ready" | "indexing" | "stale" | "error" | "idle";
-export type FileIndexStatus = "indexed" | "failed";
+export type FileIndexStatus = "indexed" | "failed" | "skipped";
 export type ProviderKind = "openai" | "openai-codex" | "azure-openai" | "anthropic" | "google" | "ollama";
 export type ModelCapability = "chat" | "embedding" | "vision";
 export type RetrievalMode = "vector" | "vectorless";
+export type DataPolicy = "any" | "local-only";
+
+export const DEFAULT_MAX_FILE_SIZE_MB = 50;
+
+export interface AppSettings {
+  /** "local-only" blocks every provider connection that is not a local Ollama endpoint. */
+  dataPolicy: DataPolicy;
+}
+
+export interface AppFeatures {
+  /** OpenAI Codex sign-in is hidden unless HELLO_FILES_ENABLE_CODEX=1. */
+  codexEnabled: boolean;
+}
 
 export interface ProviderConnection {
   id: string;
@@ -51,10 +64,23 @@ export interface Channel {
   embeddingModelId: string | null;
   retrievalMode: RetrievalMode;
   systemPrompt: string;
+  autoSync: boolean;
+  excludePatterns: string[];
   lastIndexedAt: string | null;
+  lastIndexStats: IndexBuildStats | null;
+  lastError: string | null;
   status: ChannelStatus;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface IndexBuildStats {
+  added: number;
+  updated: number;
+  removed: number;
+  unchanged: number;
+  failed: number;
+  skipped: number;
 }
 
 export interface IndexedFileRecord {
@@ -157,6 +183,7 @@ export interface ChannelSnapshot {
   threads: Thread[];
   indexedFiles: IndexedFileRecord[];
   failedFiles: IndexedFileRecord[];
+  skippedFiles: IndexedFileRecord[];
 }
 
 export interface IndexManifest {
@@ -213,6 +240,13 @@ export interface ConnectProviderInput {
   provider: ProviderKind;
   apiKey?: string;
   connectionName?: string;
+  /** Azure OpenAI: resource endpoint (required). Ollama: server address (optional, defaults to http://127.0.0.1:11434). */
+  baseUrl?: string;
+  /** Azure OpenAI only. */
+  apiVersion?: string;
+  /** Azure OpenAI only: deployment names, since Azure has no model discovery. */
+  azureChatDeployment?: string;
+  azureEmbeddingDeployment?: string;
 }
 
 export interface ConnectProviderResult {
@@ -232,6 +266,16 @@ export interface BootstrapResponse {
   providerConnections: ProviderConnection[];
   providerDefaults: ProviderDefaults[];
   providerModels: ProviderModel[];
+  /** Every chat thread, across all knowledge bases (for the sidebar). */
+  threads: Thread[];
+  settings: AppSettings;
+  features: AppFeatures;
+  defaults: {
+    /** The assistant instructions a new knowledge base starts with. */
+    systemPrompt: string;
+  };
+  /** Directory that holds every channel's search index. */
+  indexStorageDir: string;
 }
 
 export interface RegisterChannelInput {
@@ -242,6 +286,8 @@ export interface RegisterChannelInput {
   embeddingModelId: string | null;
   retrievalMode?: RetrievalMode;
   systemPrompt?: string;
+  autoSync?: boolean;
+  excludePatterns?: string[];
 }
 
 export interface UpdateChannelModelsInput {
@@ -250,6 +296,13 @@ export interface UpdateChannelModelsInput {
   chatModelId: string | null;
   embeddingModelId: string | null;
   retrievalMode?: RetrievalMode;
+}
+
+export interface UpdateChannelSettingsInput {
+  channelId: string;
+  displayName?: string;
+  autoSync?: boolean;
+  excludePatterns?: string[];
 }
 
 export interface UpdateChannelSystemPromptInput {
@@ -295,6 +348,9 @@ export interface SendMessageResult {
 }
 
 export interface WorkerBuildOptions {
+  excludePatterns?: string[];
+  maxFileSizeMb?: number;
+  includeHidden?: boolean;
   retrieval?: {
     mode: RetrievalMode;
     engine?: string;
@@ -315,6 +371,7 @@ export interface WorkerBuildResponse {
   files: IndexedFileRecord[];
   cancelled?: boolean;
   retainedPartial?: boolean;
+  stats?: IndexBuildStats;
 }
 
 export interface WorkerEnvelope<TPayload = unknown> {
